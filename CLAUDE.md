@@ -19,7 +19,7 @@ Specifically, do **not** include:
 
 When a change must reference the private worker-agent source, keep it **generic**
 — say "built and published from a separate private repository" and describe only
-the **public contract** (the CDN `latest.json` manifest schema and binary URL
+the **public contract** (the GitHub Releases manifest `latest.json` schema and binary URL
 layout), never the private repo's internals.
 
 When in doubt, leave the internal detail out or ask before committing.

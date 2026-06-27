@@ -107,12 +107,10 @@ Configuration:
 
 | Variable | Purpose |
 |---|---|
-| `WORKER_CDN_URL` | Base URL the CLI fetches `latest.json` and binaries from. |
+| `WORKER_CDN_URL` | Full `latest.json` manifest URL the CLI fetches the worker-agent from (or a base URL, for back-compat). Defaults to the public GitHub Releases manifest at `clustercodehq/dist`. |
 | `CLUSTERCODE_WORKER_BINARY` | Absolute path to a local worker-agent binary; bypasses all download logic (local development, offline/air-gapped, CI). |
 
-> **Note:** the production CDN is not provisioned yet, so `WORKER_CDN_URL` has no
-> default. Until it is set, run with `CLUSTERCODE_WORKER_BINARY` pointing at a
-> locally built worker-agent binary.
+> **Note:** the worker-agent is published to GitHub Releases in the public `clustercodehq/dist` repo; the CLI auto-fetches it by default, so `WORKER_CDN_URL` is only needed to override the host (e.g. a staging mirror). For local dev, set `CLUSTERCODE_WORKER_BINARY` to a locally built binary.
 
 ## License
 
