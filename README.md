@@ -96,12 +96,13 @@ The orchestrator / portal URL is resolved in this order:
 ## Worker binary
 
 `clustercode worker` runs a prebuilt worker-agent binary fetched on demand from
-the ClusterCode CDN. On first run, the CLI detects your OS/arch, downloads the
-matching binary, verifies its SHA-256, and caches it under
+GitHub Releases (the public `clustercodehq/dist` repo). On first run, the CLI
+detects your OS/arch, downloads the matching binary, verifies its SHA-256, and
+caches it under
 `~/.clustercode/bin/worker-agent/<version>/<os>-<arch>/`. On later runs it checks for a newer
-published version and updates automatically; if the CDN is unreachable it runs
-the cached binary. The current version plus one previous version are retained for
-quick rollback.
+published version and updates automatically; if the release host is unreachable
+it runs the cached binary. The current version plus one previous version are
+retained for quick rollback.
 
 Configuration:
 
