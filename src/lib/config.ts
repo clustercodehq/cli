@@ -85,8 +85,14 @@ export function getOrchestratorUrl(): string {
   return process.env.ORCHESTRATOR_URL || 'https://console.clustercode.io';
 }
 
+// Default worker-agent manifest URL: the mutable "latest" pointer release in the
+// public clustercodehq/dist repo, served by GitHub's CDN. Mirrors the baked
+// production defaults of getOrchestratorUrl()/getPortalUrl().
+const DEFAULT_WORKER_MANIFEST_URL =
+  'https://github.com/clustercodehq/dist/releases/download/worker-agent-latest/latest.json';
+
 export function getWorkerCdnUrl(): string {
-  return process.env.WORKER_CDN_URL ?? '';
+  return process.env.WORKER_CDN_URL || DEFAULT_WORKER_MANIFEST_URL;
 }
 
 export function getPortalUrl(): string {
