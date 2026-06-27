@@ -33,7 +33,11 @@ describe('binaryFileName', () => {
 });
 
 describe('manifestUrl', () => {
-  it('builds the manifest URL, tolerating a trailing slash', () => {
+  it('returns a full latest.json URL unchanged (GitHub Releases default)', () => {
+    const full = 'https://github.com/clustercodehq/dist/releases/download/worker-agent-latest/latest.json';
+    assert.equal(manifestUrl(full), full);
+  });
+  it('appends the legacy suffix to a base, tolerating a trailing slash', () => {
     assert.equal(manifestUrl('https://cdn.test'), 'https://cdn.test/worker-agent/latest.json');
     assert.equal(manifestUrl('https://cdn.test/'), 'https://cdn.test/worker-agent/latest.json');
   });

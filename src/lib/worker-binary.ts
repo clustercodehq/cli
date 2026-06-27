@@ -41,7 +41,11 @@ export function binaryFileName(platform: string): string {
 }
 
 export function manifestUrl(cdnUrl: string): string {
-  return `${cdnUrl.replace(/\/$/, '')}/worker-agent/latest.json`;
+  const trimmed = cdnUrl.replace(/\/$/, '');
+  // Accept either a full manifest URL (…/latest.json — the GitHub Releases
+  // default) or a base, to which the legacy /worker-agent/latest.json suffix is
+  // appended for backward compatibility.
+  return trimmed.endsWith('.json') ? trimmed : `${trimmed}/worker-agent/latest.json`;
 }
 
 export function parseManifest(raw: unknown): Manifest {
