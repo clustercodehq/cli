@@ -1,0 +1,59 @@
+{
+  "name": "@clustercode/cli",
+  "version": "0.1.0-alpha.2",
+  "type": "module",
+  "description": "CLI for the ClusterCode platform",
+  "keywords": [
+    "clustercode",
+    "cli",
+    "worker",
+    "orchestrator"
+  ],
+  "homepage": "https://github.com/clustercodehq/cli#readme",
+  "bugs": {
+    "url": "https://github.com/clustercodehq/cli/issues"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "clustercode": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "dev:watch": "tsx watch src/cli.ts",
+    "cli": "tsx src/cli.ts",
+    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true});fs.rmSync('tsconfig.tsbuildinfo',{force:true})\"",
+    "prepublishOnly": "npm run build",
+    "test:unit": "node --test --import tsx tests/unit/*.spec.ts",
+    "test:e2e": "node --test --import tsx tests/e2e/cli/*.spec.ts",
+    "test": "npm run test:unit && npm run test:e2e"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clustercodehq/cli.git"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.2.0",
+    "commander": "^13.1.0",
+    "dotenv": "^17.4.1",
+    "open": "^11.0.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
