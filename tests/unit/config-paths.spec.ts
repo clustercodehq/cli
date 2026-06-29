@@ -16,11 +16,14 @@ describe('worker config/paths', () => {
     }
   });
 
-  it('getWorkerCdnUrl returns empty string when unset (no CDN provisioned yet)', () => {
+  it('getWorkerCdnUrl returns the baked GitHub Releases default when unset', () => {
     const prev = process.env.WORKER_CDN_URL;
     delete process.env.WORKER_CDN_URL;
     try {
-      assert.equal(getWorkerCdnUrl(), '');
+      assert.equal(
+        getWorkerCdnUrl(),
+        'https://github.com/clustercodehq/dist/releases/download/worker-agent-latest/latest.json',
+      );
     } finally {
       if (prev !== undefined) process.env.WORKER_CDN_URL = prev;
     }
