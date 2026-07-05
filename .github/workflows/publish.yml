@@ -1,0 +1,65 @@
+name: Publish CLI
+
+# Tag-triggered publish of @clustercode/cli to the npm registry — the same
+# mechanism as the rest of the platform (a git tag drives the release). Push a
+# `v<version>` tag whose version matches package.json and this builds, tests,
+# and publishes to npm. Prerelease versions go to their preid dist-tag
+# (alpha/beta/rc) so `@clustercode/cli@latest` only ever points at a stable
+# release; stable versions publish to `latest`.
+#
+# Requires an `NPM_TOKEN` repo secret (an npm automation token with publish
+# rights to the @clustercode scope).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-cli
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + publish @clustercode/cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve + verify version
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (version ${TAG_VERSION}) does not match package.json version ${PKG_VERSION}; refusing to publish." >&2
+            exit 1
+          fi
+          # npm dist-tag: prerelease (X.Y.Z-<preid>...) → its preid; stable → latest.
+          DIST_TAG=latest
+          case "$PKG_VERSION" in
+            *-*) DIST_TAG="$(printf '%s' "$PKG_VERSION" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9A-Za-z]+).*/\1/')" ;;
+          esac
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing @clustercode/cli@$PKG_VERSION with npm dist-tag '$DIST_TAG'"
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm run test:unit
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --tag "${{ steps.meta.outputs.dist_tag }}"
