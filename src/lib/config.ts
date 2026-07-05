@@ -85,14 +85,48 @@ export function getOrchestratorUrl(): string {
   return process.env.ORCHESTRATOR_URL || 'https://console.clustercode.io';
 }
 
-// Default worker-agent manifest URL: the mutable "latest" pointer release in the
-// public clustercodehq/dist repo, served by GitHub's CDN. Mirrors the baked
-// production defaults of getOrchestratorUrl()/getPortalUrl().
-const DEFAULT_WORKER_MANIFEST_URL =
-  'https://github.com/clustercodehq/dist/releases/download/worker-agent-latest/latest.json';
+// Base for worker-agent release manifests in the public clustercodehq/dist repo,
+// served by GitHub's CDN. Each release tag (worker-agent-latest / worker-agent-next
+// / worker-agent-v<version>) exposes a `latest.json` manifest.
+const DEFAULT_WORKER_DIST_BASE =
+  'https://github.com/clustercodehq/dist/releases/download';
 
+export interface WorkerChannelSelector {
+  /** Prerelease channel: 'next' pulls the newest prerelease; default 'latest' (stable). */
+  channel?: 'latest' | 'next';
+  /** Exact version pin (e.g. "1.0.0-alpha.4"); takes precedence over `channel`. */
+  version?: string;
+}
+
+// Map a channel/version selection to its release tag, mirroring npm dist-tags:
+// default → stable `latest`; `next` → newest prerelease; explicit version → that
+// immutable per-version release.
+function workerReleaseTag(sel: WorkerChannelSelector): string {
+  if (sel.version) return `worker-agent-v${sel.version}`;
+  return sel.channel === 'next' ? 'worker-agent-next' : 'worker-agent-latest';
+}
+
+/**
+ * Resolve the worker-agent manifest URL for a channel/version selection.
+ *
+ * WORKER_CDN_URL, when set, is an explicit override: if it names a
+ * worker-agent-* release manifest we swap the release-tag segment to honor the
+ * selection; otherwise (a bare/custom URL with no such segment) it is used
+ * verbatim and the selection is ignored — there's no release structure to
+ * redirect. With no override, the URL is built from the default dist base.
+ */
+export function getWorkerManifestUrl(sel: WorkerChannelSelector = {}): string {
+  const tag = workerReleaseTag(sel);
+  const override = process.env.WORKER_CDN_URL;
+  if (override) {
+    return override.replace(/worker-agent-(?:latest|next|v[^/]+)/, tag);
+  }
+  return `${DEFAULT_WORKER_DIST_BASE}/${tag}/latest.json`;
+}
+
+// Back-compat: the stable `latest` manifest URL (default channel).
 export function getWorkerCdnUrl(): string {
-  return process.env.WORKER_CDN_URL || DEFAULT_WORKER_MANIFEST_URL;
+  return getWorkerManifestUrl();
 }
 
 export function getPortalUrl(): string {

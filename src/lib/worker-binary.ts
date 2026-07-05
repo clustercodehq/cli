@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync, chmodSync, existsSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { getWorkerBinaryDir, getWorkerCdnUrl } from './config.js';
+import { getWorkerBinaryDir, getWorkerManifestUrl } from './config.js';
 
 export interface PlatformEntry {
   url: string;
@@ -188,6 +188,10 @@ export interface EnsureDeps {
   cacheDir?: string;
   platform?: string;
   arch?: string;
+  /** Prerelease channel: 'next' pulls the newest prerelease. Default: stable 'latest'. */
+  channel?: 'latest' | 'next';
+  /** Exact worker-agent version pin (e.g. "1.0.0-alpha.4"); overrides `channel`. */
+  version?: string;
 }
 
 export async function ensureWorkerBinary(deps: EnsureDeps = {}): Promise<EnsureResult> {
@@ -202,7 +206,7 @@ export async function ensureWorkerBinary(deps: EnsureDeps = {}): Promise<EnsureR
   const platform = deps.platform ?? process.platform;
   const arch = deps.arch ?? process.arch;
   const cacheDir = deps.cacheDir ?? getWorkerBinaryDir();
-  const cdnUrl = deps.cdnUrl ?? getWorkerCdnUrl();
+  const cdnUrl = deps.cdnUrl ?? getWorkerManifestUrl({ channel: deps.channel, version: deps.version });
 
   const key = platformKey(platform, arch);
   if (!key) throw new Error(`No worker binary available for ${platform}/${arch}.`);
