@@ -222,6 +222,19 @@ export const workerCommand = new Command('worker')
         ? 'docker'
         : undefined;
 
+    // Validate a pinned --agent-version as semver (tolerating a leading "v") so a
+    // typo can't be interpolated into a bogus release URL and silently 404.
+    if (opts.agentVersion) {
+      const normalized = opts.agentVersion.replace(/^v/, '');
+      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(normalized)) {
+        clack.log.error(
+          `Invalid --agent-version "${opts.agentVersion}". Use a semver like 1.0.0 or 1.0.0-alpha.4.`,
+        );
+        process.exit(1);
+      }
+      opts.agentVersion = normalized;
+    }
+
     // Worker-agent version/channel selection (npm-style): --agent-version pins an
     // exact version; --prerelease follows the newest prerelease ('next'); default
     // is the stable 'latest'. --agent-version wins if both are given.

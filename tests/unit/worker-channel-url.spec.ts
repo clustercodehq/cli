@@ -53,4 +53,19 @@ describe('getWorkerManifestUrl (channel/version selection)', () => {
     assert.equal(getWorkerManifestUrl({ channel: 'next' }), 'https://mycdn.example.com/manifest.json');
     assert.equal(getWorkerManifestUrl({ version: '1.2.3' }), 'https://mycdn.example.com/manifest.json');
   });
+
+  it('leaves an override VERBATIM for the default selection (never clobbers a direct pin)', () => {
+    // Regression guard: a user who points WORKER_CDN_URL straight at a pinned
+    // release must NOT have it silently rewritten to latest on a plain run.
+    process.env.WORKER_CDN_URL = `${BASE}/worker-agent-v1.0.0/latest.json`;
+    assert.equal(getWorkerManifestUrl(), `${BASE}/worker-agent-v1.0.0/latest.json`);
+    assert.equal(getWorkerManifestUrl({ channel: 'latest' }), `${BASE}/worker-agent-v1.0.0/latest.json`);
+  });
+
+  it('never rewrites the host when a segment-like token appears in the hostname', () => {
+    process.env.WORKER_CDN_URL = 'https://worker-agent-next.mycdn.io/manifest.json';
+    // Explicit selection, but the only "worker-agent-*" is in the HOST — must be untouched.
+    assert.equal(getWorkerManifestUrl({ version: '1.2.3' }), 'https://worker-agent-next.mycdn.io/manifest.json');
+    assert.equal(getWorkerManifestUrl({ channel: 'next' }), 'https://worker-agent-next.mycdn.io/manifest.json');
+  });
 });

@@ -127,12 +127,25 @@ export function cachedBinaryPath(cacheDir: string, version: string, key: string,
   return join(cacheDir, version, key, binaryFileName(platform));
 }
 
+// Thrown when the manifest endpoint responds but with a non-OK status (e.g. a
+// 404 for a version/channel that isn't published). Distinct from a network/
+// timeout failure so callers can fail hard on "not found" instead of silently
+// falling back to an unrelated cached binary.
+export class ManifestHttpError extends Error {
+  readonly httpStatus: number;
+  constructor(status: number) {
+    super(`Manifest fetch failed: HTTP ${status}`);
+    this.name = 'ManifestHttpError';
+    this.httpStatus = status;
+  }
+}
+
 export async function fetchManifest(cdnUrl: string, timeoutMs: number): Promise<Manifest> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(manifestUrl(cdnUrl), { signal: controller.signal });
-    if (!res.ok) throw new Error(`Manifest fetch failed: HTTP ${res.status}`);
+    if (!res.ok) throw new ManifestHttpError(res.status);
     return parseManifest(await res.json());
   } finally {
     clearTimeout(timer);
@@ -212,12 +225,17 @@ export async function ensureWorkerBinary(deps: EnsureDeps = {}): Promise<EnsureR
   if (!key) throw new Error(`No worker binary available for ${platform}/${arch}.`);
 
   const installed = readInstalled(cacheDir);
+  // An explicit --agent-version pin or --prerelease (next) selection: a not-found
+  // must fail loudly rather than silently serving an unrelated cached binary.
+  const explicit = deps.version != null || deps.channel === 'next';
 
   let manifest: Manifest | null = null;
+  let fetchErr: unknown = null;
   if (cdnUrl) {
     try {
       manifest = await fetchManifest(cdnUrl, 4000);
-    } catch {
+    } catch (err) {
+      fetchErr = err;
       manifest = null;
     }
   }
@@ -227,6 +245,24 @@ export async function ensureWorkerBinary(deps: EnsureDeps = {}): Promise<EnsureR
   const cachedPath = installed ? cachedBinaryPath(cacheDir, installed.version, key, platform) : null;
 
   if (!manifest) {
+    // A definitive HTTP error (e.g. 404) for an explicit selection means that
+    // version/channel simply isn't published — fail hard, don't run something else.
+    if (explicit && fetchErr instanceof ManifestHttpError) {
+      throw new Error(
+        deps.version
+          ? `worker-agent v${deps.version} was not found (HTTP ${fetchErr.httpStatus}). Check the version or omit --agent-version.`
+          : `No prerelease worker-agent is published yet (HTTP ${fetchErr.httpStatus}). Omit --prerelease to use the stable release.`,
+      );
+    }
+    // For an exact pin, only a cached binary of THAT version is acceptable —
+    // never fall back to a different cached version.
+    if (deps.version) {
+      const pinPath = cachedBinaryPath(cacheDir, deps.version, key, platform);
+      if (existsSync(pinPath)) {
+        return { path: pinPath, version: deps.version, status: 'stale-cache' };
+      }
+      throw new Error(`worker-agent v${deps.version} is not cached and the CDN is unreachable.`);
+    }
     if (cachedPath && existsSync(cachedPath)) {
       return { path: cachedPath, version: installed!.version, status: 'stale-cache' };
     }
@@ -237,12 +273,18 @@ export async function ensureWorkerBinary(deps: EnsureDeps = {}): Promise<EnsureR
     );
   }
 
-  if (installed && installed.version === manifest.version && cachedPath && existsSync(cachedPath)) {
-    return { path: cachedPath, version: installed.version, status: 'up-to-date' };
+  // If the resolved version's binary is already on disk (e.g. cached from a
+  // previous run on another channel), reuse it — no re-download, just refresh
+  // the installed pointer. Avoids tens-of-MB churn when flipping channels.
+  const destPath = cachedBinaryPath(cacheDir, manifest.version, key, platform);
+  if (existsSync(destPath)) {
+    if (!installed || installed.version !== manifest.version) {
+      writeInstalled(cacheDir, { version: manifest.version, path: destPath });
+    }
+    return { path: destPath, version: manifest.version, status: 'up-to-date' };
   }
 
   const entry = selectPlatformEntry(manifest, key);
-  const destPath = cachedBinaryPath(cacheDir, manifest.version, key, platform);
   await downloadAndVerify(resolveBinaryUrl(cdnUrl, entry.url), entry.sha256, destPath);
   writeInstalled(cacheDir, { version: manifest.version, path: destPath });
   pruneVersions(cacheDir, [manifest.version, installed?.version].filter((v): v is string => Boolean(v)));

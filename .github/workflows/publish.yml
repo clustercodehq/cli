@@ -49,6 +49,13 @@ jobs:
           case "$PKG_VERSION" in
             *-*) DIST_TAG="$(printf '%s' "$PKG_VERSION" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9A-Za-z]+).*/\1/')" ;;
           esac
+          # Guard: a valid npm dist-tag is a non-numeric identifier. Anything else
+          # (odd/numeric preid, malformed version) fails clearly here rather than
+          # deep inside `npm publish`.
+          if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9-]*$'; then
+            echo "::error::Computed npm dist-tag '$DIST_TAG' from version '$PKG_VERSION' is not a valid tag; refusing to publish." >&2
+            exit 1
+          fi
           echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
           echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
           echo "Publishing @clustercode/cli@$PKG_VERSION with npm dist-tag '$DIST_TAG'"

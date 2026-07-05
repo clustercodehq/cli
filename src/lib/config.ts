@@ -119,7 +119,22 @@ export function getWorkerManifestUrl(sel: WorkerChannelSelector = {}): string {
   const tag = workerReleaseTag(sel);
   const override = process.env.WORKER_CDN_URL;
   if (override) {
-    return override.replace(/worker-agent-(?:latest|next|v[^/]+)/, tag);
+    // Only an EXPLICIT --prerelease/--agent-version selection redirects the
+    // release-tag segment of the override. The default (stable latest) leaves
+    // WORKER_CDN_URL verbatim, so it keeps meaning "this exact manifest" —
+    // including when a user pins it directly to a worker-agent-v<x> release.
+    const explicit = sel.version != null || sel.channel === 'next';
+    if (!explicit) return override;
+    try {
+      const u = new URL(override);
+      // Operate on the pathname only (never the host) and anchor to a whole
+      // …/worker-agent-*/ path segment (trailing '/' required), so we never
+      // eat an extension/query or rewrite an unrelated substring.
+      u.pathname = u.pathname.replace(/\/worker-agent-(?:latest|next|v[^/]+)(?=\/)/, `/${tag}`);
+      return u.href;
+    } catch {
+      return override; // not a parseable URL — honor it verbatim
+    }
   }
   return `${DEFAULT_WORKER_DIST_BASE}/${tag}/latest.json`;
 }
