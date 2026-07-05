@@ -134,7 +134,10 @@ async function ensureWorkerConfigInner(): Promise<boolean> {
   return true;
 }
 
-async function startWorkerProcess(runtime?: 'podman' | 'docker'): Promise<void> {
+async function startWorkerProcess(
+  runtime?: 'podman' | 'docker',
+  agent?: { channel?: 'next'; version?: string },
+): Promise<void> {
   const bypass = isAuthBypassEnabled();
 
   if (!bypass) {
@@ -154,7 +157,7 @@ async function startWorkerProcess(runtime?: 'podman' | 'docker'): Promise<void> 
   const spinner = clack.spinner();
   spinner.start('Preparing worker binary...');
   try {
-    const result = await ensureWorkerBinary();
+    const result = await ensureWorkerBinary({ channel: agent?.channel, version: agent?.version });
     switch (result.status) {
       case 'downloaded': spinner.stop(`Downloaded worker ${result.version}`); break;
       case 'up-to-date': spinner.stop(`Worker ${result.version} up to date`); break;
@@ -167,6 +170,15 @@ async function startWorkerProcess(runtime?: 'podman' | 'docker'): Promise<void> 
     console.error(pc.red(err instanceof Error ? err.message : String(err)));
     process.exit(1);
   }
+
+  // The "Preparing worker binary" spinner above puts stdin into raw mode via
+  // @clack/core, and on Windows @clack/core's cleanup skips restoring it (see
+  // lib/tty.ts). Restore it BEFORE spawning the child with stdio:'inherit' —
+  // otherwise the inherited raw-mode stdin leaves ENABLE_PROCESSED_INPUT off,
+  // so Ctrl+C is never translated into a signal and gets swallowed for both the
+  // CLI and the worker. Both the normal and auth-bypass paths reach here, so
+  // this is the single correct restore point before the worker runs.
+  restoreTty();
 
   const pkgDir = dirname(binary);
 
@@ -195,7 +207,9 @@ export const workerCommand = new Command('worker')
   .description('Start the ClusterCode worker on this machine')
   .option('--podman', 'Use Podman as the container engine')
   .option('--docker', 'Use Docker as the container engine')
-  .action(async (opts: { podman?: boolean; docker?: boolean }) => {
+  .option('--prerelease', 'Use the latest prerelease worker-agent (the "next" channel)')
+  .option('--agent-version <version>', 'Pin an exact worker-agent version (e.g. 1.0.0-alpha.4)')
+  .action(async (opts: { podman?: boolean; docker?: boolean; prerelease?: boolean; agentVersion?: string }) => {
     clack.intro(pc.bold('ClusterCode Worker'));
 
     if (opts.podman && opts.docker) {
@@ -207,6 +221,15 @@ export const workerCommand = new Command('worker')
       : opts.docker
         ? 'docker'
         : undefined;
+
+    // Worker-agent version/channel selection (npm-style): --agent-version pins an
+    // exact version; --prerelease follows the newest prerelease ('next'); default
+    // is the stable 'latest'. --agent-version wins if both are given.
+    const agent: { channel?: 'next'; version?: string } = opts.agentVersion
+      ? { version: opts.agentVersion }
+      : opts.prerelease
+        ? { channel: 'next' }
+        : {};
 
     if (process.env.WS_WORKER_AUTH_BYPASS === 'true' && !isAuthBypassEnabled()) {
       clack.log.warn(
@@ -232,7 +255,7 @@ export const workerCommand = new Command('worker')
         clack.log.info(`Auth bypass — initialized ${pc.dim('~/.clustercode/worker.json')}`);
       }
       clack.outro('Starting worker (auth bypass)...');
-      await startWorkerProcess(runtime);
+      await startWorkerProcess(runtime, agent);
       return;
     }
 
@@ -241,5 +264,5 @@ export const workerCommand = new Command('worker')
     if (!ready) return;
 
     clack.outro('Starting worker...');
-    await startWorkerProcess(runtime);
+    await startWorkerProcess(runtime, agent);
   });
