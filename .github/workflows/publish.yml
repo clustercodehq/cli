@@ -3,9 +3,20 @@ name: Publish CLI
 # Tag-triggered publish of @clustercode/cli to the npm registry — the same
 # mechanism as the rest of the platform (a git tag drives the release). Push a
 # `v<version>` tag whose version matches package.json and this builds, tests,
-# and publishes to npm. Prerelease versions go to their preid dist-tag
-# (alpha/beta/rc) so `@clustercode/cli@latest` only ever points at a stable
-# release; stable versions publish to `latest`.
+# and publishes to npm.
+#
+# dist-tag policy (decided AT publish time — see the "Resolve + verify version"
+# step): stable versions publish to `latest`. Prereleases normally publish to
+# their preid (alpha/beta/rc), EXCEPT while no stable release yet owns `latest`
+# (pre-1.0), when the newest prerelease OWNS `latest` so a plain
+# `npm i -g @clustercode/cli` isn't stuck on a stale build. This is self-limiting
+# — the moment a real stable claims `latest`, prereleases fall back to their
+# preid channel automatically.
+#
+# WHY decide at publish time (not with a post-publish `npm dist-tag add`): OIDC
+# trusted publishing only authenticates the `npm publish` call itself. A separate
+# `npm dist-tag add` in the same job has no credential and fails. So the only way
+# to move `latest` under OIDC is to publish UNDER `--tag latest`.
 #
 # Auth: npm TRUSTED PUBLISHING via GitHub OIDC — no NPM_TOKEN, nothing to expire
 # or rotate. The npm CLI exchanges the workflow's OIDC token for a short-lived
@@ -53,10 +64,26 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} (version ${TAG_VERSION}) does not match package.json version ${PKG_VERSION}; refusing to publish." >&2
             exit 1
           fi
-          # npm dist-tag: prerelease (X.Y.Z-<preid>...) → its preid; stable → latest.
+          # Choose the dist-tag to publish UNDER (OIDC can only set a tag at
+          # publish time — see the header comment).
+          #   stable (no '-')      → latest
+          #   prerelease (has '-') → its preid, UNLESS no stable owns `latest`
+          #                          yet (current latest is a prerelease or
+          #                          absent), in which case the prerelease owns
+          #                          `latest`. Self-limiting: once a stable claims
+          #                          `latest`, prereleases fall back to the preid.
           DIST_TAG=latest
           case "$PKG_VERSION" in
-            *-*) DIST_TAG="$(printf '%s' "$PKG_VERSION" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9A-Za-z]+).*/\1/')" ;;
+            *-*)
+              PREID="$(printf '%s' "$PKG_VERSION" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9A-Za-z]+).*/\1/')"
+              DIST_TAG="$PREID"
+              # npm view is an unauthenticated public read — fine here (pre-publish).
+              CUR_LATEST="$(npm view @clustercode/cli@latest version 2>/dev/null || echo '')"
+              case "$CUR_LATEST" in
+                *-*|'') DIST_TAG=latest ;;
+              esac
+              echo "Current 'latest' is '${CUR_LATEST:-<absent>}' → prerelease publishes to '$DIST_TAG'."
+              ;;
           esac
           # Guard: a valid npm dist-tag is a non-numeric identifier. Anything else
           # (odd/numeric preid, malformed version) fails clearly here rather than
@@ -77,32 +104,9 @@ jobs:
 
       # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates automatically
       # and adds provenance. (Config lives on npmjs.com, not in this repo.)
+      # The dist-tag was resolved above and is applied HERE, at publish time —
+      # this is the only tag placement OIDC can do (a post-publish `dist-tag add`
+      # has no credential and fails), so `latest` tracking is handled entirely by
+      # `--tag`, not a follow-up step.
       - name: Publish to npm (OIDC trusted publishing)
         run: npm publish --access public --tag "${{ steps.meta.outputs.dist_tag }}"
-
-      # Pre-1.0 phase: while there's no stable release yet, keep `latest` on the
-      # newest prerelease so a plain `npm i` isn't stuck on a stale build. This
-      # SELF-LIMITS: it only moves `latest` when the current `latest` is itself a
-      # prerelease (or absent). The moment a real stable version claims `latest`,
-      # this stops touching it. Best-effort — if the OIDC credential can't move a
-      # dist-tag, it warns and you run the one-liner it prints (publish already
-      # succeeded, so this never fails the release).
-      - name: Keep 'latest' on the newest prerelease (pre-1.0 only)
-        if: contains(steps.meta.outputs.version, '-')
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -uo pipefail
-          CUR_LATEST="$(npm view @clustercode/cli@latest version 2>/dev/null || echo '')"
-          case "$CUR_LATEST" in
-            *-*|'')
-              echo "Current 'latest' ($CUR_LATEST) is a prerelease/absent — moving latest → $VERSION"
-              if npm dist-tag add "@clustercode/cli@$VERSION" latest; then
-                echo "Moved 'latest' → $VERSION"
-              else
-                echo "::warning::Could not move 'latest' automatically (the OIDC credential may not permit dist-tag changes). Run manually: npm dist-tag add @clustercode/cli@$VERSION latest"
-              fi
-              ;;
-            *)
-              echo "Current 'latest' ($CUR_LATEST) is a STABLE release — leaving it untouched." ;;
-          esac
