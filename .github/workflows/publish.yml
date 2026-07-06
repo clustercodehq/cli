@@ -7,8 +7,11 @@ name: Publish CLI
 # (alpha/beta/rc) so `@clustercode/cli@latest` only ever points at a stable
 # release; stable versions publish to `latest`.
 #
-# Requires an `NPM_TOKEN` repo secret (an npm automation token with publish
-# rights to the @clustercode scope).
+# Auth: npm TRUSTED PUBLISHING via GitHub OIDC — no NPM_TOKEN, nothing to expire
+# or rotate. The npm CLI exchanges the workflow's OIDC token for a short-lived
+# publish credential per run, and provenance attestations are generated
+# automatically. Requires a one-time trusted-publisher config on npmjs.com for
+# @clustercode/cli pointing at this repo + workflow filename (publish.yml).
 
 on:
   push:
@@ -17,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write # required for npm trusted publishing (OIDC)
 
 concurrency:
   group: publish-cli
@@ -31,8 +35,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm >= 11.5.1; force-upgrade so we don't depend
+      # on whatever npm the Node image happens to bundle.
+      - name: Ensure OIDC-capable npm
+        run: npm install -g npm@latest
 
       - name: Resolve + verify version
         id: meta
@@ -66,7 +75,7 @@ jobs:
 
       - run: npm run test:unit
 
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates automatically
+      # and adds provenance. (Config lives on npmjs.com, not in this repo.)
+      - name: Publish to npm (OIDC trusted publishing)
         run: npm publish --access public --tag "${{ steps.meta.outputs.dist_tag }}"
