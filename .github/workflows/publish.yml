@@ -79,3 +79,30 @@ jobs:
       # and adds provenance. (Config lives on npmjs.com, not in this repo.)
       - name: Publish to npm (OIDC trusted publishing)
         run: npm publish --access public --tag "${{ steps.meta.outputs.dist_tag }}"
+
+      # Pre-1.0 phase: while there's no stable release yet, keep `latest` on the
+      # newest prerelease so a plain `npm i` isn't stuck on a stale build. This
+      # SELF-LIMITS: it only moves `latest` when the current `latest` is itself a
+      # prerelease (or absent). The moment a real stable version claims `latest`,
+      # this stops touching it. Best-effort — if the OIDC credential can't move a
+      # dist-tag, it warns and you run the one-liner it prints (publish already
+      # succeeded, so this never fails the release).
+      - name: Keep 'latest' on the newest prerelease (pre-1.0 only)
+        if: contains(steps.meta.outputs.version, '-')
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -uo pipefail
+          CUR_LATEST="$(npm view @clustercode/cli@latest version 2>/dev/null || echo '')"
+          case "$CUR_LATEST" in
+            *-*|'')
+              echo "Current 'latest' ($CUR_LATEST) is a prerelease/absent — moving latest → $VERSION"
+              if npm dist-tag add "@clustercode/cli@$VERSION" latest; then
+                echo "Moved 'latest' → $VERSION"
+              else
+                echo "::warning::Could not move 'latest' automatically (the OIDC credential may not permit dist-tag changes). Run manually: npm dist-tag add @clustercode/cli@$VERSION latest"
+              fi
+              ;;
+            *)
+              echo "Current 'latest' ($CUR_LATEST) is a STABLE release — leaving it untouched." ;;
+          esac
