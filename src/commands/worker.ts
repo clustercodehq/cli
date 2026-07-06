@@ -3,6 +3,7 @@ import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { dirname } from 'node:path';
+import { createInterface } from 'node:readline';
 import {
   readCredentials,
   readWorkerConfig,
@@ -11,6 +12,7 @@ import {
 } from '../lib/config.js';
 import { ensureWorkerBinary } from '../lib/worker-binary.js';
 import { restoreTty } from '../lib/tty.js';
+import { formatWorkerLogLine } from '../lib/worker-log.js';
 
 /** Loopback hosts where the auth bypass is permitted. */
 function isLoopbackHost(host: string): boolean {
@@ -185,11 +187,26 @@ async function startWorkerProcess(
   const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: '1' };
   if (runtime) env.CONTAINER_RUNTIME = runtime;
 
+  // stdin stays inherited (the Ctrl+C/TTY fix above depends on it), but
+  // stdout/stderr are piped so the agent's slog JSON can be reformatted into
+  // readable, colored lines (see lib/worker-log.ts). readline buffers partial
+  // chunks into whole lines and flushes the remainder on close, and non-JSON
+  // output (panics, raw prints) passes through verbatim.
   const child: ChildProcess = spawn(binary, [], {
     cwd: pkgDir,
-    stdio: 'inherit',
+    stdio: ['inherit', 'pipe', 'pipe'],
     env,
   });
+
+  for (const [source, sink] of [
+    [child.stdout, process.stdout],
+    [child.stderr, process.stderr],
+  ] as const) {
+    if (!source) continue;
+    createInterface({ input: source }).on('line', (line) => {
+      sink.write(formatWorkerLogLine(line) + '\n');
+    });
+  }
 
   child.on('exit', (code) => {
     process.exit(code ?? 1);
