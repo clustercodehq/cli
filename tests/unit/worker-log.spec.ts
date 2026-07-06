@@ -38,8 +38,35 @@ describe('formatWorkerLogLine', () => {
   });
 
   it('serializes non-string field values as JSON', () => {
-    const out = fmt('{"time":"2026-07-06T14:08:26Z","level":"INFO","msg":"startup configuration","cpus":14,"windowsImages":false}');
+    const out = fmt('{"time":"2026-07-06T14:08:26Z","level":"INFO","msg":"probe","cpus":14,"windowsImages":false}');
     assert.match(out, /cpus=14 windowsImages=false$/);
+  });
+
+  it('expands records with >2 fields into an aligned tree block', () => {
+    const out = fmt(
+      '{"time":"2026-07-06T14:32:03Z","level":"INFO","msg":"startup configuration","configDir":"/Users/javier/.clustercode","mode":"byom","engines":"podman","cpus":14}',
+    );
+    const lines = out.split('\n');
+    assert.equal(lines.length, 5); // head + 4 field branches
+    assert.match(lines[0], /● {2}startup configuration$/); // no inline fields on the head
+    assert.match(lines[1], /^ {14}├─ configDir {2}\/Users\/javier\/\.clustercode$/);
+    assert.match(lines[2], /^ {14}├─ mode {7}byom$/); // key padded to 'configDir' width (9)
+    assert.match(lines[4], /^ {14}└─ cpus {7}14$/); // last branch uses └─
+  });
+
+  it('keeps records with exactly 2 fields inline (no tree)', () => {
+    const out = fmt('{"time":"2026-07-06T14:32:03Z","level":"INFO","msg":"two fields","a":"1","b":"2"}');
+    assert.equal(out.includes('\n'), false);
+    assert.match(out, /two fields {2}a=1 b=2$/);
+  });
+
+  it('expands a WARN record too, keeping the yellow head symbol line intact', () => {
+    const out = fmt(
+      '{"time":"2026-07-06T14:33:11Z","level":"WARN","msg":"engine unreachable","engine":"podman","detail":"exit status 125","action":"re-resolving connection"}',
+    );
+    const lines = out.split('\n');
+    assert.match(lines[0], /▲ {2}engine unreachable$/);
+    assert.match(lines[3], /^ {14}└─ action {2}re-resolving connection$/);
   });
 
   it('passes non-JSON lines through verbatim (panics, raw prints)', () => {
