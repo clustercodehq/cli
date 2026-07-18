@@ -1,6 +1,6 @@
 {
   "name": "@clustercode/cli",
-  "version": "1.0.0-alpha.7",
+  "version": "1.0.0-beta.1",
   "type": "module",
   "description": "CLI for the ClusterCode platform",
   "keywords": [
@@ -27,7 +27,7 @@
   ],
   "publishConfig": {
     "access": "public",
-    "tag": "alpha"
+    "tag": "beta"
   },
   "scripts": {
     "build": "tsc",
