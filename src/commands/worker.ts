@@ -139,6 +139,7 @@ async function ensureWorkerConfigInner(): Promise<boolean> {
 async function startWorkerProcess(
   runtime?: 'podman' | 'docker',
   agent?: { channel?: 'next'; version?: string },
+  verbose?: boolean,
 ): Promise<void> {
   const bypass = isAuthBypassEnabled();
 
@@ -186,6 +187,10 @@ async function startWorkerProcess(
 
   const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: '1' };
   if (runtime) env.CONTAINER_RUNTIME = runtime;
+  // Verbose is delivered via env, not argv: the agent honors LOG_LEVEL on
+  // every released version, whereas its --verbose flag only exists ≥beta.13 —
+  // env keeps `clustercode worker --verbose` working with any pinned agent.
+  if (verbose) env.LOG_LEVEL = 'debug';
 
   // stdin stays inherited (the Ctrl+C/TTY fix above depends on it), but
   // stdout/stderr are piped so the agent's slog JSON can be reformatted into
@@ -226,7 +231,8 @@ export const workerCommand = new Command('worker')
   .option('--docker', 'Use Docker as the container engine')
   .option('--prerelease', 'Use the latest prerelease worker-agent (the "next" channel)')
   .option('--agent-version <version>', 'Pin an exact worker-agent version (e.g. 1.0.0-alpha.4)')
-  .action(async (opts: { podman?: boolean; docker?: boolean; prerelease?: boolean; agentVersion?: string }) => {
+  .option('-v, --verbose', 'Verbose worker-agent logging (debug level)')
+  .action(async (opts: { podman?: boolean; docker?: boolean; prerelease?: boolean; agentVersion?: string; verbose?: boolean }) => {
     clack.intro(pc.bold('ClusterCode Worker'));
 
     if (opts.podman && opts.docker) {
@@ -285,7 +291,7 @@ export const workerCommand = new Command('worker')
         clack.log.info(`Auth bypass — initialized ${pc.dim('~/.clustercode/worker.json')}`);
       }
       clack.outro('Starting worker (auth bypass)...');
-      await startWorkerProcess(runtime, agent);
+      await startWorkerProcess(runtime, agent, opts.verbose);
       return;
     }
 
@@ -294,5 +300,5 @@ export const workerCommand = new Command('worker')
     if (!ready) return;
 
     clack.outro('Starting worker...');
-    await startWorkerProcess(runtime, agent);
+    await startWorkerProcess(runtime, agent, opts.verbose);
   });
