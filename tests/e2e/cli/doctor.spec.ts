@@ -44,6 +44,13 @@ describe('doctor', () => {
       assert.ok(['pass', 'fail', 'warn'].includes(check.status));
       assert.ok(typeof check.name === 'string');
       assert.ok(typeof check.detail === 'string');
+      // The optional engine field must stay name+version only: CheckResult is
+      // serialized verbatim here, and the engine's resolved filesystem path can
+      // embed the local username (per-user installs), which must not leak into
+      // machine-readable output.
+      if (check.engine !== undefined) {
+        assert.deepEqual(Object.keys(check.engine).sort(), ['name', 'version']);
+      }
     }
   });
 
@@ -89,7 +96,7 @@ describe('doctor exit codes', () => {
   });
 
   /** Runs with an isolated, empty home so the auth + worker checks are guaranteed to fail. */
-  function runUnhealthy(...args: string[]): { stdout: string; exitCode: number } {
+  function runUnhealthy(...args: string[]): { stdout: string; exitCode: number; timedOut: boolean } {
     const env = {
       ...process.env,
       NO_COLOR: '1',
@@ -104,27 +111,37 @@ describe('doctor exit codes', () => {
         ['--import', 'tsx', join(cliRoot, 'src', 'cli.ts'), 'doctor', ...args],
         { encoding: 'utf-8', cwd: cliRoot, timeout: 30_000, env },
       );
-      return { stdout, exitCode: 0 };
+      return { stdout, exitCode: 0, timedOut: false };
     } catch (err: unknown) {
-      const e = err as { stdout?: string; stderr?: string; status?: number };
-      return { stdout: [e.stdout ?? '', e.stderr ?? ''].join('\n'), exitCode: e.status ?? 1 };
+      const e = err as { stdout?: string; stderr?: string; status?: number; signal?: string | null };
+      return {
+        stdout: [e.stdout ?? '', e.stderr ?? ''].join('\n'),
+        exitCode: e.status ?? 1,
+        // A hang at the confirm prompt surfaces as a timeout kill: status is null
+        // and signal is set. Without checking this, `e.status ?? 1` coerces the
+        // kill to exit code 1 and every assertion below passes vacuously.
+        timedOut: e.signal != null,
+      };
     }
   }
 
   it('exits non-zero on failures without --json, so it works as a scripted gate', () => {
-    const { exitCode } = runUnhealthy();
+    const { exitCode, timedOut } = runUnhealthy();
+    assert.equal(timedOut, false, 'doctor was killed by the test timeout instead of exiting');
     assert.equal(exitCode, 1);
   });
 
   it('exits non-zero on failures with --json', () => {
-    const { exitCode } = runUnhealthy('--json');
+    const { exitCode, timedOut } = runUnhealthy('--json');
+    assert.equal(timedOut, false, 'doctor was killed by the test timeout instead of exiting');
     assert.equal(exitCode, 1);
   });
 
   it('does not hang waiting for the onboard prompt without a TTY', () => {
     // stdin is not a TTY here; the confirm must be skipped rather than block until
     // the 30s timeout kills the process.
-    const { stdout } = runUnhealthy();
+    const { stdout, timedOut } = runUnhealthy();
+    assert.equal(timedOut, false, 'doctor was killed by the test timeout instead of exiting');
     assert.match(stdout, /clustercode onboard/);
   });
 });

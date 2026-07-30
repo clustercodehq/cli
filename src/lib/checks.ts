@@ -118,21 +118,29 @@ export async function checkOrchestratorConnectivity(): Promise<CheckResult> {
   }
 }
 
-function detectContainerEngine(): { name: string; path: string; version: string } | null {
+interface DetectedEngine {
+  name: string;
+  path: string;
+  version: string;
+}
+
+/** Every engine present on this machine, in preference order (Podman first). */
+function detectContainerEngines(): DetectedEngine[] {
   // An engine installed after this shell started is absent from the inherited
   // PATH, which would otherwise make every doctor run report "not found" for an
   // engine that is sitting on disk. Cheap filesystem probe, memoized.
   augmentPathWithKnownEngineDirs();
 
+  const found: DetectedEngine[] = [];
   for (const engine of ['podman', 'docker']) {
     const version = execSilent(`${engine} --version`);
     if (version) {
       const path = resolveExecutable(engine) ?? engine;
       const versionMatch = version.match(/(\d+\.\d+\.\d+)/);
-      return { name: engine, path, version: versionMatch?.[1] ?? version };
+      found.push({ name: engine, path, version: versionMatch?.[1] ?? version });
     }
   }
-  return null;
+  return found;
 }
 
 /**
@@ -180,49 +188,42 @@ function isPodmanMachineRunning(): boolean {
   return output.split(/\r?\n/).some((line) => line.trim().toLowerCase() === 'true');
 }
 
-export function checkContainerRuntime(): CheckResult {
-  const engine = detectContainerEngine();
-  if (!engine) {
-    return { name: 'container-runtime', status: 'fail', detail: 'Podman or Docker not found' };
-  }
+/** Is this specific engine actually able to run containers right now? */
+function evaluateEngine(engine: DetectedEngine): CheckResult {
+  // Deliberately excludes the resolved filesystem path: CheckResult is serialized
+  // verbatim into `doctor --json`, and a per-user install path embeds the local
+  // username. Callers that need the path resolve it themselves.
+  const engineInfo = { name: engine.name, version: engine.version };
+  const label = `${engine.name} v${engine.version}`;
 
   // For Podman on macOS/Windows, check machine status directly since `podman info`
   // can exit non-zero even when a machine is running (socket connection issues).
   const needsMachine = engine.name === 'podman' && (process.platform === 'darwin' || process.platform === 'win32');
-  if (needsMachine) {
-    if (isPodmanMachineRunning()) {
-      return {
+  const usable = needsMachine ? isPodmanMachineRunning() : execSilent(`${engine.name} info`) !== null;
+
+  return usable
+    ? { name: 'container-runtime', status: 'pass', detail: label, engine: engineInfo }
+    : {
         name: 'container-runtime',
-        status: 'pass',
-        detail: `${engine.name} v${engine.version}`,
-        engine,
+        status: 'fail',
+        // Status only — onboarding prints the start commands as this check's remediation.
+        detail: `${label} found but not running`,
+        engine: engineInfo,
       };
-    }
-    return {
-      name: 'container-runtime',
-      status: 'fail',
-      // Status only — onboarding prints the start commands as this check's remediation.
-      detail: `${engine.name} v${engine.version} found but not running`,
-      engine,
-    };
+}
+
+export function checkContainerRuntime(): CheckResult {
+  const engines = detectContainerEngines();
+  if (engines.length === 0) {
+    return { name: 'container-runtime', status: 'fail', detail: 'Podman or Docker not found' };
   }
 
-  const info = execSilent(`${engine.name} info`);
-  if (!info) {
-    return {
-      name: 'container-runtime',
-      status: 'fail',
-      detail: `${engine.name} v${engine.version} found but not running`,
-      engine,
-    };
-  }
-
-  return {
-    name: 'container-runtime',
-    status: 'pass',
-    detail: `${engine.name} v${engine.version}`,
-    engine,
-  };
+  // Report a WORKING engine if any exists, rather than the first one installed.
+  // Podman installed with its machine stopped alongside a running Docker used to
+  // report a failure and — once `worker` gained a runtime preflight — refuse to
+  // start, even though the machine had a perfectly usable engine.
+  const results = engines.map(evaluateEngine);
+  return results.find((r) => r.status === 'pass') ?? results[0];
 }
 
 /** Container images and the worker binary land under ~/.clustercode, so measure the volume that holds it — not always C:. */
@@ -244,6 +245,20 @@ export function evaluateDisk(freeBytes: number, location: string): CheckResult {
   return { name: 'disk', status: 'pass', detail };
 }
 
+/**
+ * Parse the data line of `df -Pk <path>` output into available bytes and the
+ * mount point. Anchors on the three numeric block fields plus the capacity
+ * percentage rather than splitting on whitespace at fixed indexes: a device
+ * name containing spaces (e.g. macOS's "map auto_home") shifts every
+ * whitespace-split field, and a mount point containing spaces would otherwise
+ * be truncated at its first word. Exported for tests.
+ */
+export function parseDfLine(line: string): { availBytes: number; mount: string } | null {
+  const match = line.match(/\s(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+(.+)$/);
+  if (!match) return null;
+  return { availBytes: parseInt(match[3], 10) * 1024, mount: match[4].trim() };
+}
+
 export function checkDiskSpace(): CheckResult {
   const target = diskCheckTarget();
 
@@ -261,16 +276,16 @@ export function checkDiskSpace(): CheckResult {
     if (!isNaN(freeBytes)) {
       return evaluateDisk(freeBytes, `${driveLetter.toUpperCase()}:`);
     }
-  } else if (!target.includes('"')) {
-    // -P forces single-line output, so the fields stay at fixed indexes even when
-    // the device name is long enough that df would otherwise wrap it.
-    const output = execSilent(`df -Pk "${target}" | tail -1`);
-    if (output) {
-      const parts = output.split(/\s+/);
-      const availKB = parseInt(parts[3], 10);
-      if (!isNaN(availKB)) {
-        return evaluateDisk(availKB * 1024, parts[5] ?? target);
-      }
+  } else if (!target.includes("'")) {
+    // Single quotes so the shell treats the path literally — inside double
+    // quotes, `$(...)`, backticks, and `$var` in a home directory path would be
+    // expanded (and executed) by /bin/sh. A path containing a single quote
+    // (excluded above) falls through to the "could not determine" warning.
+    // -P forces single-line output, so a long device name cannot wrap the line.
+    const output = execSilent(`df -Pk '${target}' | tail -1`);
+    const parsed = output ? parseDfLine(output) : null;
+    if (parsed) {
+      return evaluateDisk(parsed.availBytes, parsed.mount);
     }
   }
 

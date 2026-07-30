@@ -52,7 +52,10 @@ export function mergePathEntries(existing: string[], additions: string[]): strin
 }
 
 function currentPathEntries(): string[] {
-  return (process.env.Path ?? process.env.PATH ?? '').split(PATH_SEP).filter(Boolean);
+  // PATH first: on Windows process.env is case-insensitive, so both spellings
+  // read the same entry; on POSIX only PATH is meaningful, and a stray `Path`
+  // variable must not shadow (and then clobber) the real PATH.
+  return (process.env.PATH ?? process.env.Path ?? '').split(PATH_SEP).filter(Boolean);
 }
 
 /** Returns true when the PATH actually changed. */

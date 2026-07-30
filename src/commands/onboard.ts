@@ -431,6 +431,9 @@ async function runOnboardInner(): Promise<void> {
   const failures = results.filter((r) => r.status === 'fail');
 
   if (failures.length === 0) {
+    // Explicitly clear the exit code: doctor sets process.exitCode = 1 before
+    // delegating here, and a "everything looks good" outcome must not exit 1.
+    process.exitCode = 0;
     clack.outro(pc.green('Everything looks good! No issues to fix.'));
     return;
   }

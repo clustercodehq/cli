@@ -64,6 +64,35 @@ function createPodmanStub(opts: { version: string; machineOutput: string }): voi
   }
 }
 
+/** Create a docker stub that reports a version and a healthy daemon via `docker info`. */
+function createHealthyDockerStub(version: string): void {
+  if (isWin) {
+    const script = [
+      '@echo off',
+      'echo %* | findstr /C:"--version" >nul 2>&1 && (',
+      `  echo Docker version ${version}, build abc1234`,
+      '  exit /b 0',
+      ')',
+      'echo %* | findstr /C:"info" >nul 2>&1 && (',
+      '  echo Server Version: ' + version,
+      '  exit /b 0',
+      ')',
+      'exit /b 1',
+    ].join('\r\n');
+    writeFileSync(join(stubDir, 'docker.cmd'), script);
+  } else {
+    const script = [
+      '#!/bin/sh',
+      'case "$*" in',
+      `  *--version*) echo "Docker version ${version}, build abc1234"; exit 0 ;;`,
+      `  *info*) echo "Server Version: ${version}"; exit 0 ;;`,
+      '  *) exit 1 ;;',
+      'esac',
+    ].join('\n');
+    writeFileSync(join(stubDir, 'docker'), script, { mode: 0o755 });
+  }
+}
+
 function seedConfigs(): void {
   const dir = join(tempHome, '.clustercode');
   mkdirSync(dir, { recursive: true });
@@ -81,7 +110,13 @@ function seedConfigs(): void {
   );
 }
 
-function runDoctor(env: Record<string, string> = {}): { checks: Record<string, { status: string; detail: string }> } {
+interface DoctorCheck {
+  status: string;
+  detail: string;
+  engine?: { name: string; version: string };
+}
+
+function runDoctor(env: Record<string, string> = {}): { checks: Record<string, DoctorCheck> } {
   const fullEnv = {
     ...process.env,
     NO_COLOR: '1',
@@ -114,9 +149,9 @@ function runDoctor(env: Record<string, string> = {}): { checks: Record<string, {
   assert.ok(jsonMatch !== null, `Expected JSON in stdout but got: ${stdout.slice(0, 500)}`);
   const jsonStart = jsonMatch.index!;
   const result = JSON.parse(stdout.slice(jsonStart));
-  const checks: Record<string, { status: string; detail: string }> = {};
+  const checks: Record<string, DoctorCheck> = {};
   for (const c of result.checks) {
-    checks[c.name] = { status: c.status, detail: c.detail };
+    checks[c.name] = { status: c.status, detail: c.detail, engine: c.engine };
   }
   return { checks };
 }
@@ -146,6 +181,39 @@ describe('container-runtime check', () => {
 
     const { checks } = runDoctor();
     assert.equal(checks['container-runtime'].status, 'pass');
+  });
+
+  it('reports the working engine when a stopped Podman sits in front of a running Docker', () => {
+    // Detection returns Podman first. Before the check evaluated every engine, a
+    // stopped Podman machine masked a perfectly usable Docker — and once `worker`
+    // gained a runtime preflight, that made it refuse to start on a healthy box.
+    seedConfigs();
+    createPodmanStub({ version: '5.8.1', machineOutput: 'false' });
+    createHealthyDockerStub('27.1.1');
+
+    // Ignore any real engine on this machine so only the stubs are in play.
+    const { checks } = runDoctor({ CLUSTERCODE_NO_ENGINE_PATH_PROBE: '1' });
+    assert.equal(checks['container-runtime'].status, 'pass');
+    assert.match(checks['container-runtime'].detail, /docker v27\.1\.1/);
+  });
+
+  it('reports the stopped engine when no engine is usable', () => {
+    // With nothing working, the first-detected engine's failure is what surfaces,
+    // so the remediation names an engine the user actually has.
+    seedConfigs();
+    createPodmanStub({ version: '5.8.1', machineOutput: 'false' });
+
+    // Restrict PATH to the stubs so a real Docker on this machine cannot satisfy
+    // the check and mask the behavior under test.
+    const nodeBin = dirname(process.execPath);
+    const minimalPath = isWin
+      ? [stubDir, nodeBin, `${process.env.SystemRoot}\\system32`].join(';')
+      : [stubDir, nodeBin, '/usr/bin', '/bin'].join(':');
+
+    const { checks } = runDoctor({ PATH: minimalPath, CLUSTERCODE_NO_ENGINE_PATH_PROBE: '1' });
+    assert.equal(checks['container-runtime'].status, 'fail');
+    assert.match(checks['container-runtime'].detail, /podman v5\.8\.1 found but not running/);
+    assert.equal(checks['container-runtime'].engine?.name, 'podman');
   });
 
   it('reports fail when no container engine is found', () => {
