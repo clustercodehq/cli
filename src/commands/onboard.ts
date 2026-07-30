@@ -6,8 +6,10 @@ import {
   runAllChecks,
   checkContainerRuntime,
   checkWsl,
+  type CheckResult,
 } from '../lib/checks.js';
 import { readCredentials } from '../lib/config.js';
+import { locateContainerEngine } from '../lib/env-path.js';
 import { restoreTty } from '../lib/tty.js';
 
 function execSilent(cmd: string): string | null {
@@ -27,12 +29,22 @@ function detectLinuxDistro(): 'debian' | 'fedora' | 'unknown' {
   return 'unknown';
 }
 
-function getInstallInstructions(): { auto: string[]; manual: string } {
+/**
+ * Commands for the automatic path (`install`) and the copy-pasteable fallback
+ * (`manual`).
+ *
+ * `install` deliberately covers installation ONLY — starting the runtime is left
+ * to startContainerRuntime(), which checks for an existing Podman machine first.
+ * Listing `podman machine init` here meant a retry after a partial failure ran
+ * init against an already-initialized machine, which errors out and aborted the
+ * sequence before `podman machine start` ever ran.
+ */
+function getInstallInstructions(): { install: string[]; manual: string } {
   const platform = process.platform;
 
   if (platform === 'darwin') {
     return {
-      auto: ['brew install podman', 'podman machine init', 'podman machine start'],
+      install: ['brew install podman'],
       manual: [
         'Install Podman:',
         '  brew install podman',
@@ -46,14 +58,15 @@ function getInstallInstructions(): { auto: string[]; manual: string } {
 
   if (platform === 'win32') {
     return {
-      auto: [
-        'winget install RedHat.Podman',
-        'podman machine init',
-        'podman machine start',
+      // -e --id pins the exact package (a fuzzy name match can prompt for
+      // disambiguation), and the accept/interactivity flags keep winget from
+      // blocking on an agreement prompt inside a non-interactive child process.
+      install: [
+        'winget install -e --id RedHat.Podman --accept-package-agreements --accept-source-agreements --disable-interactivity',
       ],
       manual: [
         'Install Podman:',
-        '  winget install RedHat.Podman',
+        '  winget install -e --id RedHat.Podman',
         '  podman machine init',
         '  podman machine start',
         '',
@@ -62,6 +75,8 @@ function getInstallInstructions(): { auto: string[]; manual: string } {
         'Note: WSL2 is required. If not installed:',
         '  wsl --install',
         '  (restart your computer after WSL2 installation)',
+        '',
+        'After installing, open a NEW terminal so podman is on your PATH.',
       ].join('\n'),
     };
   }
@@ -70,7 +85,7 @@ function getInstallInstructions(): { auto: string[]; manual: string } {
   const distro = detectLinuxDistro();
   if (distro === 'debian') {
     return {
-      auto: ['sudo apt update', 'sudo apt install -y podman'],
+      install: ['sudo apt update', 'sudo apt install -y podman'],
       manual: [
         'Install Podman:',
         '  sudo apt update && sudo apt install -y podman',
@@ -79,7 +94,7 @@ function getInstallInstructions(): { auto: string[]; manual: string } {
   }
   if (distro === 'fedora') {
     return {
-      auto: ['sudo dnf install -y podman'],
+      install: ['sudo dnf install -y podman'],
       manual: [
         'Install Podman:',
         '  sudo dnf install -y podman',
@@ -88,7 +103,7 @@ function getInstallInstructions(): { auto: string[]; manual: string } {
   }
 
   return {
-    auto: [],
+    install: [],
     manual: [
       'Install Podman for your distribution:',
       '  https://podman.io/docs/installation#linux',
@@ -96,12 +111,17 @@ function getInstallInstructions(): { auto: string[]; manual: string } {
   };
 }
 
-function runCommand(cmd: string): boolean {
+interface CommandOutcome {
+  ok: boolean;
+  code: number;
+}
+
+function runCommand(cmd: string): CommandOutcome {
   try {
     execSync(cmd, { stdio: 'inherit' });
-    return true;
-  } catch {
-    return false;
+    return { ok: true, code: 0 };
+  } catch (err) {
+    return { ok: false, code: (err as { status?: number }).status ?? 1 };
   }
 }
 
@@ -119,7 +139,7 @@ async function fixWsl(): Promise<boolean> {
     if (clack.isCancel(shouldInstall) || !shouldInstall) return false;
 
     clack.log.step(`Running: ${pc.dim('wsl --install -d Ubuntu')}`);
-    if (!runCommand('wsl --install -d Ubuntu')) {
+    if (!runCommand('wsl --install -d Ubuntu').ok) {
       clack.log.error('Failed to install Ubuntu distro.');
       return false;
     }
@@ -151,7 +171,7 @@ async function fixWsl(): Promise<boolean> {
   }
 
   clack.log.step(`Running: ${pc.dim('wsl --install')}`);
-  if (!runCommand('wsl --install')) {
+  if (!runCommand('wsl --install').ok) {
     clack.log.error('Failed to install WSL2. You may need to run this from an Administrator terminal.');
     clack.log.info(`Try running manually: ${pc.dim('wsl --install')}`);
     return false;
@@ -166,18 +186,27 @@ async function fixWsl(): Promise<boolean> {
 
 async function startContainerRuntime(engineName: string): Promise<boolean> {
   if (engineName === 'podman') {
+    // Podman on Linux runs containers directly — there is no VM to init or start.
+    if (process.platform === 'linux') {
+      const check = checkContainerRuntime();
+      if (check.status !== 'pass') clack.log.error(check.detail);
+      return check.status === 'pass';
+    }
+
     // Check if a Podman machine exists
     const machines = execSilent('podman machine list --format "{{.Name}}"');
     if (!machines || machines.trim() === '') {
       clack.log.step(`Initializing Podman machine...`);
-      if (!runCommand('podman machine init')) {
+      if (!runCommand('podman machine init').ok) {
         clack.log.error('Failed to initialize Podman machine.');
         return false;
       }
     }
 
     clack.log.step('Starting Podman machine...');
-    if (!runCommand('podman machine start')) {
+    // `podman machine start` exits non-zero when the machine is ALREADY running,
+    // so let the health check have the final word rather than the exit code.
+    if (!runCommand('podman machine start').ok && checkContainerRuntime().status !== 'pass') {
       clack.log.error('Failed to start Podman machine.');
       return false;
     }
@@ -196,7 +225,7 @@ async function startContainerRuntime(engineName: string): Promise<boolean> {
       return false;
     } else {
       clack.log.step('Starting Docker...');
-      if (!runCommand('sudo systemctl start docker')) {
+      if (!runCommand('sudo systemctl start docker').ok) {
         clack.log.error('Failed to start Docker.');
         return false;
       }
@@ -230,7 +259,7 @@ async function fixContainerRuntime(): Promise<boolean> {
   // Not installed at all — offer to install
   const instructions = getInstallInstructions();
 
-  if (instructions.auto.length === 0) {
+  if (instructions.install.length === 0) {
     clack.log.info(instructions.manual);
     return false;
   }
@@ -283,13 +312,41 @@ async function fixContainerRuntime(): Promise<boolean> {
     }
   }
 
-  for (const cmd of instructions.auto) {
+  // Run every install command, then let a binary probe decide whether it worked.
+  // Exit codes alone are not a reliable signal: winget exits non-zero for
+  // "No available upgrade found" when the package is already present, which is
+  // not a failure. Warn as we go, but reserve the verdict for the probe.
+  const failedCommands: string[] = [];
+  for (const cmd of instructions.install) {
     clack.log.step(`Running: ${pc.dim(cmd)}`);
-    const ok = runCommand(cmd);
+    const { ok, code } = runCommand(cmd);
     if (!ok) {
-      clack.log.error(`Command failed: ${cmd}`);
-      return false;
+      failedCommands.push(cmd);
+      clack.log.warn(`Exited with code ${code}: ${pc.dim(cmd)}`);
     }
+  }
+
+  const located = locateContainerEngine();
+  if (!located) {
+    clack.log.error(
+      failedCommands.length > 0
+        ? `Install failed: ${failedCommands.join(', ')}`
+        : 'Install finished, but no container engine could be found afterwards.',
+    );
+    console.log();
+    clack.log.info(instructions.manual);
+    console.log();
+    return false;
+  }
+
+  if (located.viaPathRepair) {
+    // The installer updated the machine PATH, but this process (and the shell
+    // that launched it) started beforehand, so both inherited a stale copy.
+    clack.log.info(
+      `Found ${located.name} at ${pc.dim(located.path)}.\n` +
+      `It was installed after this terminal started — open a ${pc.bold('new terminal')} for ` +
+      `${pc.dim(located.name)} to be available outside this wizard.`,
+    );
   }
 
   const recheck = checkContainerRuntime();
@@ -298,19 +355,61 @@ async function fixContainerRuntime(): Promise<boolean> {
     return true;
   }
 
-  // Installed but might need starting (e.g., macOS podman machine)
-  if (recheck.engine) {
-    clack.log.info('Installed successfully. Now starting the runtime...');
-    const started = await startContainerRuntime(recheck.engine.name);
-    if (started) {
-      const finalCheck = checkContainerRuntime();
-      clack.log.success(finalCheck.detail);
-      return true;
-    }
+  clack.log.info('Installed successfully. Now starting the runtime...');
+  if (await startContainerRuntime(located.name)) {
+    clack.log.success(checkContainerRuntime().detail);
+    return true;
   }
 
   clack.log.error('Container runtime still not healthy after installation.');
+  console.log();
+  clack.log.info(instructions.manual);
+  console.log();
   return false;
+}
+
+/**
+ * What to actually run for a check that is still failing after the wizard. The
+ * old outro said only "Fix manually and re-run", leaving the user with no idea
+ * what "manually" meant.
+ */
+function remediationHint(check: CheckResult): string | null {
+  switch (check.name) {
+    case 'auth':
+      return 'Run: clustercode login';
+    case 'worker':
+      return 'Run: clustercode worker';
+    case 'wsl':
+      return [
+        'Install WSL2 (from an Administrator terminal):',
+        '  wsl --install',
+        'Then restart your computer.',
+      ].join('\n');
+    case 'container-runtime':
+      // Already installed, just not started — don't tell them to reinstall it.
+      if (check.engine) {
+        return check.engine.name === 'podman'
+          ? ['Start Podman:', '  podman machine init   (first time only)', '  podman machine start'].join('\n')
+          : `Start ${check.engine.name}, then re-run this command.`;
+      }
+      return getInstallInstructions().manual;
+    case 'orchestrator':
+      return 'Check the orchestrator URL:\n  clustercode config set orchestrator-url <url>';
+    default:
+      return null;
+  }
+}
+
+/** Print each failing check with the command that fixes it. */
+function reportRemainingFailures(failures: CheckResult[]): void {
+  for (const failure of failures) {
+    console.log(`  ${pc.red('✗')} ${failure.detail}`);
+    const hint = remediationHint(failure);
+    if (hint) {
+      console.log(hint.split('\n').map((line) => `      ${pc.dim(line)}`).join('\n'));
+    }
+    console.log();
+  }
 }
 
 export async function runOnboard(): Promise<void> {
@@ -333,6 +432,19 @@ async function runOnboardInner(): Promise<void> {
 
   if (failures.length === 0) {
     clack.outro(pc.green('Everything looks good! No issues to fix.'));
+    return;
+  }
+
+  // Every fix step below is a prompt. Without a TTY the first one hits EOF and
+  // kills the process mid-wizard, so report what is wrong and how to fix it
+  // instead of half-running and dying at the first question.
+  if (!process.stdin.isTTY) {
+    clack.log.warn(
+      `${failures.length} ${failures.length === 1 ? 'issue' : 'issues'} found, but there is no interactive terminal to run the setup prompts:\n`,
+    );
+    reportRemainingFailures(failures);
+    process.exitCode = 1;
+    clack.outro(pc.yellow('Re-run ' + pc.bold('clustercode onboard') + ' from an interactive terminal.'));
     return;
   }
 
@@ -426,12 +538,19 @@ async function runOnboardInner(): Promise<void> {
 
   const remainingFailures = finalResults.filter((r) => r.status === 'fail');
   if (remainingFailures.length === 0) {
+    process.exitCode = 0;
     clack.outro(pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.'));
-  } else {
-    clack.outro(
-      pc.yellow(`${remainingFailures.length} ${remainingFailures.length === 1 ? 'issue remains' : 'issues remain'}. Fix manually and re-run ${pc.bold('clustercode onboard')}.`)
-    );
+    return;
   }
+
+  // Print the actual remediation for each remaining failure. This lands last so
+  // it can't be pushed off-screen by a later step's success message.
+  reportRemainingFailures(remainingFailures);
+
+  process.exitCode = 1;
+  clack.outro(
+    pc.yellow(`${remainingFailures.length} ${remainingFailures.length === 1 ? 'issue remains' : 'issues remain'}. Fix the above, then re-run ${pc.bold('clustercode onboard')}.`)
+  );
 }
 
 export const onboardCommand = new Command('onboard')

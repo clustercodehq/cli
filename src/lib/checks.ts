@@ -1,21 +1,60 @@
 import { execSync } from 'node:child_process';
-import { freemem, totalmem } from 'node:os';
-import { readCredentials, readWorkerConfig, getOrchestratorUrl, getWorkerBinaryDir } from './config.js';
+import { existsSync } from 'node:fs';
+import { homedir, totalmem } from 'node:os';
+import { parse } from 'node:path';
+import {
+  readCredentials,
+  readWorkerConfig,
+  getOrchestratorUrl,
+  getWorkerBinaryDir,
+  getClusterCodeDir,
+} from './config.js';
 import { readInstalled } from './worker-binary.js';
+import { augmentPathWithKnownEngineDirs, resolveExecutable } from './env-path.js';
 
 export interface CheckResult {
   name: string;
   status: 'pass' | 'fail' | 'warn';
   detail: string;
+  /**
+   * Set by the container-runtime check when an engine is present on disk. Lets
+   * callers distinguish "nothing installed" from "installed but not started",
+   * which need different remediation.
+   */
+  engine?: { name: string; version: string };
 }
 
 function bytesToGB(bytes: number): string {
   return (bytes / 1024 / 1024 / 1024).toFixed(1);
 }
 
+/**
+ * Decode console output that may be UTF-16LE.
+ *
+ * Several Windows built-ins — wsl.exe among them — write UTF-16LE regardless of
+ * the code page. Decoding that as utf-8 yields NUL-interleaved text ("W\0S\0L\0"),
+ * which silently defeats every regex applied to it. Sniff the encoding instead of
+ * assuming utf-8.
+ */
+export function decodeConsoleOutput(buf: Buffer): string {
+  if (buf.length >= 2) {
+    if (buf[0] === 0xff && buf[1] === 0xfe) return buf.subarray(2).toString('utf16le');
+    // Latin-script text encoded as UTF-16LE has a NUL in every odd byte position.
+    let sampled = 0;
+    let nulAtOddIndex = 0;
+    for (let i = 1; i < Math.min(buf.length, 64); i += 2) {
+      sampled++;
+      if (buf[i] === 0) nulAtOddIndex++;
+    }
+    if (sampled > 0 && nulAtOddIndex / sampled > 0.8) return buf.toString('utf16le');
+  }
+  return buf.toString('utf-8');
+}
+
 function execSilent(cmd: string): string | null {
   try {
-    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    // No `encoding` option, so this returns a Buffer we can decode ourselves.
+    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] })).trim();
   } catch {
     return null;
   }
@@ -32,7 +71,10 @@ export function checkAuth(): CheckResult {
 export function checkWorkerRegistration(): CheckResult {
   const worker = readWorkerConfig();
   if (!worker) {
-    return { name: 'worker', status: 'fail', detail: 'Worker not configured — run clustercode worker' };
+    // Status only, no remediation: onboarding prints the fix for each remaining
+    // failure, and embedding "run clustercode worker" here made onboard tell the
+    // user to run a different command while it was already fixing this.
+    return { name: 'worker', status: 'fail', detail: 'Worker not configured' };
   }
   return {
     name: 'worker',
@@ -77,15 +119,34 @@ export async function checkOrchestratorConnectivity(): Promise<CheckResult> {
 }
 
 function detectContainerEngine(): { name: string; path: string; version: string } | null {
+  // An engine installed after this shell started is absent from the inherited
+  // PATH, which would otherwise make every doctor run report "not found" for an
+  // engine that is sitting on disk. Cheap filesystem probe, memoized.
+  augmentPathWithKnownEngineDirs();
+
   for (const engine of ['podman', 'docker']) {
     const version = execSilent(`${engine} --version`);
     if (version) {
-      const path = execSilent(process.platform === 'win32' ? `where ${engine}` : `which ${engine}`) ?? engine;
+      const path = resolveExecutable(engine) ?? engine;
       const versionMatch = version.match(/(\d+\.\d+\.\d+)/);
       return { name: engine, path, version: versionMatch?.[1] ?? version };
     }
   }
   return null;
+}
+
+/**
+ * Render the WSL check's detail line.
+ *
+ * The version can legitimately be unparseable — localized output, or a build that
+ * omits the line. When that happens, say "available" rather than gluing the "v"
+ * prefix onto a placeholder, which is what produced "WSL2 vdetected".
+ */
+export function formatWslDetail(versionOutput: string | null): string {
+  // `wsl --version` reports four components (e.g. 2.3.26.0), so match one-or-more
+  // dotted parts rather than exactly three and truncating the last one.
+  const versionMatch = versionOutput?.match(/WSL.*?:\s*(\d+(?:\.\d+)+)/i);
+  return versionMatch ? `WSL2 v${versionMatch[1]}` : 'WSL2 available';
 }
 
 export function checkWsl(): CheckResult | null {
@@ -94,14 +155,7 @@ export function checkWsl(): CheckResult | null {
 
   const wslOutput = execSilent('wsl --status');
   if (wslOutput) {
-    // Check for WSL2 specifically
-    const versionOutput = execSilent('wsl --version');
-    if (versionOutput) {
-      const versionMatch = versionOutput.match(/WSL.*?:\s*(\d+\.\d+\.\d+)/i);
-      const version = versionMatch?.[1] ?? 'detected';
-      return { name: 'wsl', status: 'pass', detail: `WSL2 v${version}` };
-    }
-    return { name: 'wsl', status: 'pass', detail: 'WSL2 available' };
+    return { name: 'wsl', status: 'pass', detail: formatWslDetail(execSilent('wsl --version')) };
   }
 
   // wsl --status failed — check if wsl.exe exists at all
@@ -126,7 +180,7 @@ function isPodmanMachineRunning(): boolean {
   return output.split(/\r?\n/).some((line) => line.trim().toLowerCase() === 'true');
 }
 
-export function checkContainerRuntime(): CheckResult & { engine?: { name: string; version: string } } {
+export function checkContainerRuntime(): CheckResult {
   const engine = detectContainerEngine();
   if (!engine) {
     return { name: 'container-runtime', status: 'fail', detail: 'Podman or Docker not found' };
@@ -147,7 +201,8 @@ export function checkContainerRuntime(): CheckResult & { engine?: { name: string
     return {
       name: 'container-runtime',
       status: 'fail',
-      detail: `${engine.name} v${engine.version} found but not running (run: podman machine init && podman machine start)`,
+      // Status only — onboarding prints the start commands as this check's remediation.
+      detail: `${engine.name} v${engine.version} found but not running`,
       engine,
     };
   }
@@ -170,50 +225,78 @@ export function checkContainerRuntime(): CheckResult & { engine?: { name: string
   };
 }
 
+/** Container images and the worker binary land under ~/.clustercode, so measure the volume that holds it — not always C:. */
+function diskCheckTarget(): string {
+  const dir = getClusterCodeDir();
+  // The directory may not exist before the first login; fall back to its parent.
+  return existsSync(dir) ? dir : homedir();
+}
+
+const MIN_DISK_GB = 20;
+
+/** Grade a free-space reading. Exported for tests. */
+export function evaluateDisk(freeBytes: number, location: string): CheckResult {
+  const freeGB = freeBytes / 1024 / 1024 / 1024;
+  const detail = `Disk: ${freeGB.toFixed(1)}GB free on ${location}`;
+  if (freeGB < MIN_DISK_GB) {
+    return { name: 'disk', status: 'warn', detail: `${detail} (${MIN_DISK_GB}GB+ recommended for container images)` };
+  }
+  return { name: 'disk', status: 'pass', detail };
+}
+
 export function checkDiskSpace(): CheckResult {
-  const MIN_DISK_GB = 5;
+  const target = diskCheckTarget();
 
   if (process.platform === 'win32') {
-    // Use PowerShell (WMIC is deprecated on newer Windows)
-    const output = execSilent('powershell -NoProfile -Command "(Get-PSDrive C).Free"');
-    if (output) {
-      const freeBytes = parseInt(output.trim(), 10);
-      if (!isNaN(freeBytes)) {
-        const freeGB = freeBytes / 1024 / 1024 / 1024;
-        if (freeGB < MIN_DISK_GB) {
-          return { name: 'disk', status: 'warn', detail: `Low disk space: ${freeGB.toFixed(1)}GB free` };
-        }
-        return { name: 'disk', status: 'pass', detail: `${freeGB.toFixed(1)}GB free` };
-      }
+    // Get-PSDrive takes a drive letter, so a UNC home directory can't be measured.
+    const driveLetter = parse(target).root.match(/^([A-Za-z]):/)?.[1];
+    if (!driveLetter) {
+      return { name: 'disk', status: 'warn', detail: `Could not determine free space for ${target}` };
     }
-  } else {
-    const output = execSilent('df -k / | tail -1');
+    // PowerShell rather than WMIC, which is deprecated on newer Windows.
+    const output = execSilent(
+      `powershell -NoProfile -Command "(Get-PSDrive ${driveLetter.toUpperCase()}).Free"`,
+    );
+    const freeBytes = output ? parseInt(output.trim(), 10) : NaN;
+    if (!isNaN(freeBytes)) {
+      return evaluateDisk(freeBytes, `${driveLetter.toUpperCase()}:`);
+    }
+  } else if (!target.includes('"')) {
+    // -P forces single-line output, so the fields stay at fixed indexes even when
+    // the device name is long enough that df would otherwise wrap it.
+    const output = execSilent(`df -Pk "${target}" | tail -1`);
     if (output) {
       const parts = output.split(/\s+/);
       const availKB = parseInt(parts[3], 10);
       if (!isNaN(availKB)) {
-        const freeGB = availKB / 1024 / 1024;
-        if (freeGB < MIN_DISK_GB) {
-          return { name: 'disk', status: 'warn', detail: `Low disk space: ${freeGB.toFixed(1)}GB free` };
-        }
-        return { name: 'disk', status: 'pass', detail: `${freeGB.toFixed(1)}GB free` };
+        return evaluateDisk(availKB * 1024, parts[5] ?? target);
       }
     }
   }
 
-  return { name: 'disk', status: 'warn', detail: 'Could not determine disk space' };
+  return { name: 'disk', status: 'warn', detail: `Could not determine free space for ${target}` };
+}
+
+const MIN_TOTAL_MEMORY_GB = 8;
+
+/**
+ * Grade installed RAM. Deliberately reports *total*, not free: os.freemem()
+ * excludes reclaimable cache, so it swings wildly and made a 4GB machine pass
+ * while a well-provisioned one under load looked unhealthy. Exported for tests.
+ */
+export function evaluateMemory(totalBytes: number): CheckResult {
+  if (totalBytes / 1024 / 1024 / 1024 < MIN_TOTAL_MEMORY_GB) {
+    return {
+      name: 'memory',
+      status: 'warn',
+      detail: `RAM: ${bytesToGB(totalBytes)}GB total (${MIN_TOTAL_MEMORY_GB}GB+ recommended)`,
+    };
+  }
+  return { name: 'memory', status: 'pass', detail: `RAM: ${bytesToGB(totalBytes)}GB total` };
 }
 
 export function checkMemory(): CheckResult {
-  const MIN_MEMORY_GB = 1;
-  const free = freemem();
-  const total = totalmem();
-  const freeGB = free / 1024 / 1024 / 1024;
-
-  if (freeGB < MIN_MEMORY_GB) {
-    return { name: 'memory', status: 'warn', detail: `Low memory: ${bytesToGB(free)}GB free of ${bytesToGB(total)}GB` };
-  }
-  return { name: 'memory', status: 'pass', detail: `${bytesToGB(free)}GB free of ${bytesToGB(total)}GB` };
+  return evaluateMemory(totalmem());
 }
 
 export async function runAllChecks(): Promise<CheckResult[]> {

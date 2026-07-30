@@ -58,6 +58,16 @@ export const doctorCommand = new Command('doctor')
       if (warnings.length > 0) parts.push(`${warnings.length} ${warnings.length === 1 ? 'warning' : 'warnings'}`);
 
       if (failures.length > 0) {
+        // Non-zero exit so `clustercode doctor` is usable as a scripted gate. If we
+        // hand off to onboard below, its own outcome overwrites this.
+        process.exitCode = 1;
+
+        // Without a TTY there is nobody to answer the prompt — don't hang a CI job.
+        if (!process.stdin.isTTY) {
+          clack.outro(`${parts.join(', ')} found. Run ${pc.bold('clustercode onboard')} to fix.`);
+          return;
+        }
+
         const shouldOnboard = await clack.confirm({
           message: `${parts.join(', ')} found. Run ${pc.bold('clustercode onboard')} to fix?`,
         });
@@ -68,6 +78,9 @@ export const doctorCommand = new Command('doctor')
         }
 
         if (shouldOnboard) {
+          // Close doctor's box before onboard opens its own, otherwise the two
+          // render as nested, never-terminated frames.
+          clack.outro(`Starting ${pc.bold('clustercode onboard')}...`);
           const { runOnboard } = await import('./onboard.js');
           await runOnboard();
         } else {

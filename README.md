@@ -56,11 +56,24 @@ Check system health: auth status, worker registration, orchestrator
 connectivity, container runtime, disk, and memory. Add `--json` for
 machine-readable output.
 
+Exits non-zero when any check fails, so it works as a scripted gate:
+
+```bash
+clustercode doctor --json || echo "not healthy"
+```
+
 ### `clustercode onboard`
 
 Interactive setup wizard that runs all health checks and offers to fix each
 issue (authentication, worker registration, container-runtime install), with
-platform-aware setup for macOS, Linux, and Windows.
+platform-aware setup for macOS, Linux, and Windows. Any issue left unresolved is
+listed at the end with the exact command that fixes it, and the wizard exits
+non-zero.
+
+On Windows, a container engine installed by the wizard is not on the PATH that
+the current terminal inherited, so the CLI re-resolves it from the default
+install location for the rest of the session. Open a new terminal to use
+`podman` directly.
 
 ### `clustercode config`
 
@@ -92,6 +105,16 @@ The orchestrator / portal URL is resolved in this order:
 
 1. Environment (`ORCHESTRATOR_URL` / `PORTAL_URL`) — loaded from `.env` or the shell
 2. Production defaults (`https://console.clustercode.io` / `https://clustercode.io`)
+
+## Container runtime
+
+`clustercode worker` requires Podman or Docker and refuses to start without one.
+Escape hatches, both off by default:
+
+| Variable | Purpose |
+|---|---|
+| `CLUSTERCODE_SKIP_RUNTIME_CHECK=1` | Skip the container-runtime preflight in `clustercode worker`. |
+| `CLUSTERCODE_NO_ENGINE_PATH_PROBE=1` | Resolve engines strictly from `PATH`, ignoring default install locations. |
 
 ## Worker binary
 

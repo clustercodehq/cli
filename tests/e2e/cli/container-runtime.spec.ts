@@ -158,7 +158,11 @@ describe('container-runtime check', () => {
       ? [stubDir, nodeBin, `${process.env.SystemRoot}\\system32`].join(';')
       : [stubDir, nodeBin, '/usr/bin', '/bin', '/usr/local/bin'].join(':');
 
-    const { checks } = runDoctor({ PATH: minimalPath });
+    // Restricting PATH is not enough on a machine that really has Podman
+    // installed: the check also probes default install locations so an engine
+    // installed after the shell started is still found. Disable that probe to
+    // get a genuinely engine-free environment.
+    const { checks } = runDoctor({ PATH: minimalPath, CLUSTERCODE_NO_ENGINE_PATH_PROBE: '1' });
     assert.equal(checks['container-runtime'].status, 'fail');
     assert.match(checks['container-runtime'].detail, /not found/);
   });
