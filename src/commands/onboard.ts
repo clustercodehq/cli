@@ -10,7 +10,7 @@ import {
 } from '../lib/checks.js';
 import { readCredentials } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
-import { restoreTty } from '../lib/tty.js';
+import { releaseStdin } from '../lib/tty.js';
 
 function execSilent(cmd: string): string | null {
   try {
@@ -416,7 +416,7 @@ export async function runOnboard(): Promise<void> {
   try {
     await runOnboardInner();
   } finally {
-    restoreTty();
+    releaseStdin();
   }
 }
 
