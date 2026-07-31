@@ -41,14 +41,30 @@ function runCli(args: string[]): { stdout: string; stderr: string; exitCode: num
   }
 }
 
-/** Extract the JSON object from stdout, which may carry non-JSON prefix lines. */
+/**
+ * Extract the JSON object from stdout, which may carry non-JSON prefix lines.
+ *
+ * A bare `JSON.parse` failure here reports only a character offset, which says
+ * nothing about what the CLI actually emitted. Anything unparseable is re-thrown
+ * with both streams and a byte offset so the culprit is visible in the failure
+ * output instead of requiring a separate reproduction.
+ */
 function parseDoctorJson(stdout: string, stderr: string): { checks: Array<{ name: string; status: string }> } {
+  const dump = () =>
+    `\n--- stdout (${Buffer.byteLength(stdout)} bytes) ---\n${JSON.stringify(stdout)}` +
+    `\n--- stderr (${Buffer.byteLength(stderr)} bytes) ---\n${JSON.stringify(stderr)}`;
+
   const jsonStart = stdout.match(/^\s*\{/m);
-  assert.ok(
-    jsonStart !== null,
-    `Expected JSON in stdout.\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
-  );
-  return JSON.parse(stdout.slice(jsonStart.index!));
+  assert.ok(jsonStart !== null, `Expected a JSON object in stdout.${dump()}`);
+
+  try {
+    return JSON.parse(stdout.slice(jsonStart.index!));
+  } catch (err) {
+    throw new Error(
+      `doctor --json did not emit a clean JSON document on stdout: ` +
+      `${err instanceof Error ? err.message : String(err)}${dump()}`,
+    );
+  }
 }
 
 describe('doctor worker-binary check', () => {
@@ -60,13 +76,18 @@ describe('doctor worker-binary check', () => {
     assert.equal(check!.status, 'warn'); // empty home → not downloaded yet
   });
 
-  it('emits parseable JSON on stdout even when stderr carries warnings', () => {
+  it('emits nothing after the JSON document on stdout', () => {
     // --json is a machine-readable contract: stdout must be the JSON document
-    // alone, regardless of anything a runtime writes to stderr.
+    // and nothing else, whatever a runtime writes to stderr. A trailing byte is
+    // just as fatal to a consumer as a leading one.
     const { stdout, stderr } = runCli(['doctor', '--json']);
-    assert.doesNotThrow(
-      () => JSON.parse(stdout.slice(stdout.match(/^\s*\{/m)!.index!)),
-      `stdout was not parseable JSON.\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+    parseDoctorJson(stdout, stderr); // throws with both streams dumped on failure
+
+    const afterJson = stdout.slice(stdout.lastIndexOf('}') + 1);
+    assert.equal(
+      afterJson.trim(),
+      '',
+      `Unexpected trailing output after the JSON document: ${JSON.stringify(afterJson)}`,
     );
   });
 });
