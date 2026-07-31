@@ -1,0 +1,158 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  formatWslDetail,
+  evaluateDisk,
+  evaluateMemory,
+  decodeConsoleOutput,
+  parseDfLine,
+} from '../../src/lib/checks.js';
+
+const GB = 1024 * 1024 * 1024;
+
+describe('decodeConsoleOutput', () => {
+  it('decodes UTF-16LE output, which is what wsl.exe emits', () => {
+    const buf = Buffer.from('WSL version: 2.7.11.0', 'utf16le');
+    assert.equal(decodeConsoleOutput(buf), 'WSL version: 2.7.11.0');
+  });
+
+  it('strips a UTF-16LE byte-order mark', () => {
+    const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('WSL version: 2.7.11.0', 'utf16le')]);
+    assert.equal(decodeConsoleOutput(buf), 'WSL version: 2.7.11.0');
+  });
+
+  it('leaves ordinary utf-8 output alone', () => {
+    assert.equal(decodeConsoleOutput(Buffer.from('podman version 5.8.3', 'utf-8')), 'podman version 5.8.3');
+  });
+
+  it('does not mangle multi-byte utf-8', () => {
+    assert.equal(decodeConsoleOutput(Buffer.from('versión 5.8.3 — ok', 'utf-8')), 'versión 5.8.3 — ok');
+  });
+
+  it('handles empty and single-byte output', () => {
+    assert.equal(decodeConsoleOutput(Buffer.alloc(0)), '');
+    assert.equal(decodeConsoleOutput(Buffer.from('x', 'utf-8')), 'x');
+  });
+
+  it('decodes a short BOM-less UTF-16LE line (wsl --list --quiet with no distros)', () => {
+    // "\r\n" as UTF-16LE: previously the NUL bytes survived a utf-8 decode, so
+    // the "no distro configured" branch never saw an empty string.
+    assert.equal(decodeConsoleOutput(Buffer.from('\r\n', 'utf16le')).trim(), '');
+  });
+
+  it('feeds a parseable version through to the WSL detail line', () => {
+    // The end-to-end shape of the "WSL2 vdetected" bug: UTF-16LE input, real version out.
+    const raw = decodeConsoleOutput(Buffer.from('WSL version: 2.7.11.0\nKernel version: 6.6.87.2', 'utf16le'));
+    assert.equal(formatWslDetail(raw), 'WSL2 v2.7.11.0');
+  });
+});
+
+describe('formatWslDetail', () => {
+  it('includes the version when wsl --version reports one', () => {
+    assert.equal(formatWslDetail('WSL version: 2.3.26.0\nKernel version: 5.15.167.4'), 'WSL2 v2.3.26.0');
+  });
+
+  it('captures all four version components', () => {
+    // wsl reports e.g. 2.7.11.0; a three-part pattern silently truncated the last.
+    assert.equal(formatWslDetail('WSL version: 2.7.11.0'), 'WSL2 v2.7.11.0');
+  });
+
+  it('falls back to "available" when the version cannot be parsed', () => {
+    // Localized output does not match the English pattern; the detail must not
+    // read "WSL2 vdetected".
+    assert.equal(formatWslDetail('Versión de WSL: no disponible'), 'WSL2 available');
+  });
+
+  it('falls back to "available" for NUL-interleaved text rather than a bogus version', () => {
+    // Belt-and-braces: if a UTF-16LE decode is ever missed upstream, the detail
+    // must degrade gracefully instead of emitting garbage. (NUL bytes are
+    // written as escapes so this source file stays plain text.)
+    assert.equal(formatWslDetail('W\u0000S\u0000L\u0000 \u0000v\u00002\u0000'), 'WSL2 available');
+  });
+
+  it('falls back to "available" when wsl --version produced no output', () => {
+    assert.equal(formatWslDetail(null), 'WSL2 available');
+  });
+
+  it('never emits a bare "v" prefix without a version', () => {
+    for (const output of [null, '', 'garbage', 'WSL version: unknown']) {
+      assert.doesNotMatch(formatWslDetail(output), /\bv(?!\d)/);
+    }
+  });
+});
+
+describe('parseDfLine', () => {
+  it('parses a plain df -Pk data line', () => {
+    const parsed = parseDfLine('/dev/sda2  971350180 550000000 421350180  57% /home');
+    assert.deepEqual(parsed, { availBytes: 421350180 * 1024, mount: '/home' });
+  });
+
+  it('is not shifted by a device name containing spaces', () => {
+    // macOS autofs mounts report e.g. "map auto_home" as the device; a fixed
+    // whitespace-split read the wrong field (0 KB free, location "100%").
+    const parsed = parseDfLine('map auto_home        0        0   123456   100%   /System/Volumes/Data/home');
+    assert.deepEqual(parsed, { availBytes: 123456 * 1024, mount: '/System/Volumes/Data/home' });
+  });
+
+  it('keeps a mount point containing spaces intact', () => {
+    const parsed = parseDfLine('/dev/disk3s5  971350180 550000000 421350180  57% /Volumes/My Disk');
+    assert.deepEqual(parsed, { availBytes: 421350180 * 1024, mount: '/Volumes/My Disk' });
+  });
+
+  it('returns null for a header or garbage line', () => {
+    assert.equal(parseDfLine('Filesystem 1024-blocks Used Available Capacity Mounted on'), null);
+    assert.equal(parseDfLine('df: /nope: No such file or directory'), null);
+    assert.equal(parseDfLine(''), null);
+  });
+});
+
+describe('evaluateDisk', () => {
+  it('passes with ample space and names the measured location', () => {
+    const result = evaluateDisk(55.5 * GB, 'C:');
+    assert.equal(result.status, 'pass');
+    assert.equal(result.name, 'disk');
+    assert.match(result.detail, /^Disk: 55\.5GB free on C:$/);
+  });
+
+  it('warns below the recommended minimum', () => {
+    const result = evaluateDisk(3 * GB, 'C:');
+    assert.equal(result.status, 'warn');
+    assert.match(result.detail, /3\.0GB free on C:/);
+    assert.match(result.detail, /recommended/);
+  });
+
+  it('labels the reading as disk so it is distinguishable from RAM', () => {
+    assert.match(evaluateDisk(100 * GB, '/').detail, /^Disk:/);
+  });
+
+  it('reports the location it was given rather than assuming C:', () => {
+    assert.match(evaluateDisk(100 * GB, 'D:').detail, /on D:$/);
+    assert.match(evaluateDisk(100 * GB, '/home').detail, /on \/home$/);
+  });
+});
+
+describe('evaluateMemory', () => {
+  it('passes on a machine with ample RAM', () => {
+    const result = evaluateMemory(32 * GB);
+    assert.equal(result.status, 'pass');
+    assert.equal(result.name, 'memory');
+    assert.match(result.detail, /^RAM: 32\.0GB total$/);
+  });
+
+  it('warns on an underprovisioned machine', () => {
+    const result = evaluateMemory(4 * GB);
+    assert.equal(result.status, 'warn');
+    assert.match(result.detail, /4\.0GB total/);
+    assert.match(result.detail, /recommended/);
+  });
+
+  it('grades on installed RAM, not momentarily free RAM', () => {
+    // A 32GB machine stays healthy no matter how little is free right now — the
+    // old check keyed off os.freemem() and flipped status as caches filled.
+    assert.equal(evaluateMemory(32 * GB).status, 'pass');
+  });
+
+  it('labels the reading as RAM so it is distinguishable from disk', () => {
+    assert.match(evaluateMemory(16 * GB).detail, /^RAM:/);
+  });
+});

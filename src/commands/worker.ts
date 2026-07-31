@@ -11,6 +11,7 @@ import {
   getOrchestratorUrl,
 } from '../lib/config.js';
 import { ensureWorkerBinary } from '../lib/worker-binary.js';
+import { checkContainerRuntime } from '../lib/checks.js';
 import { restoreTty } from '../lib/tty.js';
 import { formatWorkerLogLine } from '../lib/worker-log.js';
 
@@ -134,6 +135,34 @@ async function ensureWorkerConfigInner(): Promise<boolean> {
   });
 
   return true;
+}
+
+/**
+ * The worker cannot run jobs without a container engine, so refuse to start
+ * without one instead of letting the agent fail later with a murkier error.
+ *
+ * A missing engine is fatal. An engine that is present but not running is only a
+ * warning when the user named an engine explicitly (`--podman`/`--docker`),
+ * since detection reports the first engine it finds and that may not be theirs.
+ * Set CLUSTERCODE_SKIP_RUNTIME_CHECK=1 to bypass.
+ *
+ * Runs after auth/tenant setup so a brand-new user is told to log in first rather
+ * than being sent to fix their container runtime.
+ */
+function preflightContainerRuntime(explicitRuntime: boolean): void {
+  if (process.env.CLUSTERCODE_SKIP_RUNTIME_CHECK === '1') return;
+
+  const check = checkContainerRuntime();
+  if (check.status === 'pass') return;
+
+  if (check.engine && explicitRuntime) {
+    clack.log.warn(check.detail);
+    return;
+  }
+
+  clack.log.error(check.detail);
+  clack.log.info(`Run ${pc.bold('clustercode onboard')} to set up a container runtime.`);
+  process.exit(1);
 }
 
 async function startWorkerProcess(
@@ -290,6 +319,7 @@ export const workerCommand = new Command('worker')
         });
         clack.log.info(`Auth bypass — initialized ${pc.dim('~/.clustercode/worker.json')}`);
       }
+      preflightContainerRuntime(runtime !== undefined);
       clack.outro('Starting worker (auth bypass)...');
       await startWorkerProcess(runtime, agent, opts.verbose);
       return;
@@ -298,6 +328,11 @@ export const workerCommand = new Command('worker')
     // Normal mode — ensure login + tenant selection
     const ready = await ensureWorkerConfig();
     if (!ready) return;
+
+    // After auth/tenant setup (so a new user sees "not logged in" first, which is
+    // the more actionable error) but before the outro, so a runtime failure reads
+    // as part of the intro block rather than trailing after "Starting worker...".
+    preflightContainerRuntime(runtime !== undefined);
 
     clack.outro('Starting worker...');
     await startWorkerProcess(runtime, agent, opts.verbose);
