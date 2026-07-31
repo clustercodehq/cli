@@ -2,7 +2,7 @@ import { Command } from 'commander';
 import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { runAllChecks, type CheckResult } from '../lib/checks.js';
-import { restoreTty } from '../lib/tty.js';
+import { releaseStdin } from '../lib/tty.js';
 
 function statusIcon(status: CheckResult['status']): string {
   switch (status) {
@@ -90,6 +90,6 @@ export const doctorCommand = new Command('doctor')
         clack.outro(pc.yellow(`${parts.join(', ')} found, but no critical issues.`));
       }
     } finally {
-      restoreTty();
+      releaseStdin();
     }
   });

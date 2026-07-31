@@ -4,7 +4,7 @@ import pc from 'picocolors';
 import { createServer } from 'node:http';
 import { readCredentials, writeCredentials } from '../lib/config.js';
 import { getOrchestratorUrl, getPortalUrl } from '../lib/config.js';
-import { restoreTty } from '../lib/tty.js';
+import { releaseStdin } from '../lib/tty.js';
 
 /** Escape HTML special characters to prevent XSS when interpolating user-controlled strings. */
 function escapeHtml(str: string): string {
@@ -311,6 +311,6 @@ export const loginCommand = new Command('login')
       await runLogin(options);
       clack.outro('');
     } finally {
-      restoreTty();
+      releaseStdin();
     }
   });

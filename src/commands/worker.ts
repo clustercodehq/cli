@@ -12,7 +12,7 @@ import {
 } from '../lib/config.js';
 import { ensureWorkerBinary } from '../lib/worker-binary.js';
 import { checkContainerRuntime } from '../lib/checks.js';
-import { restoreTty } from '../lib/tty.js';
+import { restoreRawMode, releaseStdin } from '../lib/tty.js';
 import { formatWorkerLogLine } from '../lib/worker-log.js';
 
 /** Loopback hosts where the auth bypass is permitted. */
@@ -66,7 +66,11 @@ export async function ensureWorkerConfig(): Promise<boolean> {
   try {
     return await ensureWorkerConfigInner();
   } finally {
-    restoreTty();
+    // Raw mode only — NOT releaseStdin(). Onboarding calls this partway through
+    // its wizard and prompts again straight afterwards; unref'ing stdin here
+    // made the next prompt render and the process exit without reading it.
+    // Whoever owns the command releases stdin when the command is done.
+    restoreRawMode();
   }
 }
 
@@ -210,7 +214,7 @@ async function startWorkerProcess(
   // so Ctrl+C is never translated into a signal and gets swallowed for both the
   // CLI and the worker. Both the normal and auth-bypass paths reach here, so
   // this is the single correct restore point before the worker runs.
-  restoreTty();
+  releaseStdin();
 
   const pkgDir = dirname(binary);
 
@@ -327,7 +331,13 @@ export const workerCommand = new Command('worker')
 
     // Normal mode — ensure login + tenant selection
     const ready = await ensureWorkerConfig();
-    if (!ready) return;
+    if (!ready) {
+      // ensureWorkerConfig only restores raw mode (onboarding prompts again after
+      // it), so this command has to release stdin itself or a spinner started
+      // during tenant setup would keep the event loop alive and hang the exit.
+      releaseStdin();
+      return;
+    }
 
     // After auth/tenant setup (so a new user sees "not logged in" first, which is
     // the more actionable error) but before the outro, so a runtime failure reads
