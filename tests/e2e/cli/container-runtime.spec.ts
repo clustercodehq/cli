@@ -26,10 +26,17 @@ afterEach(() => {
 });
 
 /**
- * Create a podman stub that responds to --version and machine list.
+ * Create a podman stub that responds to --version, machine list, and info.
  * Uses keyword matching (findstr on Windows, case on Unix) to avoid quoting issues.
+ *
+ * `info` mirrors `machineOutput`: the check consults machine state only on
+ * macOS/Windows, where Podman runs a VM. On Linux there is no machine, so it
+ * asks `podman info` instead — a stub that answered only `machine list` reported
+ * "not running" there no matter what, which is why these tests failed on Linux.
+ * Tying both to the same flag keeps each case meaningful on every platform.
  */
 function createPodmanStub(opts: { version: string; machineOutput: string }): void {
+  const healthy = opts.machineOutput.split('\n').some((l) => l.trim() === 'true');
   if (isWin) {
     // Write the machine output to a file so we can `type` it (avoids echo newline issues)
     const machineFile = join(stubDir, 'machine-output.txt');
@@ -47,6 +54,11 @@ function createPodmanStub(opts: { version: string; machineOutput: string }): voi
       `  type "${machineFile}"`,
       '  exit /b 0',
       ')',
+      // `info` reports daemon health — the signal used where there is no VM.
+      'echo %* | findstr /C:"info" >nul 2>&1 && (',
+      `  echo host: podman ${opts.version}`,
+      `  exit /b ${healthy ? 0 : 1}`,
+      ')',
       'exit /b 1',
     ].join('\r\n');
     writeFileSync(join(stubDir, 'podman.cmd'), script);
@@ -56,6 +68,7 @@ function createPodmanStub(opts: { version: string; machineOutput: string }): voi
       'case "$*" in',
       `  *--version*) echo "podman version ${opts.version}"; exit 0 ;;`,
       `  *machine\\ list*) printf '%s\\n' ${opts.machineOutput.split('\n').map((l) => `'${l}'`).join(' ')}; exit 0 ;;`,
+      `  *info*) echo "host: podman ${opts.version}"; exit ${healthy ? 0 : 1} ;;`,
       '  *) exit 1 ;;',
       'esac',
     ].join('\n');
