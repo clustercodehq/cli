@@ -69,8 +69,57 @@ function writeJson<T>(filePath: string, data: T): void {
   }
 }
 
+/**
+ * Raw write. Prefer `saveLogin()` for anything that comes from an actual login —
+ * it also invalidates a worker registration left behind by another account.
+ */
 export function writeCredentials(creds: Credentials): void {
   writeJson(getCredentialsPath(), creds);
+}
+
+export function clearWorkerConfig(): void {
+  try {
+    unlinkSync(getWorkerConfigPath());
+  } catch {
+    // Nothing registered yet, or already gone — either way there is nothing stale left.
+  }
+}
+
+/** Credentials are read back as unvalidated JSON, so treat `email` as unknown. */
+function normalizeEmail(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isSameAccount(a: Credentials, b: Credentials): boolean {
+  const previous = normalizeEmail(a.email);
+  // A stored record with no usable email is not a match: a registration that
+  // cannot be tied to the account now logging in is not one worth keeping.
+  return previous !== '' && previous === normalizeEmail(b.email);
+}
+
+/**
+ * Persist a login, discarding any worker registration that belonged to a
+ * different account.
+ *
+ * worker.json binds a workerId and a tenantId to whoever registered them, and
+ * logging in replaces credentials.json only. Log in as someone else and the
+ * worker then connects with the new API key but the previous account's
+ * tenantId/workerId; the orchestrator rejects that pair with a permanent HTTP
+ * 403 and the agent exits. Nothing in the CLI noticed, because tenant setup
+ * short-circuits as soon as worker.json names a tenant — so the only way out
+ * was to delete ~/.clustercode by hand.
+ *
+ * Dropping the registration here puts the next `clustercode worker` back
+ * through tenant selection, where it mints a workerId for the new account.
+ */
+export function saveLogin(creds: Credentials): { switchedAccount: boolean } {
+  const previous = readCredentials();
+  const switchedAccount = previous !== null && !isSameAccount(previous, creds);
+
+  writeCredentials(creds);
+  if (switchedAccount) clearWorkerConfig();
+
+  return { switchedAccount };
 }
 
 export function writeWorkerConfig(config: WorkerConfig): void {

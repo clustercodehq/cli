@@ -2,7 +2,8 @@ import { Command } from 'commander';
 import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { createServer } from 'node:http';
-import { readCredentials, writeCredentials } from '../lib/config.js';
+import type { Socket } from 'node:net';
+import { readCredentials, saveLogin } from '../lib/config.js';
 import { getOrchestratorUrl, getPortalUrl } from '../lib/config.js';
 import { releaseStdin } from '../lib/tty.js';
 
@@ -113,16 +114,74 @@ async function openBrowser(url: string): Promise<void> {
   await open(url);
 }
 
-async function loginWithBrowser(): Promise<{ success: boolean; error?: string }> {
+/** "3 minutes" / "45 seconds", for the timeout message. */
+function describeTimeout(ms: number): string {
+  if (ms >= 60_000) {
+    const minutes = Math.round(ms / 60_000);
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+  }
+  const seconds = Math.round(ms / 1000);
+  return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
+}
+
+export interface BrowserLoginResult {
+  success: boolean;
+  error?: string;
+  /** True when this login replaced a different account's credentials. */
+  switchedAccount?: boolean;
+}
+
+export interface BrowserLoginOptions {
+  /** Hands the login URL to the user. Overridable so tests can play the browser. */
+  openUrl?: (loginUrl: string) => Promise<void>;
+  /** How long to wait for the callback. */
+  timeoutMs?: number;
+}
+
+const DEFAULT_LOGIN_TIMEOUT_MS = 3 * 60 * 1000;
+
+async function defaultOpenUrl(loginUrl: string): Promise<void> {
+  clack.log.info(`Opening browser for authentication...\n  ${pc.dim(loginUrl)}`);
+
+  if (process.env.CLUSTERCODE_NO_OPEN_BROWSER) {
+    clack.log.info(`Visit this URL manually:\n  ${pc.cyan(loginUrl)}`);
+    return;
+  }
+
+  try {
+    await openBrowser(loginUrl);
+  } catch {
+    clack.log.warn(`Could not open browser. Visit this URL manually:\n  ${pc.cyan(loginUrl)}`);
+  }
+}
+
+export async function loginWithBrowser(
+  options: BrowserLoginOptions = {},
+): Promise<BrowserLoginResult> {
   const portalUrl = getPortalUrl();
+  const openUrl = options.openUrl ?? defaultOpenUrl;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
 
-  return new Promise<{ success: boolean; error?: string }>((resolve) => {
-    let timeout: ReturnType<typeof setTimeout>;
+  return new Promise<BrowserLoginResult>((resolve) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const sockets = new Set<Socket>();
 
-    function done(success: boolean, error?: string) {
+    function done(result: BrowserLoginResult) {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
       server.close();
-      resolve({ success, error });
+      // A browser does not hang up when it is done with us. It leaves the
+      // keep-alive connection that carried the callback open, and typically a
+      // speculative one it opened and never sent anything on. server.close()
+      // stops the listener but touches neither, and every one of those sockets
+      // keeps the event loop alive — so the CLI would print "Logged in as ..."
+      // and then sit there until the user gave up and hit Ctrl+C. The response
+      // is already flushed by the time we get here (see the res.end callbacks
+      // below), so there is nothing left to deliver.
+      for (const socket of sockets) socket.destroy();
+      resolve(result);
     }
 
     const server = createServer((req, res) => {
@@ -145,27 +204,32 @@ async function loginWithBrowser(): Promise<{ success: boolean; error?: string }>
             false,
             setupUrl ?? undefined,
             'Complete setup',
-          ));
-          done(false, message);
+          ), () => done({ success: false, error: message }));
           return;
         }
 
         if (apiKey && email) {
-          writeCredentials({
+          const { switchedAccount } = saveLogin({
             apiKey,
             email,
             createdAt: new Date().toISOString(),
           });
 
           res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(callbackPage('You\'re logged in!', 'You can close this tab and return to your terminal.', true));
-          done(true);
+          // done() only runs once the page is on the wire: it destroys the very
+          // socket this response is being written to.
+          res.end(
+            callbackPage('You\'re logged in!', 'You can close this tab and return to your terminal.', true),
+            () => done({ success: true, switchedAccount }),
+          );
           return;
         }
 
         res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(callbackPage('Missing credentials', 'The authentication response was incomplete. Please try again.', false));
-        done(false);
+        res.end(
+          callbackPage('Missing credentials', 'The authentication response was incomplete. Please try again.', false),
+          () => done({ success: false }),
+        );
         return;
       }
 
@@ -173,39 +237,43 @@ async function loginWithBrowser(): Promise<{ success: boolean; error?: string }>
       res.end();
     });
 
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+
     server.listen(0, '127.0.0.1', async () => {
       const address = server.address();
       if (!address || typeof address === 'string') {
-        done(false);
+        done({ success: false });
         return;
       }
 
       const callbackUrl = `http://127.0.0.1:${address.port}/callback`;
       const loginUrl = `${portalUrl}/login?redirect_url=${encodeURIComponent(callbackUrl)}&cli=true`;
 
-      clack.log.info(`Opening browser for authentication...\n  ${pc.dim(loginUrl)}`);
-
-      if (process.env.CLUSTERCODE_NO_OPEN_BROWSER) {
-        clack.log.info(`Visit this URL manually:\n  ${pc.cyan(loginUrl)}`);
-      } else {
-        try {
-          await openBrowser(loginUrl);
-        } catch {
-          clack.log.warn(`Could not open browser. Visit this URL manually:\n  ${pc.cyan(loginUrl)}`);
-        }
-      }
-
-      const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+      // Arm the timeout BEFORE handing the URL over. Arming it afterwards left a
+      // window either side of `await openUrl(...)`: a callback that landed first
+      // cleared a timer that did not exist yet, and this line then armed one
+      // against a login that had already finished. Nothing ever cleared it, so
+      // the command hung for the full timeout and signed off by reporting a
+      // failure for a login that worked.
       timeout = setTimeout(() => {
-        clack.log.error('Authentication timed out after 3 minutes.');
+        clack.log.error(`Authentication timed out after ${describeTimeout(timeoutMs)}.`);
         clack.log.info(`Try again, or use ${pc.bold('clustercode login --no-browser')} to paste a token manually.`);
-        done(false);
-      }, TIMEOUT_MS);
+        done({ success: false });
+      }, timeoutMs);
+
+      try {
+        await openUrl(loginUrl);
+      } catch (err) {
+        done({ success: false, error: err instanceof Error ? err.message : String(err) });
+      }
     });
   });
 }
 
-async function loginWithToken(): Promise<boolean> {
+async function loginWithToken(): Promise<BrowserLoginResult> {
   const token = await clack.text({
     message: 'Paste your API token:',
     placeholder: 'csk_live_...',
@@ -216,7 +284,7 @@ async function loginWithToken(): Promise<boolean> {
 
   if (clack.isCancel(token)) {
     clack.cancel('Login cancelled.');
-    return false;
+    return { success: false };
   }
 
   const email = await clack.text({
@@ -229,7 +297,7 @@ async function loginWithToken(): Promise<boolean> {
 
   if (clack.isCancel(email)) {
     clack.cancel('Login cancelled.');
-    return false;
+    return { success: false };
   }
 
   // Validate token against orchestrator API
@@ -240,19 +308,19 @@ async function loginWithToken(): Promise<boolean> {
     });
     if (!res.ok) {
       clack.log.error('Token validation failed. Check that your token is correct.');
-      return false;
+      return { success: false };
     }
   } catch {
     clack.log.warn('Could not validate token — orchestrator unreachable. Saving anyway.');
   }
 
-  writeCredentials({
+  const { switchedAccount } = saveLogin({
     apiKey: token.trim(),
     email: email.trim(),
     createdAt: new Date().toISOString(),
   });
 
-  return true;
+  return { success: true, switchedAccount };
 }
 
 export async function runLogin(options: { noBrowser?: boolean }): Promise<void> {
@@ -274,8 +342,7 @@ export async function runLogin(options: { noBrowser?: boolean }): Promise<void> 
 
   const useToken = options.noBrowser || isHeadless();
 
-  let success: boolean;
-  let errorMessage: string | undefined;
+  let result: BrowserLoginResult;
 
   if (useToken) {
     if (!options.noBrowser && isHeadless()) {
@@ -284,21 +351,30 @@ export async function runLogin(options: { noBrowser?: boolean }): Promise<void> 
     clack.log.info(
       `Generate a token at ${pc.cyan(getOrchestratorUrl().replace(/^ws/, 'http').replace(/\/ws\/worker$/, '') + '/settings/tokens')}`
     );
-    success = await loginWithToken();
+    result = await loginWithToken();
   } else {
     const spinner = clack.spinner();
     spinner.start('Waiting for browser authentication (3 min timeout)...');
-    const result = await loginWithBrowser();
-    success = result.success;
-    errorMessage = result.error;
-    spinner.stop(success ? 'Authentication complete' : 'Authentication failed');
+    result = await loginWithBrowser();
+    spinner.stop(result.success ? 'Authentication complete' : 'Authentication failed');
   }
 
-  if (success) {
-    const creds = readCredentials();
-    clack.log.success(`Logged in as ${pc.bold(creds?.email ?? 'unknown')}`);
-  } else {
-    clack.log.error(errorMessage || 'Login failed. Please try again.');
+  if (!result.success) {
+    clack.log.error(result.error || 'Login failed. Please try again.');
+    return;
+  }
+
+  const creds = readCredentials();
+  clack.log.success(`Logged in as ${pc.bold(creds?.email ?? 'unknown')}`);
+
+  if (result.switchedAccount) {
+    // The worker registration that just got dropped belonged to the previous
+    // account. Say so, or the next `clustercode worker` looks like it forgot the
+    // setup for no reason.
+    clack.log.info(
+      `Switched account — this machine's worker registration belonged to the previous one and was cleared.\n` +
+      `  Run ${pc.bold('clustercode worker')} to pick a tenant and register again.`
+    );
   }
 }
 

@@ -131,8 +131,14 @@ async function ensureWorkerConfigInner(): Promise<boolean> {
     ? orchestratorUrl
     : orchestratorUrl.replace(/^http/, 'ws') + '/ws/worker';
 
+  // A workerId is registered under one tenant, so it cannot be carried across to
+  // another: reusing it makes the orchestrator reject the pair. Keep it only
+  // while the tenant is unchanged, so re-running setup for the same tenant does
+  // not spawn a duplicate worker in the console.
+  const keepsTenant = existing?.tenantId === selectedTenant.id;
+
   writeWorkerConfig({
-    workerId: existing?.workerId || crypto.randomUUID(),
+    workerId: (keepsTenant && existing?.workerId) || crypto.randomUUID(),
     tenantId: selectedTenant.id,
     tenantName: selectedTenant.name,
     orchestratorUrl: wsUrl,
