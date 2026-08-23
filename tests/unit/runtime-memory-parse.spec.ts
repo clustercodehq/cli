@@ -52,9 +52,9 @@ describe('parseEngineCapacity', () => {
   });
 
   test('format string matches what the worker agent probes', () => {
-    // Pinned deliberately: the agent's enginecap package probes these exact
-    // fields. If this drifts, doctor and the orchestrator disagree about how
-    // much memory this worker has.
+    // Pinned deliberately: the worker agent probes these exact fields when it
+    // reports capacity. If this drifts, doctor and the scheduler disagree about
+    // how much memory this worker has.
     assert.equal(ENGINE_CAPACITY_FORMAT, '{{.Host.MemTotal}} {{.Host.CPUs}}');
   });
 });
