@@ -12,6 +12,7 @@ import {
   configExists,
 } from './config-store/index.js';
 import type { Credentials, WorkerConfig, AppConfig } from './config-store/index.js';
+import { MIN_RUNTIME_MEMORY_MIB } from './runtime-memory.js';
 
 // Re-export reads and types so existing CLI imports keep working
 export {
@@ -27,7 +28,10 @@ export {
 };
 export type { Credentials, WorkerConfig, AppConfig };
 
-const ALLOWED_CONFIG_KEYS: ReadonlySet<keyof AppConfig> = new Set(['WORKER_NAME']);
+const ALLOWED_CONFIG_KEYS: ReadonlySet<keyof AppConfig> = new Set([
+  'WORKER_NAME',
+  'RUNTIME_MEMORY_MB',
+]);
 
 export function isAllowedConfigKey(key: string): key is keyof AppConfig {
   return ALLOWED_CONFIG_KEYS.has(key as keyof AppConfig);
@@ -44,6 +48,30 @@ export function validateWorkerName(name: string): string | null {
   if (!trimmed) return 'Worker name cannot be empty';
   if (trimmed.length > MAX_WORKER_NAME_LENGTH)
     return `Worker name must be ${MAX_WORKER_NAME_LENGTH} characters or less`;
+  return null;
+}
+
+/**
+ * Validate a runtime memory allocation.
+ *
+ * `hostBytes` of 0 means "unknown" (some platforms report nothing) — in that
+ * case we skip the upper bound rather than block a legitimate value.
+ */
+export function validateRuntimeMemoryMb(value: string, hostBytes: number): string | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return 'Runtime memory must be a whole number of MB (for example: 8192)';
+  }
+  const mb = Number(trimmed);
+  if (mb < MIN_RUNTIME_MEMORY_MIB) {
+    return `Runtime memory must be at least ${MIN_RUNTIME_MEMORY_MIB} MB`;
+  }
+  if (hostBytes > 0) {
+    const hostMb = Math.floor(hostBytes / 1024 / 1024);
+    if (mb > hostMb) {
+      return `Runtime memory cannot exceed the machine's ${hostMb} MB of RAM`;
+    }
+  }
   return null;
 }
 
