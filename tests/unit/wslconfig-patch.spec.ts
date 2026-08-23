@@ -79,4 +79,25 @@ describe('patchWslConfig', () => {
     assert.throws(() => patchWslConfig(null, 0), /positive/i);
     assert.throws(() => patchWslConfig(null, -5), /positive/i);
   });
+
+  test('recognizes a [wsl2] header carrying a trailing comment', () => {
+    for (const header of ['[wsl2] ; note', '[wsl2] # note', '[WSL2]; note']) {
+      const out = patchWslConfig(`${header}\nmemory=1GB\n`, 4096);
+      assert.equal(out.match(/\[wsl2\]/gi)?.length, 1, header);
+      assert.match(out, /memory=4096MB/);
+      assert.doesNotMatch(out, /memory=1GB/);
+    }
+  });
+
+  test('treats a commented header of another section as a real boundary', () => {
+    const out = patchWslConfig('[wsl2]\nprocessors=2\n[experimental] ; note\nmemory=1GB\n', 8192);
+    assert.match(out, /\[experimental\] ; note\nmemory=1GB/);
+    assert.match(out, /memory=8192MB/);
+    assert.equal(out.match(/memory=/g)?.length, 2);
+  });
+
+  test('still rejects a malformed header that is not a section line', () => {
+    const out = patchWslConfig('[wsl2] junk\nmemory=1GB\n', 4096);
+    assert.match(out, /\[wsl2\]\nmemory=4096MB/);
+  });
 });

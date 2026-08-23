@@ -129,8 +129,12 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
   const eol = existing.includes('\r\n') ? '\r\n' : '\n';
   const lines = existing.split(/\r?\n/);
 
-  const isSectionHeader = (line: string) => /^\s*\[[^\]]*\]\s*$/.test(line);
-  const isWsl2Header = (line: string) => /^\s*\[\s*wsl2\s*\]\s*$/i.test(line);
+  // The optional `[;#]` tail matters: a hand-edited .wslconfig often carries a
+  // trailing comment on the section line. Without it we would not recognize the
+  // section, append a SECOND [wsl2] block, and the user's setting could silently
+  // never take effect while we report success.
+  const isSectionHeader = (line: string) => /^\s*\[[^\]]*\]\s*([;#].*)?$/.test(line);
+  const isWsl2Header = (line: string) => /^\s*\[\s*wsl2\s*\]\s*([;#].*)?$/i.test(line);
   const isMemoryKey = (line: string) => /^\s*memory\s*=/i.test(line);
 
   const headerIdx = lines.findIndex(isWsl2Header);
