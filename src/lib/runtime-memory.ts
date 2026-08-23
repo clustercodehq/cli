@@ -213,13 +213,28 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
   }
 
   if (engineName === 'docker') {
-    return {
-      name,
-      status: devboxes < 1 ? 'warn' : 'pass',
-      detail:
-        `Docker memory: ${gb(engine.memTotalBytes)}GB of ${gb(hostBytes)}GB host ` +
-        `(~${devboxes} ${plural}) — configure in Docker Desktop settings`,
-    };
+    const base =
+      `Docker memory: ${gb(engine.memTotalBytes)}GB of ${gb(hostBytes)}GB host ` +
+      `(~${devboxes} ${plural})`;
+    // Where the knob actually lives differs by platform: with the WSL2 backend
+    // Docker Desktop's own sliders are disabled and WSL's global config governs
+    // memory, so pointing a Windows user at Docker Desktop sends them somewhere
+    // that cannot change anything.
+    const where =
+      platform === 'win32'
+        ? 'set [wsl2] memory= in .wslconfig'
+        : 'raise it in Docker Desktop settings';
+
+    if (devboxes < 1) {
+      return { name, status: 'warn', detail: `${base} — too small to host a DevBox; ${where}` };
+    }
+    // Same headroom rule as the Podman path: a passing check must mean the same
+    // thing whichever engine is installed.
+    if (hostBytes > 0 && engine.memTotalBytes / hostBytes < HEADROOM_WARN_RATIO) {
+      return { name, status: 'warn', detail: `${base} — more host memory is available; ${where}` };
+    }
+    // Nothing to do: do not append an action the user has no reason to take.
+    return { name, status: 'pass', detail: base };
   }
 
   const base =

@@ -86,6 +86,40 @@ describe('evaluateRuntimeMemory', () => {
     assert.match(r.detail, /Docker/i);
   });
 
+  test('applies the same headroom rule to Docker as to Podman', () => {
+    const reading = { hostBytes: HOST_32GB, provider: 'unknown' as const, platform: 'darwin' as NodeJS.Platform };
+    const docker = evaluateRuntimeMemory({
+      ...reading, engine: { memTotalBytes: 6144 * MIB, cpus: 4 }, engineName: 'docker',
+    });
+    const podman = evaluateRuntimeMemory({
+      ...reading, engine: { memTotalBytes: 6144 * MIB, cpus: 4 }, engineName: 'podman',
+    });
+    assert.equal(docker.status, 'warn');
+    assert.equal(docker.status, podman.status);
+  });
+
+  test('a passing Docker check does not nag about reconfiguring', () => {
+    const r = evaluateRuntimeMemory({
+      engine: { memTotalBytes: 24576 * MIB, cpus: 8 },
+      hostBytes: HOST_32GB, provider: 'unknown', engineName: 'docker', platform: 'darwin',
+    });
+    assert.equal(r.status, 'pass');
+    assert.doesNotMatch(r.detail, /settings|\.wslconfig/i);
+  });
+
+  test('points Docker users at the knob that actually works on their platform', () => {
+    const small = { memTotalBytes: 2048 * MIB, cpus: 2 };
+    const win = evaluateRuntimeMemory({
+      engine: small, hostBytes: HOST_32GB, provider: 'unknown', engineName: 'docker', platform: 'win32',
+    });
+    const mac = evaluateRuntimeMemory({
+      engine: small, hostBytes: HOST_32GB, provider: 'unknown', engineName: 'docker', platform: 'darwin',
+    });
+    assert.match(win.detail, /\.wslconfig/);
+    assert.doesNotMatch(win.detail, /Docker Desktop/);
+    assert.match(mac.detail, /Docker Desktop/);
+  });
+
   test('detail is a single line — doctor prints one line per check', () => {
     const r = evaluateRuntimeMemory({
       engine: { memTotalBytes: 15808 * MIB, cpus: 8 },
