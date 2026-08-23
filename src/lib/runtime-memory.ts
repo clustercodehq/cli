@@ -109,3 +109,58 @@ export function estimateDevboxes(
   if (usable <= 0) return 0;
   return Math.floor(usable / perDevboxMib);
 }
+
+/**
+ * Set `[wsl2] memory=` in a .wslconfig, preserving everything else.
+ *
+ * This rewrites a *global*, user-owned file that other tools also read, so it
+ * patches rather than regenerates: comments, blank lines, unrelated keys and
+ * unrelated sections all survive verbatim.
+ */
+export function patchWslConfig(existing: string | null, memoryMib: number): string {
+  if (!Number.isFinite(memoryMib) || memoryMib <= 0) {
+    throw new Error('WSL memory must be a positive number of MiB');
+  }
+  // WSL treats an unsuffixed size as BYTES, so the suffix is mandatory.
+  const entry = `memory=${memoryMib}MB`;
+
+  if (!existing || existing.trim() === '') return `[wsl2]\n${entry}\n`;
+
+  const eol = existing.includes('\r\n') ? '\r\n' : '\n';
+  const lines = existing.split(/\r?\n/);
+
+  const isSectionHeader = (line: string) => /^\s*\[[^\]]*\]\s*$/.test(line);
+  const isWsl2Header = (line: string) => /^\s*\[\s*wsl2\s*\]\s*$/i.test(line);
+  const isMemoryKey = (line: string) => /^\s*memory\s*=/i.test(line);
+
+  const headerIdx = lines.findIndex(isWsl2Header);
+
+  if (headerIdx === -1) {
+    // No [wsl2] section: append one, keeping a blank line before it.
+    const body = existing.replace(/\s*$/, '');
+    return `${body}${eol}${eol}[wsl2]${eol}${entry}${eol}`;
+  }
+
+  // Find the end of the [wsl2] section (next header, or EOF).
+  let endIdx = lines.length;
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    if (isSectionHeader(lines[i])) {
+      endIdx = i;
+      break;
+    }
+  }
+
+  const memoryIdx = lines.findIndex(
+    (line, i) => i > headerIdx && i < endIdx && isMemoryKey(line),
+  );
+
+  if (memoryIdx !== -1) {
+    lines[memoryIdx] = entry;
+  } else {
+    lines.splice(headerIdx + 1, 0, entry);
+  }
+
+  let out = lines.join(eol);
+  if (!out.endsWith(eol)) out += eol;
+  return out;
+}
