@@ -11,6 +11,9 @@ import {
 } from './config.js';
 import { readInstalled } from './worker-binary.js';
 import { augmentPathWithKnownEngineDirs, resolveExecutable } from './env-path.js';
+import { checkRuntimeMemory } from './runtime-memory.js';
+
+export { checkRuntimeMemory };
 
 export interface CheckResult {
   name: string;
@@ -330,8 +333,11 @@ export async function runAllChecks(): Promise<CheckResult[]> {
     results.push(wslCheck);
   }
 
+  const containerRuntime = checkContainerRuntime();
+
   results.push(
-    checkContainerRuntime(),
+    containerRuntime,
+    checkRuntimeMemory(containerRuntime),
     checkDiskSpace(),
     checkMemory(),
   );

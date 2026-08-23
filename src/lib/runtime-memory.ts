@@ -169,7 +169,10 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
   return out;
 }
 
+import { execSync } from 'node:child_process';
+import { totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
+import { decodeConsoleOutput } from './checks.js';
 
 export interface RuntimeMemoryReading {
   engine: EngineCapacity | null;
@@ -250,4 +253,56 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
   }
 
   return { name, status: 'pass', detail: base };
+}
+
+function execSilent(cmd: string): string | null {
+  try {
+    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] })).trim();
+  } catch {
+    return null;
+  }
+}
+
+/** `podman machine list` works while the machine is stopped; `inspect` has no VMType field. */
+export function detectMachineProvider(engineName: string): MachineProvider {
+  if (engineName !== 'podman') return 'unknown';
+  return parseMachineProvider(execSilent('podman machine list --format "{{.VMType}}"'));
+}
+
+/**
+ * Docker's info template is a different shape — `.MemTotal` / `.NCPU`, with no
+ * `.Host` — so probing it with Podman's format string errors out and would make
+ * every Docker user look permanently unmeasurable.
+ */
+const DOCKER_CAPACITY_FORMAT = '{{.MemTotal}} {{.NCPU}}';
+
+export function probeEngineCapacity(engineName: string): EngineCapacity | null {
+  const format = engineName === 'docker' ? DOCKER_CAPACITY_FORMAT : ENGINE_CAPACITY_FORMAT;
+  return parseEngineCapacity(execSilent(`${engineName} info --format "${format}"`));
+}
+
+/**
+ * Takes the already-computed container-runtime result rather than recomputing
+ * it. That avoids a second round of engine detection (2-4 process spawns, slow
+ * on Windows, and doctor is spawned by many e2e tests) and keeps this module
+ * from importing back into checks.ts.
+ */
+export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
+  const engineName = runtime.engine?.name ?? null;
+
+  if (!engineName) {
+    return {
+      name: 'runtime-memory',
+      status: 'warn',
+      detail: 'Runtime memory unknown — no container runtime detected',
+    };
+  }
+
+  return evaluateRuntimeMemory({
+    engine: probeEngineCapacity(engineName),
+    hostBytes: totalmem(),
+    provider: detectMachineProvider(engineName),
+    engineName,
+    platform: process.platform,
+  });
 }

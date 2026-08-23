@@ -65,6 +65,7 @@ describe('doctor', () => {
     assert.ok(names.includes('worker'));
     assert.ok(names.includes('orchestrator'));
     assert.ok(names.includes('container-runtime'));
+    assert.ok(names.includes('runtime-memory'));
     assert.ok(names.includes('disk'));
     assert.ok(names.includes('memory'));
   });
