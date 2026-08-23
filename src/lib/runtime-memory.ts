@@ -168,3 +168,71 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
   if (!out.endsWith(eol)) out += eol;
   return out;
 }
+
+import type { CheckResult } from './checks.js';
+
+export interface RuntimeMemoryReading {
+  engine: EngineCapacity | null;
+  hostBytes: number;
+  provider: MachineProvider;
+  engineName: string | null;
+  platform: NodeJS.Platform;
+}
+
+/** Fraction of host memory below which we suggest raising the allocation. */
+const HEADROOM_WARN_RATIO = 0.6;
+
+function gb(bytes: number): string {
+  return (bytes / 1024 / 1024 / 1024).toFixed(1);
+}
+
+export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
+  const { engine, hostBytes, engineName, platform } = reading;
+  const name = 'runtime-memory';
+
+  if (!engine) {
+    return {
+      name,
+      status: 'warn',
+      detail: 'Runtime memory unknown — start the container runtime and re-run to measure it',
+    };
+  }
+
+  const engineMib = Math.floor(engine.memTotalBytes / MIB);
+  const devboxes = estimateDevboxes(engineMib);
+  const plural = devboxes === 1 ? 'DevBox' : 'DevBoxes';
+
+  // Native Linux has no VM: engine memory *is* host memory, so comparing the
+  // two would always look like a perfect score and says nothing useful.
+  if (platform === 'linux') {
+    return {
+      name,
+      status: devboxes < 1 ? 'warn' : 'pass',
+      detail: `Runtime memory: ${gb(engine.memTotalBytes)}GB (~${devboxes} ${plural})`,
+    };
+  }
+
+  if (engineName === 'docker') {
+    return {
+      name,
+      status: devboxes < 1 ? 'warn' : 'pass',
+      detail:
+        `Docker memory: ${gb(engine.memTotalBytes)}GB of ${gb(hostBytes)}GB host ` +
+        `(~${devboxes} ${plural}) — configure in Docker Desktop settings`,
+    };
+  }
+
+  const base =
+    `Runtime memory: ${gb(engine.memTotalBytes)}GB of ${gb(hostBytes)}GB host ` +
+    `(~${devboxes} ${plural})`;
+
+  if (devboxes < 1) {
+    return { name, status: 'warn', detail: `${base} — too small to host a DevBox` };
+  }
+
+  if (hostBytes > 0 && engine.memTotalBytes / hostBytes < HEADROOM_WARN_RATIO) {
+    return { name, status: 'warn', detail: `${base} — more host memory is available` };
+  }
+
+  return { name, status: 'pass', detail: base };
+}
