@@ -38,7 +38,10 @@ export function planMemoryApply(
     return {
       kind: 'unsupported',
       steps: [],
-      reason: 'Docker memory is set in Docker Desktop settings, not from the CLI',
+      reason:
+        platform === 'win32'
+          ? 'Docker memory is governed by [wsl2] memory= in .wslconfig (WSL2 backend) or by Docker Desktop settings (Hyper-V backend) — set it there, not from the CLI'
+          : 'Docker memory is set in Docker Desktop settings, not from the CLI',
     };
   }
 
@@ -89,9 +92,19 @@ export function applyWslMemory(memoryMib: number): { ok: boolean; error?: string
     let existing: string | null = null;
     if (existsSync(path)) {
       const buf = readFileSync(path);
+      // A .wslconfig is plain text — a NUL byte means some UTF-16 variant. This
+      // must be checked separately from the round-trip below: BOM-less UTF-16LE
+      // holding ASCII is byte-for-byte valid UTF-8 (NUL is a legal codepoint), so
+      // it round-trips cleanly and would otherwise slip through and be corrupted.
+      if (buf.includes(0)) {
+        return {
+          ok: false,
+          error: `${path} is not UTF-8 encoded. Set [wsl2] memory=${memoryMib}MB manually.`,
+        };
+      }
       const decoded = buf.toString('utf-8');
       // Round-trip rather than sniffing a specific encoding: anything that is
-      // not valid UTF-8 (UTF-16 either endianness, Windows-1252, ...) fails to
+      // not valid UTF-8 (UTF-16 with a BOM, Windows-1252, ...) fails to
       // re-encode to the same bytes. Refuse rather than silently rewriting the
       // user's content as replacement characters.
       if (!Buffer.from(decoded, 'utf-8').equals(buf)) {

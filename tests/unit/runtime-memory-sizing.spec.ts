@@ -256,7 +256,10 @@ describe('formatFitTable', () => {
     const text = formatFitTable(devboxFitTable(23040, 'win32'));
     const lines = text.split('\n');
     assert.equal(lines[lines.length - 2], 'Counts are per size — mixed sizes share the same pool.');
-    assert.equal(lines[lines.length - 1], 'Windows DevBoxes need ~2 GiB more than their size.');
+    assert.equal(
+      lines[lines.length - 1],
+      'Windows DevBoxes need ~2 GiB more than their size, so fewer fit than shown.',
+    );
   });
 
   test('does not reference internal tier names', () => {

@@ -213,7 +213,7 @@ export function formatFitTable(rows: FitRow[]): string {
   const labelWidth = Math.max(...rows.map((r) => r.label.length));
   const lines = rows.map((r) => `  ${r.label.padEnd(labelWidth)}  fits ~${r.fits}`);
   lines.push('Counts are per size — mixed sizes share the same pool.');
-  lines.push('Windows DevBoxes need ~2 GiB more than their size.');
+  lines.push('Windows DevBoxes need ~2 GiB more than their size, so fewer fit than shown.');
   return lines.join('\n');
 }
 

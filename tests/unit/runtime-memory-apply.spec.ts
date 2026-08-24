@@ -41,6 +41,18 @@ describe('planMemoryApply', () => {
     assert.match(plan.reason!, /Docker Desktop/i);
   });
 
+  test('Docker reason on Windows mentions .wslconfig, agreeing with doctor', () => {
+    const plan = planMemoryApply('unknown', 'win32', 'docker', 8192);
+    assert.equal(plan.kind, 'unsupported');
+    assert.match(plan.reason!, /\.wslconfig/);
+  });
+
+  test('Docker reason on macOS mentions Docker Desktop settings', () => {
+    const plan = planMemoryApply('unknown', 'darwin', 'docker', 8192);
+    assert.equal(plan.kind, 'unsupported');
+    assert.match(plan.reason!, /Docker Desktop/i);
+  });
+
   test('is unsupported when the provider could not be detected', () => {
     assert.equal(planMemoryApply('unknown', 'win32', 'podman', 8192).kind, 'unsupported');
   });

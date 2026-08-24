@@ -63,6 +63,48 @@ describe('applyWslMemory encoding guard', () => {
     });
   });
 
+  test('refuses a BOM-less UTF-16LE .wslconfig and leaves the file untouched', () => {
+    withTempHome(() => {
+      const path = wslConfigPath();
+      const text = '[wsl2]\nmemory=4096MB\n';
+      // No BOM: an ASCII-only UTF-16LE buffer is byte-for-byte valid UTF-8
+      // (NUL is a legal codepoint), so it round-trips and would otherwise
+      // slip past the encoding guard undetected.
+      const original = Buffer.from(text, 'utf16le');
+      writeFileSync(path, original);
+
+      const result = applyWslMemory(8192);
+
+      assert.equal(result.ok, false);
+      assert.ok(result.error);
+      const after = readFileSync(path);
+      assert.ok(after.equals(original));
+    });
+  });
+
+  test('refuses a BOM-less UTF-16BE .wslconfig and leaves the file untouched', () => {
+    withTempHome(() => {
+      const path = wslConfigPath();
+      const text = '[wsl2]\nmemory=4096MB\n';
+      const le = Buffer.from(text, 'utf16le');
+      // Swap each pair of bytes to produce big-endian UTF-16 from Node's
+      // little-endian encoder.
+      const original = Buffer.alloc(le.length);
+      for (let i = 0; i < le.length; i += 2) {
+        original[i] = le[i + 1];
+        original[i + 1] = le[i];
+      }
+      writeFileSync(path, original);
+
+      const result = applyWslMemory(8192);
+
+      assert.equal(result.ok, false);
+      assert.ok(result.error);
+      const after = readFileSync(path);
+      assert.ok(after.equals(original));
+    });
+  });
+
   test('accepts a plain UTF-8 .wslconfig, patches memory, and backs it up', () => {
     withTempHome(() => {
       const path = wslConfigPath();
