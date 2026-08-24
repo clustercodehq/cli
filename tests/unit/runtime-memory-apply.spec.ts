@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { planMemoryApply } from '../../src/lib/runtime-memory-apply.js';
+import { planMemoryApply, runApplySteps } from '../../src/lib/runtime-memory-apply.js';
 
 describe('planMemoryApply', () => {
   test('uses .wslconfig on the WSL provider — podman flags are inert there', () => {
@@ -43,5 +43,25 @@ describe('planMemoryApply', () => {
 
   test('is unsupported when the provider could not be detected', () => {
     assert.equal(planMemoryApply('unknown', 'win32', 'podman', 8192).kind, 'unsupported');
+  });
+
+  test('Docker on Linux reports the no-VM reason, not a Docker Desktop one', () => {
+    const plan = planMemoryApply('unknown', 'linux', 'docker', 8192);
+    assert.equal(plan.kind, 'unsupported');
+    assert.match(plan.reason!, /no virtual machine/i);
+    assert.doesNotMatch(plan.reason!, /Docker Desktop/);
+  });
+});
+
+describe('runApplySteps', () => {
+  test('skips descriptive steps rather than executing them', () => {
+    // None of these start with `podman ` or `wsl `, so none should be run.
+    const result = runApplySteps(['Set memory=8192MB in .wslconfig', 'Some other note']);
+    assert.deepEqual(result, { ok: true });
+  });
+
+  test('treats an all-descriptive step list as success with nothing executed', () => {
+    const result = runApplySteps([]);
+    assert.deepEqual(result, { ok: true });
   });
 });

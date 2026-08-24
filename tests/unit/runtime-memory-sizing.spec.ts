@@ -25,11 +25,11 @@ describe('recommendRuntimeMemoryMib', () => {
     assert.equal(recommendRuntimeMemoryMib(8192 * MIB), MIN_RUNTIME_MEMORY_MIB);
   });
 
-  test('protecting the host wins over the floor on a small machine', () => {
+  test('recommends nothing when the host-protection cap would leave less than the floor', () => {
     // 5 GiB host: the floor says 2048, but leaving the host 4096 allows only
-    // 1024. The host wins — a worker that makes the machine unusable is worse
-    // than a worker that is too small.
-    assert.equal(recommendRuntimeMemoryMib(5120 * MIB), 1024);
+    // 1024, which is below the floor and thus not a usable amount to offer.
+    // 0 means "this machine cannot spare any memory".
+    assert.equal(recommendRuntimeMemoryMib(5120 * MIB), 0);
   });
 
   test('recommends nothing at all when the machine is too small to share', () => {

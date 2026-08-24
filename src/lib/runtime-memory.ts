@@ -51,7 +51,13 @@ const MIB = 1024 * 1024;
  */
 export const DEFAULT_DEVBOX_MIB = 4096;
 
-/** Below this a runtime cannot host even a minimal DevBox. */
+/**
+ * Absolute floor for a usable container runtime. Note this is a floor, not a
+ * recommendation: hosting one DevBox at the default size needs roughly
+ * HOST_RESERVE_MIN_MIB + DEFAULT_DEVBOX_MIB, and the doctor check reports
+ * how many actually fit. Smaller DevBoxes can be requested per launch, so
+ * values between this floor and that figure are legitimate.
+ */
 export const MIN_RUNTIME_MEMORY_MIB = 2048;
 
 /** Memory the host OS keeps for itself, mirroring the scheduler's reserve. */
@@ -87,6 +93,10 @@ export function recommendRuntimeMemoryMib(hostBytes: number): number {
   // On a small machine the runtime floor would starve the host; the host wins.
   const hardCap = hostMib - LEAVE_HOST_HARD_MIB;
   if (result > hardCap) result = Math.max(0, Math.floor(hardCap / 1024) * 1024);
+
+  // A value below the floor is not offerable: 0 already means "this machine
+  // cannot spare any memory", and the caller handles that case.
+  if (result < MIN_RUNTIME_MEMORY_MIB) return 0;
 
   return result;
 }
@@ -177,7 +187,6 @@ import { decodeConsoleOutput } from './checks.js';
 export interface RuntimeMemoryReading {
   engine: EngineCapacity | null;
   hostBytes: number;
-  provider: MachineProvider;
   engineName: string | null;
   platform: NodeJS.Platform;
 }
@@ -298,10 +307,17 @@ export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
     };
   }
 
+  if (runtime.status !== 'pass') {
+    return {
+      name: 'runtime-memory',
+      status: 'warn',
+      detail: 'Runtime memory unknown — start the container runtime and re-run to measure it',
+    };
+  }
+
   return evaluateRuntimeMemory({
     engine: probeEngineCapacity(engineName),
     hostBytes: totalmem(),
-    provider: detectMachineProvider(engineName),
     engineName,
     platform: process.platform,
   });
