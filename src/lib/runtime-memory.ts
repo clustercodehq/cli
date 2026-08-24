@@ -101,6 +101,63 @@ export function recommendRuntimeMemoryMib(hostBytes: number): number {
   return result;
 }
 
+export type MachineUse = 'dedicated' | 'shared';
+
+/**
+ * Memory the host OS keeps for itself, by platform and how the machine is
+ * used. Linux has no VM in the way, so there is nothing to reserve on its
+ * behalf — the container runtime *is* the host.
+ */
+export function hostReserveMib(platform: NodeJS.Platform, use: MachineUse): number {
+  if (platform === 'linux') return 0;
+  return use === 'dedicated' ? 6144 : 12288;
+}
+
+/**
+ * Suggested runtime allocation for a machine used this way.
+ *
+ * `dedicated` hands over everything except the host's reserve. `shared`
+ * additionally caps at half the machine, since a machine that is also a
+ * daily driver should not be handing away most of its memory even when the
+ * reserve alone would allow it.
+ */
+export function recommendForUse(
+  hostBytes: number,
+  platform: NodeJS.Platform,
+  use: MachineUse,
+): number {
+  if (!Number.isFinite(hostBytes) || hostBytes <= 0) return 0;
+  const hostMib = Math.floor(hostBytes / MIB);
+  const reserve = hostReserveMib(platform, use);
+
+  const raw =
+    use === 'dedicated' ? hostMib - reserve : Math.min(Math.floor(hostMib * 0.5), hostMib - reserve);
+
+  if (raw <= 0) return 0;
+
+  // Floor, never round: rounding up can consume part of the host reserve,
+  // which is the one thing this function exists to protect.
+  const result = Math.floor(raw / 1024) * 1024;
+
+  if (result < MIN_RUNTIME_MEMORY_MIB) return 0;
+  return result;
+}
+
+/**
+ * Largest allocation that still leaves the host able to function — the
+ * validator's upper bound. Not rounded to a GiB: this is a hard ceiling, not
+ * a suggestion.
+ */
+export function maxSafeRuntimeMib(hostBytes: number, platform: NodeJS.Platform): number {
+  if (!Number.isFinite(hostBytes) || hostBytes <= 0) return 0;
+  const hostMib = Math.floor(hostBytes / MIB);
+  // Clamped to 0: a host smaller than the platform reserve has no safe
+  // allocation at all, not a negative one.
+  if (platform === 'win32') return Math.max(0, hostMib - 4096);
+  if (platform === 'darwin') return Math.max(0, hostMib - 6144);
+  return hostMib;
+}
+
 /**
  * Roughly how many DevBoxes an engine of this size can host, mirroring the
  * scheduler's accounting: total, less a host reserve, divided by DevBox size.
@@ -118,6 +175,46 @@ export function estimateDevboxes(
   const usable = engineTotalMib - reserve;
   if (usable <= 0) return 0;
   return Math.floor(usable / perDevboxMib);
+}
+
+export interface FitRow {
+  label: string;
+  perBoxMib: number;
+  fits: number;
+}
+
+/**
+ * Generic, public-facing DevBox sizes — deliberately not the internal tier
+ * names, since this table is shown to every user of the public CLI.
+ */
+const FIT_TABLE_SIZES: ReadonlyArray<{ label: string; perBoxMib: number }> = [
+  { label: '2 GiB (small)', perBoxMib: 2048 },
+  { label: '4 GiB (default)', perBoxMib: 4096 },
+  { label: '8 GiB (large)', perBoxMib: 8192 },
+  { label: '16 GiB (extra large)', perBoxMib: 16384 },
+];
+
+/**
+ * How many DevBoxes of each generic size an engine this big can host, so a
+ * user running larger-than-default DevBoxes is not left guessing from a
+ * count that silently assumed the default size.
+ */
+export function devboxFitTable(engineTotalMib: number, platform: NodeJS.Platform): FitRow[] {
+  void platform; // sizes and counts are the same on every platform; kept for a stable call shape
+  return FIT_TABLE_SIZES.map(({ label, perBoxMib }) => ({
+    label,
+    perBoxMib,
+    fits: estimateDevboxes(engineTotalMib, perBoxMib),
+  }));
+}
+
+/** Render a fit table as aligned plain-text lines suitable for terminal output. */
+export function formatFitTable(rows: FitRow[]): string {
+  const labelWidth = Math.max(...rows.map((r) => r.label.length));
+  const lines = rows.map((r) => `  ${r.label.padEnd(labelWidth)}  fits ~${r.fits}`);
+  lines.push('Counts are per size — mixed sizes share the same pool.');
+  lines.push('Windows DevBoxes need ~2 GiB more than their size.');
+  return lines.join('\n');
 }
 
 /**
@@ -183,23 +280,64 @@ import { execSync } from 'node:child_process';
 import { totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
 import { decodeConsoleOutput } from './checks.js';
+// Imported from the underlying store, not from './config.js': config.ts
+// imports MIN_RUNTIME_MEMORY_MIB from this module, and importing config.ts
+// back here would create a cycle.
+import { readAppConfig } from './config-store/index.js';
 
 export interface RuntimeMemoryReading {
   engine: EngineCapacity | null;
   hostBytes: number;
   engineName: string | null;
   platform: NodeJS.Platform;
+  /**
+   * The user's own stored `RUNTIME_MEMORY_MB`, when set. Present, this means
+   * the current size was a deliberate choice rather than an install default,
+   * so a reading close to it should not be re-litigated on every doctor run.
+   */
+  configuredMib?: number;
 }
 
-/** Fraction of host memory below which we suggest raising the allocation. */
-const HEADROOM_WARN_RATIO = 0.6;
+/** A reading within this fraction of the configured value counts as "that value". */
+const CONFIGURED_TOLERANCE = 0.07;
 
-function gb(bytes: number): string {
+const DEFAULT_DEVBOX_LABEL = `${DEFAULT_DEVBOX_MIB / 1024} GiB`;
+
+function gib(bytes: number): string {
   return (bytes / 1024 / 1024 / 1024).toFixed(1);
 }
 
+function fitPhrase(devboxes: number): string {
+  return devboxes < 1
+    ? `too small for a default (${DEFAULT_DEVBOX_LABEL}) DevBox`
+    : `fits ~${devboxes} default (${DEFAULT_DEVBOX_LABEL}) DevBox${devboxes === 1 ? '' : 'es'}`;
+}
+
+/** Is this reading within tolerance of the user's own configured value? */
+function isDeliberateChoice(engineMib: number, configuredMib: number | undefined): boolean {
+  if (configuredMib === undefined || configuredMib <= 0) return false;
+  return Math.abs(engineMib - configuredMib) / configuredMib < CONFIGURED_TOLERANCE;
+}
+
+/**
+ * A passing reading is still worth a nudge when nobody has made a deliberate
+ * choice and the machine could give a dedicated worker meaningfully more.
+ * This must never downgrade the status — it only appends to an already
+ * passing detail line, so a first-time user at the WSL default learns what
+ * is possible without being nagged about it on every run.
+ */
+function dedicatedNudge(
+  configuredMib: number | undefined,
+  engineMib: number,
+  dedicatedRecommendation: number,
+): string {
+  if (configuredMib !== undefined) return '';
+  if (engineMib >= dedicatedRecommendation) return '';
+  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — see \`clustercode onboard\`)`;
+}
+
 export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
-  const { engine, hostBytes, engineName, platform } = reading;
+  const { engine, hostBytes, engineName, platform, configuredMib } = reading;
   const name = 'runtime-memory';
 
   if (!engine) {
@@ -212,7 +350,6 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
 
   const engineMib = Math.floor(engine.memTotalBytes / MIB);
   const devboxes = estimateDevboxes(engineMib);
-  const plural = devboxes === 1 ? 'DevBox' : 'DevBoxes';
 
   // Native Linux has no VM: engine memory *is* host memory, so comparing the
   // two would always look like a perfect score and says nothing useful.
@@ -220,14 +357,20 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     return {
       name,
       status: devboxes < 1 ? 'warn' : 'pass',
-      detail: `Runtime memory: ${gb(engine.memTotalBytes)}GB (~${devboxes} ${plural})`,
+      detail: `Runtime memory: ${gib(engine.memTotalBytes)} GiB — ${fitPhrase(devboxes)}`,
     };
   }
 
+  // Warn only when the engine is below what we would suggest for a *shared*
+  // machine — a dedicated worker at ~50% of the host is a deliberate,
+  // correct choice, not a problem to nag about on every run.
+  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared');
+  const belowSharedRecommendation = hostBytes > 0 && engineMib < sharedRecommendation;
+  const deliberate = isDeliberateChoice(engineMib, configuredMib);
+  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated');
+
   if (engineName === 'docker') {
-    const base =
-      `Docker memory: ${gb(engine.memTotalBytes)}GB of ${gb(hostBytes)}GB host ` +
-      `(~${devboxes} ${plural})`;
+    const base = `Docker memory: ${gib(engine.memTotalBytes)} GiB of ${gib(hostBytes)} GiB host — ${fitPhrase(devboxes)}`;
     // Where the knob actually lives differs by platform: with the WSL2 backend
     // Docker Desktop's own sliders are disabled and WSL's global config governs
     // memory, so pointing a Windows user at Docker Desktop sends them somewhere
@@ -238,30 +381,33 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
         : 'raise it in Docker Desktop settings';
 
     if (devboxes < 1) {
-      return { name, status: 'warn', detail: `${base} — too small to host a DevBox; ${where}` };
+      return { name, status: 'warn', detail: `${base}; ${where}` };
     }
     // Same headroom rule as the Podman path: a passing check must mean the same
     // thing whichever engine is installed.
-    if (hostBytes > 0 && engine.memTotalBytes / hostBytes < HEADROOM_WARN_RATIO) {
+    if (belowSharedRecommendation && !deliberate) {
       return { name, status: 'warn', detail: `${base} — more host memory is available; ${where}` };
     }
-    // Nothing to do: do not append an action the user has no reason to take.
-    return { name, status: 'pass', detail: base };
+    // Nothing to do beyond a possible nudge: do not append an action the
+    // user has no reason to take.
+    return { name, status: 'pass', detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation)}` };
   }
 
-  const base =
-    `Runtime memory: ${gb(engine.memTotalBytes)}GB of ${gb(hostBytes)}GB host ` +
-    `(~${devboxes} ${plural})`;
+  const base = `Runtime memory: ${gib(engine.memTotalBytes)} GiB of ${gib(hostBytes)} GiB host — ${fitPhrase(devboxes)}`;
 
   if (devboxes < 1) {
-    return { name, status: 'warn', detail: `${base} — too small to host a DevBox` };
+    return { name, status: 'warn', detail: base };
   }
 
-  if (hostBytes > 0 && engine.memTotalBytes / hostBytes < HEADROOM_WARN_RATIO) {
-    return { name, status: 'warn', detail: `${base} — more host memory is available` };
+  if (belowSharedRecommendation && !deliberate) {
+    return {
+      name,
+      status: 'warn',
+      detail: `${base} — more host memory is available; raise with \`clustercode onboard --memory ${dedicatedRecommendation}\``,
+    };
   }
 
-  return { name, status: 'pass', detail: base };
+  return { name, status: 'pass', detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation)}` };
 }
 
 function execSilent(cmd: string): string | null {
@@ -315,10 +461,14 @@ export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
     };
   }
 
+  const configured = readAppConfig().RUNTIME_MEMORY_MB;
+  const configuredMib = configured !== undefined ? Number(configured) : undefined;
+
   return evaluateRuntimeMemory({
     engine: probeEngineCapacity(engineName),
     hostBytes: totalmem(),
     engineName,
     platform: process.platform,
+    configuredMib: configuredMib !== undefined && Number.isFinite(configuredMib) ? configuredMib : undefined,
   });
 }

@@ -13,8 +13,10 @@ import {
   checkRuntimeMemory,
   detectMachineProvider,
   probeEngineCapacity,
-  recommendRuntimeMemoryMib,
+  recommendForUse,
   estimateDevboxes,
+  devboxFitTable,
+  formatFitTable,
 } from '../lib/runtime-memory.js';
 import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
 import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
@@ -463,9 +465,11 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   if (!engineName) return;
 
   const hostBytes = totalmem();
+  const platform = process.platform;
   const provider = detectMachineProvider(engineName);
   const requested = resolveRequestedMemoryMib(flagMemory, readAppConfig().RUNTIME_MEMORY_MB, hostBytes);
-  const recommended = recommendRuntimeMemoryMib(hostBytes);
+  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated');
+  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared');
 
   // An explicitly-passed --memory that fails validation must be an error, not a
   // silent fall-through to the prompt: a CI run that typos `--memory 8GB` would
@@ -476,7 +480,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
     return;
   }
 
-  const probe = planMemoryApply(provider, process.platform, engineName, requested ?? recommended);
+  const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
   if (probe.kind === 'unsupported') {
     if (flagMemory) clack.log.warn(`Cannot set runtime memory: ${probe.reason}`);
     return;
@@ -488,8 +492,8 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   clack.log.step('Container runtime memory');
   if (currentMib !== null) {
     clack.log.info(
-      `Currently ${(currentMib / 1024).toFixed(1)}GB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)}GB ` +
-        `(~${estimateDevboxes(currentMib)} DevBoxes)`,
+      `Currently ${(currentMib / 1024).toFixed(1)} GiB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)} GiB ` +
+        `— fits ~${estimateDevboxes(currentMib)} default (4 GiB) DevBoxes`,
     );
   }
 
@@ -497,22 +501,66 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   if (target === null) {
     if (!process.stdin.isTTY) return;
     // 0 means the machine is too small to give anything away without starving
-    // the host. Say so rather than prompting with an invalid default.
-    if (recommended === 0) {
+    // the host, for either use. Say so rather than prompting with an invalid
+    // default.
+    if (dedicatedRecommendation === 0) {
       clack.log.warn('This machine does not have enough RAM to increase the runtime allocation.');
       return;
     }
-    const answer = await clack.text({
-      message: `Memory to give the container runtime, in MB (~${estimateDevboxes(recommended)} DevBoxes)?`,
-      initialValue: String(recommended),
-      // The default parameter is required: clack types the callback as
-      // `(value: string | undefined)`, and clack wants `undefined` for "valid",
-      // not `null`. Matches the existing usage in src/commands/login.ts.
-      validate: (v = '') => validateRuntimeMemoryMb(v, hostBytes) ?? undefined,
+
+    // A ceiling is not the same commitment as a reservation, and users
+    // routinely under-allocate out of caution about a number they think is
+    // set aside up front. Say what actually happens before asking them to
+    // pick one.
+    const ceilingNote =
+      platform === 'win32'
+        ? 'This is a ceiling, not a reservation — memory is used only while DevBoxes run, and Windows gets most of it back when they stop.'
+        : platform === 'darwin'
+          ? 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, though macOS may not release it back until the machine restarts.'
+          : null;
+    if (ceilingNote) clack.log.info(ceilingNote);
+
+    const useOptions: { value: 'dedicated' | 'shared' | 'custom' | 'keep'; label: string }[] = [
+      {
+        value: 'dedicated',
+        label: `Dedicated worker — mostly hosts DevBoxes (${dedicatedRecommendation / 1024} GiB, ~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes)`,
+      },
+    ];
+    if (sharedRecommendation > 0) {
+      useOptions.push({
+        value: 'shared',
+        label: `Shared — I also work on this machine (${sharedRecommendation / 1024} GiB, ~${estimateDevboxes(sharedRecommendation)} default DevBoxes)`,
+      });
+    }
+    useOptions.push({ value: 'custom', label: 'Custom amount' });
+    useOptions.push({ value: 'keep', label: 'Keep current' });
+
+    const choice = await clack.select({
+      message: 'How should the container runtime memory be sized?',
+      options: useOptions,
     });
-    if (clack.isCancel(answer)) return;
-    target = Number(String(answer).trim());
+    if (clack.isCancel(choice) || choice === 'keep') return;
+
+    if (choice === 'dedicated' || choice === 'shared') {
+      target = (choice === 'dedicated' ? dedicatedRecommendation : sharedRecommendation) as number;
+    } else {
+      const answer = await clack.text({
+        message: `Memory to give the container runtime, in MB (~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes)?`,
+        initialValue: String(dedicatedRecommendation),
+        // The default parameter is required: clack types the callback as
+        // `(value: string | undefined)`, and clack wants `undefined` for "valid",
+        // not `null`. Matches the existing usage in src/commands/login.ts.
+        validate: (v = '') => validateRuntimeMemoryMb(v, hostBytes) ?? undefined,
+      });
+      if (clack.isCancel(answer)) return;
+      target = Number(String(answer).trim());
+    }
   }
+
+  // Show what the chosen number actually buys before asking to apply it —
+  // regardless of which path picked it (flag, stored config, a preset, or a
+  // custom amount).
+  clack.log.info(formatFitTable(devboxFitTable(target, platform)));
 
   // Compare with tolerance: the guest kernel reserves some of what we allocate,
   // so an engine given 24576 MB reports meaningfully less. An exact comparison

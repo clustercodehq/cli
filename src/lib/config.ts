@@ -12,7 +12,7 @@ import {
   configExists,
 } from './config-store/index.js';
 import type { Credentials, WorkerConfig, AppConfig } from './config-store/index.js';
-import { MIN_RUNTIME_MEMORY_MIB } from './runtime-memory.js';
+import { MIN_RUNTIME_MEMORY_MIB, maxSafeRuntimeMib } from './runtime-memory.js';
 
 // Re-export reads and types so existing CLI imports keep working
 export {
@@ -67,9 +67,12 @@ export function validateRuntimeMemoryMb(value: string, hostBytes: number): strin
     return `Runtime memory must be at least ${MIN_RUNTIME_MEMORY_MIB} MB`;
   }
   if (hostBytes > 0) {
-    const hostMb = Math.floor(hostBytes / 1024 / 1024);
-    if (mb > hostMb) {
-      return `Runtime memory cannot exceed the machine's ${hostMb} MB of RAM`;
+    const maxSafeMb = maxSafeRuntimeMib(hostBytes, process.platform);
+    if (maxSafeMb === 0) {
+      return 'This machine does not have enough RAM to run the container runtime';
+    }
+    if (mb > maxSafeMb) {
+      return `Runtime memory cannot exceed ${maxSafeMb} MB on this machine (the host needs the rest)`;
     }
   }
   return null;
