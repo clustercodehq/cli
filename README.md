@@ -53,8 +53,8 @@ engine with `--podman` or `--docker`.
 ### `clustercode doctor`
 
 Check system health: auth status, worker registration, orchestrator
-connectivity, container runtime, disk, and memory. Add `--json` for
-machine-readable output.
+connectivity, container runtime, container-runtime memory allocation, disk,
+and host memory. Add `--json` for machine-readable output.
 
 Exits non-zero when any check fails, so it works as a scripted gate:
 
@@ -70,6 +70,19 @@ platform-aware setup for macOS, Linux, and Windows. Any issue left unresolved is
 listed at the end with the exact command that fixes it, and the wizard exits
 non-zero.
 
+The wizard also offers to size the memory given to the container runtime —
+this runs even when everything else is already healthy, since an
+under-provisioned runtime otherwise fails silently by capping how much work
+the worker can take on. Pass `--memory <mb>` to set it non-interactively (also
+honoured when a fresh container-runtime machine is created):
+
+```bash
+clustercode onboard --memory 8192
+```
+
+On Windows, this is governed by `.wslconfig`; applying a change restarts every
+WSL distribution on the machine.
+
 On Windows, a container engine installed by the wizard is not on the PATH that
 the current terminal inherited, so the CLI re-resolves it from the default
 install location for the rest of the session. Open a new terminal to use
@@ -84,6 +97,11 @@ clustercode config set WORKER_NAME my-worker
 clustercode config get WORKER_NAME
 clustercode config list
 ```
+
+| Key | Purpose |
+|---|---|
+| `WORKER_NAME` | Display name for this worker. |
+| `RUNTIME_MEMORY_MB` | Memory, in MB, to give the container runtime. Takes effect when a new container-runtime machine is created and whenever `clustercode onboard` runs. |
 
 ### `clustercode status`
 
