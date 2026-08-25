@@ -320,6 +320,20 @@ function isDeliberateChoice(engineMib: number, configuredMib: number | undefined
 }
 
 /**
+ * Where a dedicated-worker nudge should point. `onboard` can resize a Podman
+ * machine, but it can never resize a Docker engine — that knob lives in
+ * .wslconfig on Windows or in Docker Desktop settings everywhere else. Must
+ * agree with the `where` computed in the `docker` branch below and with
+ * `planMemoryApply`'s `unsupported` reason for docker.
+ */
+function dedicatedAction(engineName: string | null, platform: NodeJS.Platform): string {
+  if (engineName === 'docker') {
+    return platform === 'win32' ? 'set [wsl2] memory= in .wslconfig' : 'raise it in Docker Desktop settings';
+  }
+  return 'see `clustercode onboard`';
+}
+
+/**
  * A passing reading is still worth a nudge when nobody has made a deliberate
  * choice and the machine could give a dedicated worker meaningfully more.
  * This must never downgrade the status — it only appends to an already
@@ -330,10 +344,12 @@ function dedicatedNudge(
   configuredMib: number | undefined,
   engineMib: number,
   dedicatedRecommendation: number,
+  engineName: string | null,
+  platform: NodeJS.Platform,
 ): string {
   if (configuredMib !== undefined) return '';
   if (engineMib >= dedicatedRecommendation) return '';
-  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — see \`clustercode onboard\`)`;
+  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — ${dedicatedAction(engineName, platform)})`;
 }
 
 export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
@@ -390,7 +406,11 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     }
     // Nothing to do beyond a possible nudge: do not append an action the
     // user has no reason to take.
-    return { name, status: 'pass', detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation)}` };
+    return {
+      name,
+      status: 'pass',
+      detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform)}`,
+    };
   }
 
   const base = `Runtime memory: ${gib(engine.memTotalBytes)} GiB of ${gib(hostBytes)} GiB host — ${fitPhrase(devboxes)}`;
@@ -407,7 +427,11 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     };
   }
 
-  return { name, status: 'pass', detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation)}` };
+  return {
+    name,
+    status: 'pass',
+    detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform)}`,
+  };
 }
 
 function execSilent(cmd: string): string | null {

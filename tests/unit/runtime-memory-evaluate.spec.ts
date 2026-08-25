@@ -145,8 +145,11 @@ describe('evaluateRuntimeMemory', () => {
   });
 
   test('a passing Docker check does not nag about reconfiguring', () => {
+    // At/above the dedicated recommendation, so there is no nudge either —
+    // this isolates "no reconfigure text" from the (separately tested)
+    // dedicated-worker nudge, which legitimately names Docker Desktop/.wslconfig.
     const r = evaluateRuntimeMemory({
-      engine: { memTotalBytes: 24576 * MIB, cpus: 8 },
+      engine: { memTotalBytes: 26624 * MIB, cpus: 8 },
       hostBytes: HOST_32GB, engineName: 'docker', platform: 'darwin',
     });
     assert.equal(r.status, 'pass');
@@ -224,6 +227,52 @@ describe('evaluateRuntimeMemory', () => {
       });
       assert.equal(r.status, 'pass');
       assert.match(r.detail, /dedicated worker\? up to 26\.0 GiB/);
+    });
+
+    test('a passing Docker nudge on win32 points at .wslconfig, not onboard', () => {
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: BELOW_DEDICATED_MIB * MIB, cpus: 8 },
+        hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32',
+      });
+      assert.equal(r.status, 'pass');
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+      assert.match(r.detail, /\.wslconfig/);
+    });
+
+    test('a passing Docker nudge on darwin points at Docker Desktop, not onboard', () => {
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: BELOW_DEDICATED_MIB * MIB, cpus: 8 },
+        hostBytes: HOST_32GB, engineName: 'docker', platform: 'darwin',
+      });
+      assert.equal(r.status, 'pass');
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+      assert.match(r.detail, /Docker Desktop/);
+    });
+  });
+
+  describe('the warn-branch call to action for Docker', () => {
+    // 8 GiB engine on a 32 GiB host is well below the shared recommendation
+    // (16 GiB) and not a deliberate choice, so this warns on every platform.
+    test('warns on win32 pointing at .wslconfig, not onboard', () => {
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: 8192 * MIB, cpus: 8 },
+        hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32',
+      });
+      assert.equal(r.status, 'warn');
+      assert.match(r.detail, /more host memory is available/);
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+      assert.match(r.detail, /\.wslconfig/);
+    });
+
+    test('warns on darwin pointing at Docker Desktop, not onboard', () => {
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: 8192 * MIB, cpus: 8 },
+        hostBytes: HOST_32GB, engineName: 'docker', platform: 'darwin',
+      });
+      assert.equal(r.status, 'warn');
+      assert.match(r.detail, /more host memory is available/);
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+      assert.match(r.detail, /Docker Desktop/);
     });
   });
 });
