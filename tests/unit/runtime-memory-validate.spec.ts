@@ -58,8 +58,25 @@ describe('validateRuntimeMemoryMb', () => {
   // message read "cannot exceed -2048 MB". A cap of 0 means there is no safe
   // allocation at all, so the message must say that plainly instead.
   test('reports "not enough RAM" rather than a negative cap on a tiny host', () => {
-    const err = validateRuntimeMemoryMb('4096', 2 * 1024 * MIB);
-    assert.equal(err, 'This machine does not have enough RAM to run the container runtime');
-    assert.doesNotMatch(err!, /-\d/);
+    // Platform is passed explicitly: on Linux there is no VM and no host
+    // reserve, so a 2 GiB host has a 2048 MB cap rather than none, and this
+    // case only exists on the VM-backed platforms.
+    for (const platform of ['win32', 'darwin'] as NodeJS.Platform[]) {
+      const err = validateRuntimeMemoryMb('4096', 2 * 1024 * MIB, platform);
+      assert.equal(
+        err,
+        'This machine does not have enough RAM to run the container runtime',
+        platform,
+      );
+      assert.doesNotMatch(err!, /-\d/, platform);
+    }
+  });
+
+  test('a tiny Linux host has no VM reserve, so the cap is the host itself', () => {
+    // Pins the behaviour that broke CI: the same input yields a different,
+    // still-correct message on a platform with no virtual machine.
+    assert.equal(validateRuntimeMemoryMb('4096', 2 * 1024 * MIB, 'linux'),
+      'Runtime memory cannot exceed 2048 MB on this machine (the host needs the rest)');
+    assert.equal(validateRuntimeMemoryMb('2048', 2 * 1024 * MIB, 'linux'), null);
   });
 });

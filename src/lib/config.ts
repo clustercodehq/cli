@@ -57,7 +57,15 @@ export function validateWorkerName(name: string): string | null {
  * `hostBytes` of 0 means "unknown" (some platforms report nothing) — in that
  * case we skip the upper bound rather than block a legitimate value.
  */
-export function validateRuntimeMemoryMb(value: string, hostBytes: number): string | null {
+export function validateRuntimeMemoryMb(
+  value: string,
+  hostBytes: number,
+  // Explicit so the bound is testable off the host platform. Reading
+  // process.platform internally made the tiny-host case assert a Windows-only
+  // outcome: on Linux there is no VM and no reserve, so the same host size
+  // yields a different message and the test only passed on Windows.
+  platform: NodeJS.Platform = process.platform,
+): string | null {
   const trimmed = value.trim();
   if (!/^\d+$/.test(trimmed)) {
     return 'Runtime memory must be a whole number of MB (for example: 8192)';
@@ -67,7 +75,7 @@ export function validateRuntimeMemoryMb(value: string, hostBytes: number): strin
     return `Runtime memory must be at least ${MIN_RUNTIME_MEMORY_MIB} MB`;
   }
   if (hostBytes > 0) {
-    const maxSafeMb = maxSafeRuntimeMib(hostBytes, process.platform);
+    const maxSafeMb = maxSafeRuntimeMib(hostBytes, platform);
     if (maxSafeMb === 0) {
       return 'This machine does not have enough RAM to run the container runtime';
     }
