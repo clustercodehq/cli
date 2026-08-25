@@ -93,12 +93,17 @@ install location for the rest of the session. Open a new terminal to use
 When there's no `--memory` flag and nothing stored yet, the wizard asks how
 the machine is used and offers a preset for each:
 
-- **Dedicated worker** — mostly hosts DevBoxes. The host keeps a fixed
-  reserve for itself (~6 GiB on Windows/macOS) and the rest goes to the
-  container runtime. Linux has no VM in the way, so nothing is reserved.
+- **Dedicated worker** — mostly hosts DevBoxes. The host keeps a *preset*
+  reserve of ~6 GiB on Windows/macOS and the rest goes to the container
+  runtime. Linux has no VM in the way, so nothing is reserved.
 - **Shared** — you also work on this machine day to day. The runtime gets at
-  most half the machine, and the host keeps a larger reserve (~12 GiB on
-  Windows/macOS) so the desktop stays usable.
+  most half the machine, and the host keeps a larger preset reserve of ~12 GiB
+  on Windows/macOS so the desktop stays usable.
+
+Those preset reserves are deliberately conservative and are **not** the hard
+limit. A custom amount may go higher, up to a per-machine ceiling that leaves
+less behind — 4 GiB on Windows, 6 GiB on macOS. Whatever you type, the CLI
+rejects anything above that ceiling and names the exact limit for your machine.
 
 The number you pick is a **ceiling, not a reservation**: it caps how much the
 container runtime *can* take, but memory is only actually used while DevBoxes
@@ -133,7 +138,7 @@ clustercode config list
 | Key | Purpose |
 |---|---|
 | `WORKER_NAME` | Display name for this worker. |
-| `RUNTIME_MEMORY_MB` | Memory, in MB, to give the container runtime. Takes effect when a new container-runtime machine is created and whenever `clustercode onboard` runs. |
+| `RUNTIME_MEMORY_MB` | Memory, in MiB (1024-based — `8192` is 8 GiB; the `MB` in the name is historical), to give the container runtime. Takes effect when a new container-runtime machine is created and whenever `clustercode onboard` runs. |
 
 ### `clustercode status`
 
