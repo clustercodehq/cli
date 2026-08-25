@@ -13,4 +13,6 @@ export interface WorkerConfig {
 
 export interface AppConfig {
   WORKER_NAME?: string;
+  /** Memory (MB) to allocate to the container runtime. Stored as a decimal string. */
+  RUNTIME_MEMORY_MB?: string;
 }

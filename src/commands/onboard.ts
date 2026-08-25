@@ -2,13 +2,24 @@ import { Command } from 'commander';
 import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { execSync } from 'node:child_process';
+import { totalmem } from 'node:os';
 import {
   runAllChecks,
   checkContainerRuntime,
   checkWsl,
   type CheckResult,
 } from '../lib/checks.js';
-import { readCredentials } from '../lib/config.js';
+import {
+  checkRuntimeMemory,
+  detectMachineProvider,
+  probeEngineCapacity,
+  recommendForUse,
+  estimateDevboxes,
+  devboxFitTable,
+  formatFitTable,
+} from '../lib/runtime-memory.js';
+import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
+import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
 import { releaseStdin } from '../lib/tty.js';
 
@@ -184,7 +195,18 @@ async function fixWsl(): Promise<boolean> {
   return false; // Return false because a restart is needed
 }
 
-async function startContainerRuntime(engineName: string): Promise<boolean> {
+/**
+ * `podman machine init` accepts --memory, but the WSL provider ignores it — the
+ * value is recorded and never applied. Pass it anyway for the providers that do
+ * honour it; WSL is sized separately via .wslconfig.
+ */
+function buildMachineInitCommand(flagMemory?: string): string {
+  const configured = readAppConfig().RUNTIME_MEMORY_MB;
+  const mib = resolveRequestedMemoryMib(flagMemory, configured, totalmem());
+  return mib === null ? 'podman machine init' : `podman machine init --memory ${mib}`;
+}
+
+async function startContainerRuntime(engineName: string, flagMemory?: string): Promise<boolean> {
   if (engineName === 'podman') {
     // Podman on Linux runs containers directly — there is no VM to init or start.
     if (process.platform === 'linux') {
@@ -197,7 +219,7 @@ async function startContainerRuntime(engineName: string): Promise<boolean> {
     const machines = execSilent('podman machine list --format "{{.Name}}"');
     if (!machines || machines.trim() === '') {
       clack.log.step(`Initializing Podman machine...`);
-      if (!runCommand('podman machine init').ok) {
+      if (!runCommand(buildMachineInitCommand(flagMemory)).ok) {
         clack.log.error('Failed to initialize Podman machine.');
         return false;
       }
@@ -236,7 +258,7 @@ async function startContainerRuntime(engineName: string): Promise<boolean> {
   return recheck.status === 'pass';
 }
 
-async function fixContainerRuntime(): Promise<boolean> {
+async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
   // First check if it's installed but not running
   const currentCheck = checkContainerRuntime();
   if (currentCheck.engine) {
@@ -247,7 +269,7 @@ async function fixContainerRuntime(): Promise<boolean> {
     });
     if (clack.isCancel(shouldStart) || !shouldStart) return false;
 
-    const started = await startContainerRuntime(currentCheck.engine.name);
+    const started = await startContainerRuntime(currentCheck.engine.name, flagMemory);
     if (started) {
       const recheck = checkContainerRuntime();
       clack.log.success(recheck.detail);
@@ -356,7 +378,7 @@ async function fixContainerRuntime(): Promise<boolean> {
   }
 
   clack.log.info('Installed successfully. Now starting the runtime...');
-  if (await startContainerRuntime(located.name)) {
+  if (await startContainerRuntime(located.name, flagMemory)) {
     clack.log.success(checkContainerRuntime().detail);
     return true;
   }
@@ -412,15 +434,199 @@ function reportRemainingFailures(failures: CheckResult[]): void {
   }
 }
 
-export async function runOnboard(): Promise<void> {
+/**
+ * Pick the requested allocation: explicit flag, then stored config, then
+ * nothing (which means "ask"). Invalid values resolve to null rather than a
+ * guess — silently substituting a different number would be worse than asking.
+ */
+export function resolveRequestedMemoryMib(
+  flag: string | undefined,
+  configured: string | undefined,
+  hostBytes: number,
+): number | null {
+  for (const candidate of [flag, configured]) {
+    if (candidate === undefined) continue;
+    if (validateRuntimeMemoryMb(candidate, hostBytes) === null) return Number(candidate.trim());
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Offer to resize the container runtime.
+ *
+ * Unlike the other steps this runs even when nothing is failing: an
+ * under-provisioned runtime is a healthy check, but it silently caps how much
+ * work this worker is given.
+ */
+async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void> {
+  const runtime = checkContainerRuntime();
+  const engineName = runtime.engine?.name;
+  if (!engineName) return;
+
+  const hostBytes = totalmem();
+  const platform = process.platform;
+  const provider = detectMachineProvider(engineName);
+  const requested = resolveRequestedMemoryMib(flagMemory, readAppConfig().RUNTIME_MEMORY_MB, hostBytes);
+  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated');
+  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared');
+
+  // An explicitly-passed --memory that fails validation must be an error, not a
+  // silent fall-through to the prompt: a CI run that typos `--memory 8GB` would
+  // otherwise exit 0 having changed nothing.
+  if (flagMemory !== undefined && requested === null) {
+    clack.log.error(validateRuntimeMemoryMb(flagMemory, hostBytes) ?? 'Invalid --memory value');
+    process.exitCode = 1;
+    return;
+  }
+
+  const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
+  if (probe.kind === 'unsupported') {
+    if (flagMemory) clack.log.warn(`Cannot set runtime memory: ${probe.reason}`);
+    return;
+  }
+
+  const current = probeEngineCapacity(engineName);
+  const currentMib = current ? Math.floor(current.memTotalBytes / 1024 / 1024) : null;
+
+  clack.log.step('Container runtime memory');
+  if (currentMib !== null) {
+    clack.log.info(
+      `Currently ${(currentMib / 1024).toFixed(1)} GiB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)} GiB ` +
+        `— fits ~${estimateDevboxes(currentMib)} default (4 GiB) DevBoxes`,
+    );
+  }
+
+  let target = requested;
+  if (target === null) {
+    if (!process.stdin.isTTY) return;
+    // 0 means the machine is too small to give anything away without starving
+    // the host, for either use. Say so rather than prompting with an invalid
+    // default.
+    if (dedicatedRecommendation === 0) {
+      clack.log.warn('This machine does not have enough RAM to increase the runtime allocation.');
+      return;
+    }
+
+    // A ceiling is not the same commitment as a reservation, and users
+    // routinely under-allocate out of caution about a number they think is
+    // set aside up front. Say what actually happens before asking them to
+    // pick one.
+    const ceilingNote =
+      platform === 'win32'
+        ? 'This is a ceiling, not a reservation — memory is used only while DevBoxes run, and Windows gets most of it back when they stop.'
+        : platform === 'darwin'
+          ? 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, though macOS may not release it back until the machine restarts.'
+          : null;
+    if (ceilingNote) clack.log.info(ceilingNote);
+
+    const useOptions: { value: 'dedicated' | 'shared' | 'custom' | 'keep'; label: string }[] = [
+      {
+        value: 'dedicated',
+        label: `Dedicated worker — mostly hosts DevBoxes (${dedicatedRecommendation / 1024} GiB, ~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes)`,
+      },
+    ];
+    if (sharedRecommendation > 0) {
+      useOptions.push({
+        value: 'shared',
+        label: `Shared — I also work on this machine (${sharedRecommendation / 1024} GiB, ~${estimateDevboxes(sharedRecommendation)} default DevBoxes)`,
+      });
+    }
+    useOptions.push({ value: 'custom', label: 'Custom amount' });
+    useOptions.push({ value: 'keep', label: 'Keep current' });
+
+    const choice = await clack.select({
+      message: 'How should the container runtime memory be sized?',
+      options: useOptions,
+    });
+    if (clack.isCancel(choice) || choice === 'keep') return;
+
+    if (choice === 'dedicated' || choice === 'shared') {
+      target = (choice === 'dedicated' ? dedicatedRecommendation : sharedRecommendation) as number;
+    } else {
+      const answer = await clack.text({
+        message: `Memory to give the container runtime, in MB (~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes)?`,
+        initialValue: String(dedicatedRecommendation),
+        // The default parameter is required: clack types the callback as
+        // `(value: string | undefined)`, and clack wants `undefined` for "valid",
+        // not `null`. Matches the existing usage in src/commands/login.ts.
+        validate: (v = '') => validateRuntimeMemoryMb(v, hostBytes) ?? undefined,
+      });
+      if (clack.isCancel(answer)) return;
+      target = Number(String(answer).trim());
+    }
+  }
+
+  // Show what the chosen number actually buys before asking to apply it —
+  // regardless of which path picked it (flag, stored config, a preset, or a
+  // custom amount).
+  clack.log.info(formatFitTable(devboxFitTable(target, platform)));
+
+  // Compare with tolerance: the guest kernel reserves some of what we allocate,
+  // so an engine given 24576 MB reports meaningfully less. An exact comparison
+  // never matches and would re-apply (and re-run `wsl --shutdown`) every run.
+  if (currentMib !== null && Math.abs(target - currentMib) / target < 0.07) {
+    clack.log.info('Already about that size — nothing to change.');
+    return;
+  }
+
+  const plan = planMemoryApply(provider, process.platform, engineName, target);
+  clack.log.info(['Will run:', ...plan.steps.map((s) => `  ${pc.dim(s)}`)].join('\n'));
+  if (plan.warning) clack.log.warn(plan.warning);
+
+  // Both apply paths tear down the container runtime. If a worker is serving
+  // DevBoxes right now, this kills them — say so before asking, not after.
+  if (execSilent('podman ps --format "{{.Names}}"')) {
+    clack.log.warn('Containers are running — applying this will stop them.');
+  }
+
+  if (process.stdin.isTTY) {
+    const ok = await clack.confirm({ message: 'Apply this change?' });
+    if (clack.isCancel(ok) || !ok) return;
+  } else if (!flagMemory) {
+    // No TTY and no explicit --memory: a stored config value is not consent to
+    // restart every WSL distribution on the machine unattended.
+    clack.log.warn(
+      `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
+        `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
+    );
+    return;
+  }
+
+  if (plan.kind === 'wslconfig') {
+    const written = applyWslMemory(target);
+    if (!written.ok) {
+      clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
+      return;
+    }
+    clack.log.success(`Updated ${wslConfigPath()}`);
+  }
+
+  const ran = runApplySteps(plan.steps);
+  if (!ran.ok) {
+    clack.log.error(`Failed at: ${ran.failed}`);
+    return;
+  }
+
+  // Re-probe rather than reporting the requested number: a malformed .wslconfig
+  // is silently ignored by WSL, so "we asked for 24GB" is not evidence of 24GB.
+  const after = checkRuntimeMemory(checkContainerRuntime());
+  // Report at the grade actually measured — after a swallowed `machine start`
+  // failure this can legitimately still be a warning.
+  if (after.status === 'pass') clack.log.success(after.detail);
+  else clack.log.warn(after.detail);
+  clack.log.info('Restart the worker for the new capacity to be advertised.');
+}
+
+export async function runOnboard(opts: { memory?: string } = {}): Promise<void> {
   try {
-    await runOnboardInner();
+    await runOnboardInner(opts);
   } finally {
     releaseStdin();
   }
 }
 
-async function runOnboardInner(): Promise<void> {
+async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
   clack.intro(pc.bold('ClusterCode Onboarding'));
 
   const spinner = clack.spinner();
@@ -434,6 +640,7 @@ async function runOnboardInner(): Promise<void> {
     // Explicitly clear the exit code: doctor sets process.exitCode = 1 before
     // delegating here, and a "everything looks good" outcome must not exit 1.
     process.exitCode = 0;
+    await offerRuntimeMemory(opts.memory);
     clack.outro(pc.green('Everything looks good! No issues to fix.'));
     return;
   }
@@ -495,7 +702,7 @@ async function runOnboardInner(): Promise<void> {
   // Fix: container runtime
   if (failures.some((f) => f.name === 'container-runtime')) {
     clack.log.step('Container runtime not available');
-    await fixContainerRuntime();
+    await fixContainerRuntime(opts.memory);
   }
 
   // Fix: orchestrator connectivity
@@ -505,6 +712,8 @@ async function runOnboardInner(): Promise<void> {
       `Check your orchestrator URL with:\n  ${pc.dim('clustercode config set orchestrator-url <url>')}`
     );
   }
+
+  await offerRuntimeMemory(opts.memory);
 
   // Pre-warm the worker binary so the first `clustercode worker` starts instantly.
   const { readInstalled, ensureWorkerBinary } = await import('../lib/worker-binary.js');
@@ -558,6 +767,7 @@ async function runOnboardInner(): Promise<void> {
 
 export const onboardCommand = new Command('onboard')
   .description('Interactive setup wizard — fix all health check issues')
-  .action(async () => {
-    await runOnboard();
+  .option('--memory <mb>', 'Memory (MB) to allocate to the container runtime')
+  .action(async (opts: { memory?: string }) => {
+    await runOnboard(opts);
   });

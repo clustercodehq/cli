@@ -93,4 +93,16 @@ describe('config', () => {
     assert.equal(exitCode, 1);
     assert.match(stdout, /64 characters or less/i);
   });
+
+  it('rejects a runtime memory value that is not a number', () => {
+    const { stdout, exitCode } = runCli('config', 'set', 'RUNTIME_MEMORY_MB', '8GB');
+    assert.equal(exitCode, 1);
+    assert.match(stdout, /whole number of MB/i);
+  });
+
+  it('stores a valid runtime memory value', () => {
+    runCli('config', 'set', 'RUNTIME_MEMORY_MB', '8192');
+    const { stdout } = runCli('config', 'get', 'RUNTIME_MEMORY_MB');
+    assert.match(stdout, /8192/);
+  });
 });

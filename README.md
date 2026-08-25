@@ -53,8 +53,8 @@ engine with `--podman` or `--docker`.
 ### `clustercode doctor`
 
 Check system health: auth status, worker registration, orchestrator
-connectivity, container runtime, disk, and memory. Add `--json` for
-machine-readable output.
+connectivity, container runtime, container-runtime memory allocation, disk,
+and host memory. Add `--json` for machine-readable output.
 
 Exits non-zero when any check fails, so it works as a scripted gate:
 
@@ -70,10 +70,55 @@ platform-aware setup for macOS, Linux, and Windows. Any issue left unresolved is
 listed at the end with the exact command that fixes it, and the wizard exits
 non-zero.
 
+The wizard also offers to size the memory given to the container runtime —
+this runs even when everything else is already healthy, since an
+under-provisioned runtime otherwise fails silently by capping how much work
+the worker can take on. Pass `--memory <mb>` to set it non-interactively (also
+honoured when a fresh container-runtime machine is created):
+
+```bash
+clustercode onboard --memory 8192
+```
+
+On Windows, this is governed by `.wslconfig`; applying a change restarts every
+WSL distribution on the machine.
+
 On Windows, a container engine installed by the wizard is not on the PATH that
 the current terminal inherited, so the CLI re-resolves it from the default
 install location for the rest of the session. Open a new terminal to use
 `podman` directly.
+
+#### Sizing your worker
+
+When there's no `--memory` flag and nothing stored yet, the wizard asks how
+the machine is used and offers a preset for each:
+
+- **Dedicated worker** — mostly hosts DevBoxes. The host keeps a fixed
+  reserve for itself (~6 GiB on Windows/macOS) and the rest goes to the
+  container runtime. Linux has no VM in the way, so nothing is reserved.
+- **Shared** — you also work on this machine day to day. The runtime gets at
+  most half the machine, and the host keeps a larger reserve (~12 GiB on
+  Windows/macOS) so the desktop stays usable.
+
+The number you pick is a **ceiling, not a reservation**: it caps how much the
+container runtime *can* take, but memory is only actually used while DevBoxes
+are running. On Windows, WSL2 gives most of it back to the host once they
+stop; on macOS the VM may not release it back until the machine restarts.
+
+A given ceiling fits a different number of DevBoxes depending on their size,
+so the wizard also prints a fit table before asking you to confirm. For
+example, at a 22.5 GiB ceiling:
+
+```
+  2 GiB (small)         fits ~10
+  4 GiB (default)       fits ~5
+  8 GiB (large)         fits ~2
+  16 GiB (extra large)  fits ~1
+Counts are per size — mixed sizes share the same pool.
+Windows DevBoxes need ~2 GiB more than their size.
+```
+
+Budget one size up for DevBoxes that run a graphical session.
 
 ### `clustercode config`
 
@@ -84,6 +129,11 @@ clustercode config set WORKER_NAME my-worker
 clustercode config get WORKER_NAME
 clustercode config list
 ```
+
+| Key | Purpose |
+|---|---|
+| `WORKER_NAME` | Display name for this worker. |
+| `RUNTIME_MEMORY_MB` | Memory, in MB, to give the container runtime. Takes effect when a new container-runtime machine is created and whenever `clustercode onboard` runs. |
 
 ### `clustercode status`
 

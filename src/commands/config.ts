@@ -1,12 +1,14 @@
 import { Command } from 'commander';
 import * as clack from '@clack/prompts';
 import pc from 'picocolors';
+import { totalmem } from 'node:os';
 import {
   readAppConfig,
   writeAppConfig,
   isAllowedConfigKey,
   getAllowedConfigKeys,
   validateWorkerName,
+  validateRuntimeMemoryMb,
   resetAllConfig,
 } from '../lib/config.js';
 
@@ -28,6 +30,14 @@ configCommand
     }
     if (key === 'WORKER_NAME') {
       const error = validateWorkerName(value);
+      if (error) {
+        console.log(`${pc.red('✗')} ${error}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
+    if (key === 'RUNTIME_MEMORY_MB') {
+      const error = validateRuntimeMemoryMb(value, totalmem());
       if (error) {
         console.log(`${pc.red('✗')} ${error}`);
         process.exitCode = 1;
