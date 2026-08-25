@@ -88,6 +88,36 @@ the current terminal inherited, so the CLI re-resolves it from the default
 install location for the rest of the session. Open a new terminal to use
 `podman` directly.
 
+#### Choosing a container engine
+
+When no engine is installed, the wizard asks which one to set up. Pass
+`--engine podman` or `--engine docker` to skip the question:
+
+```bash
+clustercode onboard --engine docker
+```
+
+The two are not equivalent, and the difference is memory:
+
+| | Podman | Docker |
+|---|---|---|
+| `doctor` reports memory and DevBox capacity | yes | yes |
+| Same sizing math, warnings and nudges | yes | yes |
+| `onboard --memory` can apply a change | yes | **no** |
+| Automatic install on Windows / macOS | yes | yes |
+| Automatic install on Linux | yes (apt / dnf) | **no** — see below |
+
+Podman is recommended for that reason alone. Choosing Docker is supported and
+the wizard says up front where its memory knob actually lives: `[wsl2] memory=`
+in `.wslconfig` on Windows (Docker Desktop's own slider is disabled under the
+WSL2 backend), and Docker Desktop → Settings → Resources on macOS. On native
+Linux neither engine has a knob — containers run as host processes, so nothing
+caps them below your RAM.
+
+Linux Docker installs are manual by design: a working setup ends with
+`sudo usermod -aG docker $USER`, which does not take effect until you log out
+and back in, and no wizard can carry you through a re-login.
+
 #### Sizing your worker
 
 When there's no `--memory` flag and nothing stored yet, the wizard asks how
