@@ -60,14 +60,30 @@ describe('memoryKnob', () => {
   });
 
   // Docker Desktop's own memory slider is disabled under the WSL2 backend, so
-  // sending a Windows user to Docker Desktop settings sends them somewhere that
-  // cannot change anything.
-  test('Windows Docker points at .wslconfig, never at Docker Desktop settings', () => {
+  // sending a WSL2 user to Docker Desktop settings sends them somewhere that
+  // cannot change anything. Under Hyper-V the reverse holds and `.wslconfig` is
+  // inert, so the answer has to follow the probed backend.
+  test('Windows Docker follows the backend it was probed on', () => {
+    const wsl = memoryKnob('docker', 'win32', 'wsl');
+    assert.match(wsl.where, /\.wslconfig/);
+    assert.doesNotMatch(wsl.where, /Docker Desktop/);
+    assert.match(wsl.reason, /\.wslconfig/);
+    assert.match(wsl.followUp!, /wsl --shutdown/);
+
+    const hyperv = memoryKnob('docker', 'win32', 'hyperv');
+    assert.match(hyperv.where, /Docker Desktop/);
+    assert.doesNotMatch(hyperv.where, /\.wslconfig/);
+    // Nothing to run afterwards: the Docker Desktop restart is part of the
+    // settings change itself, so a `wsl --shutdown` here would be wrong advice.
+    assert.equal(hyperv.followUp, undefined);
+  });
+
+  // Guessing one backend is the same defect one backend narrower, so an
+  // unprobed answer names both rather than picking.
+  test('an unprobed Windows Docker backend names both places, not one', () => {
     const knob = memoryKnob('docker', 'win32');
     assert.match(knob.where, /\.wslconfig/);
-    assert.doesNotMatch(knob.where, /Docker Desktop/);
-    assert.match(knob.reason, /\.wslconfig/);
-    assert.match(knob.followUp!, /wsl --shutdown/);
+    assert.match(knob.where, /Docker Desktop/);
   });
 
   test('macOS Docker points at Docker Desktop settings', () => {

@@ -13,7 +13,22 @@
 import { memoryKnob } from './memory-knob.js';
 
 export type EngineName = 'podman' | 'docker';
-export type LinuxDistro = 'debian' | 'fedora' | 'unknown';
+export type LinuxDistro = 'debian' | 'fedora' | 'rhel' | 'unknown';
+
+/**
+ * The account to add to the `docker` group, and the command that does it.
+ *
+ * Not `$USER`: under `sudo` that is already root, so `sudo clustercode onboard`
+ * would add root to a group root does not need and leave the real user with the
+ * permission errors it was told it would not get. `SUDO_USER` names whoever
+ * invoked sudo, `id -un` covers the un-sudoed case, and the `-n` guard turns an
+ * empty result into a visible failure rather than `usermod -aG docker ''`.
+ */
+const DOCKER_GROUP_TARGET = '"${SUDO_USER:-$(id -un)}"';
+
+const DOCKER_GROUP_ADD =
+  `if [ -n ${DOCKER_GROUP_TARGET} ]; then sudo usermod -aG docker ${DOCKER_GROUP_TARGET}; ` +
+  'else echo "Could not determine which user to add to the docker group" >&2; exit 1; fi';
 
 export interface InstallInstructions {
   /** Commands the wizard may run itself. Empty means "manual only". */
@@ -78,7 +93,7 @@ function podmanInstructions(platform: NodeJS.Platform, distro: LinuxDistro): Ins
       manual: ['Install Podman:', '  sudo apt update && sudo apt install -y podman'].join('\n'),
     };
   }
-  if (distro === 'fedora') {
+  if (distro === 'fedora' || distro === 'rhel') {
     return {
       install: ['sudo dnf install -y podman'],
       manual: ['Install Podman:', '  sudo dnf install -y podman'].join('\n'),
@@ -131,6 +146,11 @@ function dockerInstructions(platform: NodeJS.Platform, distro: LinuxDistro): Ins
   // adding Docker's upstream repository. Unlike Podman, Docker needs its daemon
   // enabled and the invoking user placed in the `docker` group — both scripted
   // here, with the re-login that the group change requires reported afterwards.
+  // RHEL is deliberately absent here. Its `ID_LIKE=rhel` systems are close
+  // enough to Fedora for Podman, which both ship, but Fedora's Docker package is
+  // `moby-engine` and RHEL does not carry it at all — offering an automatic
+  // install there would fail at `dnf install` after the wizard had already
+  // presented the platform as supported.
   const packageInstall =
     distro === 'debian'
       ? ['sudo apt update', 'sudo apt install -y docker.io']
@@ -159,7 +179,7 @@ function dockerInstructions(platform: NodeJS.Platform, distro: LinuxDistro): Ins
   if (!packageInstall) return { install: [], manual };
 
   return {
-    install: [...packageInstall, 'sudo systemctl enable --now docker', 'sudo usermod -aG docker $USER'],
+    install: [...packageInstall, 'sudo systemctl enable --now docker', DOCKER_GROUP_ADD],
     manual,
     postInstall: LINUX_DOCKER_GROUP_NOTE,
   };

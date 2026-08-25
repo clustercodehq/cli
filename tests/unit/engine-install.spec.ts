@@ -9,6 +9,9 @@ import {
 
 const PLATFORMS: NodeJS.Platform[] = ['win32', 'darwin', 'linux'];
 
+const GROUP_ADD =
+  'if [ -n "${SUDO_USER:-$(id -un)}" ]; then sudo usermod -aG docker "${SUDO_USER:-$(id -un)}"; else echo "Could not determine which user to add to the docker group" >&2; exit 1; fi';
+
 describe('installInstructions', () => {
   test('every engine/platform pair has copy-pasteable manual steps', () => {
     for (const platform of PLATFORMS) {
@@ -53,13 +56,35 @@ describe('installInstructions', () => {
       'sudo apt update',
       'sudo apt install -y docker.io',
       'sudo systemctl enable --now docker',
-      'sudo usermod -aG docker $USER',
+      GROUP_ADD,
     ]);
     assert.deepEqual(installInstructions('docker', 'linux', 'fedora').install, [
       'sudo dnf install -y moby-engine',
       'sudo systemctl enable --now docker',
-      'sudo usermod -aG docker $USER',
+      GROUP_ADD,
     ]);
+  });
+
+  // `sudo clustercode onboard` sets USER=root, so the group add must name the
+  // account behind the sudo rather than the one running the command - otherwise
+  // the wizard says "your user was added" and the user still cannot reach the
+  // socket after logging back in.
+  test('the group add targets the invoking user, not root, and fails loudly if it cannot tell', () => {
+    const cmd = installInstructions('docker', 'linux', 'debian').install.at(-1)!;
+    assert.match(cmd, /SUDO_USER/);
+    assert.doesNotMatch(cmd, /\$USER/);
+    assert.match(cmd, /exit 1/);
+  });
+
+  // Fedora's Docker package is `moby-engine`; RHEL and its derivatives do not
+  // carry it, so an automatic install there would fail at `dnf install` after
+  // the wizard had already presented the platform as supported.
+  test('RHEL-likes get manual Docker instructions rather than a Fedora package that is not there', () => {
+    const rhel = installInstructions('docker', 'linux', 'rhel');
+    assert.deepEqual(rhel.install, []);
+    assert.doesNotMatch(rhel.manual, /moby-engine/);
+    // Podman ships in both, so it stays automatic there.
+    assert.ok(installInstructions('podman', 'linux', 'rhel').install.length > 0);
   });
 
   test('an automatic Linux Docker install reports the re-login it cannot perform', () => {

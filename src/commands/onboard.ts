@@ -8,6 +8,7 @@ import {
   runAllChecks,
   checkContainerRuntime,
   checkWsl,
+  DOCKER_GROUP_PENDING,
   type CheckResult,
 } from '../lib/checks.js';
 import {
@@ -23,6 +24,7 @@ import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '.
 import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
 import { memoryKnob, type MemoryKnob } from '../lib/memory-knob.js';
+import type { MachineProvider } from '../lib/runtime-memory.js';
 import {
   installInstructions,
   dockerStartPlan,
@@ -30,22 +32,30 @@ import {
   engineChoiceOptions,
   type EngineName,
   type InstallInstructions,
+  type LinuxDistro,
 } from '../lib/engine-install.js';
 import { releaseStdin } from '../lib/tty.js';
 
-function execSilent(cmd: string): string | null {
+function execSilent(cmd: string, timeout?: number): string | null {
   try {
-    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout }).trim();
   } catch {
     return null;
   }
 }
 
-function detectLinuxDistro(): 'debian' | 'fedora' | 'unknown' {
+// RHEL-likes are kept apart from Fedora rather than folded into it. They share
+// `dnf`, so for Podman the two are interchangeable, but Docker is not packaged
+// the same way: `moby-engine` is a Fedora package, and offering a stock RHEL,
+// CentOS Stream or Rocky user an automatic install of it means promising a
+// package that is not in their repositories. Fedora's own `ID=fedora` is
+// matched first, so only the derivatives fall through to the narrower answer.
+function detectLinuxDistro(): LinuxDistro {
   try {
     const osRelease = execSync('cat /etc/os-release', { encoding: 'utf-8' });
     if (/ID_LIKE=.*debian|ID=ubuntu|ID=debian/i.test(osRelease)) return 'debian';
-    if (/ID_LIKE=.*fedora|ID=fedora|ID_LIKE=.*rhel|ID=rhel/i.test(osRelease)) return 'fedora';
+    if (/^ID="?fedora/im.test(osRelease)) return 'fedora';
+    if (/ID_LIKE=.*(rhel|fedora|centos)|ID=(rhel|centos|rocky|almalinux)/i.test(osRelease)) return 'rhel';
   } catch { /* ignore */ }
   return 'unknown';
 }
@@ -191,7 +201,10 @@ async function startDocker(): Promise<boolean> {
   const deadline = plan.waitSeconds;
   for (let elapsed = 0; elapsed < deadline; elapsed += POLL_INTERVAL_SECONDS) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_SECONDS * 1000));
-    if (execSilent('docker info')) {
+    // Bounded: while Docker Desktop is mid-start the CLI's named-pipe connect
+    // can block for many seconds, so an untimed probe turns a "60 second" wait
+    // into minutes and a wedged pipe hangs the wizard outright.
+    if (execSilent('docker info', POLL_INTERVAL_SECONDS * 1000)) {
       spinner.stop('Docker is running.');
       return true;
     }
@@ -243,6 +256,23 @@ function knobDestination(knob: MemoryKnob): string {
   return knob.followUp ? `${knob.where}, ${knob.followUp}` : knob.where;
 }
 
+/** Is this check failing only because a `docker` group membership has not taken effect? */
+function isGroupPending(check: CheckResult): boolean {
+  return check.detail.includes(DOCKER_GROUP_PENDING);
+}
+
+/**
+ * The one accurate thing to say when Docker is installed, running, and simply
+ * not reachable until the user logs in again.
+ */
+function reportGroupPending(): void {
+  clack.log.warn(`Docker is installed and running, but ${DOCKER_GROUP_PENDING}.`);
+  clack.log.info(
+    `Log out and back in, then re-run ${pc.bold('clustercode onboard')}. ` +
+      `To use it in this terminal without logging out: ${pc.dim('newgrp docker')}`,
+  );
+}
+
 function engineLabel(engine: EngineName): string {
   return engine === 'docker' ? 'Docker' : 'Podman';
 }
@@ -282,6 +312,13 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
   // First check if it's installed but not running
   const currentCheck = checkContainerRuntime();
   if (currentCheck.engine) {
+    // The daemon is up and the user simply cannot reach it yet. Offering to
+    // start it would run a command that succeeds and changes nothing, leaving
+    // the wizard to fail again for the same reason on every re-run.
+    if (isGroupPending(currentCheck)) {
+      reportGroupPending();
+      return false;
+    }
     // Installed but not running — just need to start it
     clack.log.info(`${currentCheck.engine.name} v${currentCheck.engine.version} is installed but not running.`);
     const shouldStart = await clack.confirm({
@@ -374,7 +411,7 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
     }
   }
 
-  const located = locateContainerEngine();
+  const located = locateContainerEngine(engine);
   if (!located) {
     clack.log.error(
       failedCommands.length > 0
@@ -387,6 +424,13 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
     return false;
   }
 
+  if (located.name !== engine) {
+    clack.log.warn(
+      `You chose ${engineLabel(engine)}, but only ${located.name} could be found afterwards — ` +
+        'continuing with it. Open a new terminal and re-run if that is wrong.',
+    );
+  }
+
   if (located.viaPathRepair) {
     // The installer updated the machine PATH, but this process (and the shell
     // that launched it) started beforehand, so both inherited a stale copy.
@@ -397,12 +441,25 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
     );
   }
 
-  if (instructions.postInstall) clack.log.warn(instructions.postInstall);
+  // Only claim the group was granted if the command that grants it actually ran.
+  // Printing it after a failed `usermod` tells the user to log out for a change
+  // that was never made, and they come back to the same permission error.
+  if (instructions.postInstall && failedCommands.length === 0) {
+    clack.log.warn(instructions.postInstall);
+  }
 
   const recheck = checkContainerRuntime();
   if (recheck.status === 'pass') {
     clack.log.success(recheck.detail);
     return true;
+  }
+
+  // The install worked. Dumping the manual instructions here would contradict
+  // the re-login note printed moments ago and send the user round the loop again.
+  if (isGroupPending(recheck)) {
+    clack.log.success(`${engineLabel(engine)} installed.`);
+    reportGroupPending();
+    return false;
   }
 
   clack.log.info('Installed successfully. Now starting the runtime...');
@@ -423,7 +480,7 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
  * old outro said only "Fix manually and re-run", leaving the user with no idea
  * what "manually" meant.
  */
-function remediationHint(check: CheckResult): string | null {
+function remediationHint(check: CheckResult, preferredEngine?: EngineName): string | null {
   switch (check.name) {
     case 'auth':
       return 'Run: clustercode login';
@@ -436,13 +493,25 @@ function remediationHint(check: CheckResult): string | null {
         'Then restart your computer.',
       ].join('\n');
     case 'container-runtime':
+      // Nothing is wrong with the install: the daemon is up and the group has
+      // not taken effect. Telling this user to start Docker is the advice that
+      // made the Linux install loop forever.
+      if (isGroupPending(check)) {
+        return [
+          'Docker is running; your user just cannot reach it yet.',
+          'Log out and back in, or for this terminal only:',
+          '  newgrp docker',
+        ].join('\n');
+      }
       // Already installed, just not started — don't tell them to reinstall it.
       if (check.engine) {
         return check.engine.name === 'podman'
           ? ['Start Podman:', '  podman machine init   (first time only)', '  podman machine start'].join('\n')
           : dockerStartHint();
       }
-      return getInstallInstructions().manual;
+      // Nothing installed. Honour an explicit --engine so the last thing on
+      // screen is not instructions for the engine the user declined.
+      return getInstallInstructions(preferredEngine).manual;
     case 'orchestrator':
       return 'Check the orchestrator URL:\n  clustercode config set orchestrator-url <url>';
     default:
@@ -463,10 +532,10 @@ function dockerStartHint(): string {
 }
 
 /** Print each failing check with the command that fixes it. */
-function reportRemainingFailures(failures: CheckResult[]): void {
+function reportRemainingFailures(failures: CheckResult[], preferredEngine?: EngineName): void {
   for (const failure of failures) {
     console.log(`  ${pc.red('✗')} ${failure.detail}`);
-    const hint = remediationHint(failure);
+    const hint = remediationHint(failure, preferredEngine);
     if (hint) {
       console.log(hint.split('\n').map((line) => `      ${pc.dim(line)}`).join('\n'));
     }
@@ -504,14 +573,19 @@ export function resolveRequestedMemoryMib(
 function reportUnconfigurableMemory(
   engineName: string,
   platform: NodeJS.Platform,
+  provider: MachineProvider,
   hostBytes: number,
   dedicatedRecommendation: number,
+  reason: string,
 ): void {
   if (engineName !== 'podman' && engineName !== 'docker') return;
-  const knob = memoryKnob(engineName, platform);
+  // The PROBED provider, not a re-derived default. Re-deriving it here reopens
+  // the dead end this function exists to close: a Windows Docker install on the
+  // Hyper-V backend would be sent to .wslconfig, which cannot size it.
+  const knob = memoryKnob(engineName, platform, provider);
   // 'none' means no knob exists anywhere (native Linux) — there is nothing to
   // tell the user to go do, so saying it would be noise on every run.
-  if (knob.kind !== 'external') return;
+  if (knob.kind === 'none') return;
 
   const current = probeEngineCapacity(engineName);
   clack.log.step('Container runtime memory');
@@ -521,15 +595,22 @@ function reportUnconfigurableMemory(
       `Currently ${(currentMib / 1024).toFixed(1)} GiB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)} GiB ` +
         `— fits ~${estimateDevboxes(currentMib)} default (4 GiB) DevBoxes`,
     );
-    if (dedicatedRecommendation > currentMib) {
+    // Only when the extra memory actually buys a DevBox. Below one whole 4 GiB
+    // slot the recommendation reads as "you are short" while changing nothing,
+    // which is the same empty nudge suppressed in the doctor check.
+    if (estimateDevboxes(dedicatedRecommendation) > estimateDevboxes(currentMib)) {
       clack.log.info(
         `A dedicated worker could use up to ${(dedicatedRecommendation / 1024).toFixed(1)} GiB ` +
           `(~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes).`,
       );
     }
   }
+  // One warning, not two: the caller used to print `probe.reason` as well, so
+  // `--memory` on Docker said the same thing twice in different words.
   clack.log.warn(
-    `${engineName === 'docker' ? 'Docker' : 'Podman'} memory is not configurable from this CLI — ${knobDestination(knob)}.`,
+    knob.kind === 'external'
+      ? `${engineName === 'docker' ? 'Docker' : 'Podman'} memory is not configurable from this CLI — ${knobDestination(knob)}.`
+      : `Cannot set runtime memory: ${reason || knob.reason}`,
   );
 }
 
@@ -563,8 +644,18 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
 
   const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
   if (probe.kind === 'unsupported') {
-    if (flagMemory) clack.log.warn(`Cannot set runtime memory: ${probe.reason}`);
-    reportUnconfigurableMemory(engineName, platform, hostBytes, dedicatedRecommendation);
+    reportUnconfigurableMemory(
+      engineName,
+      platform,
+      provider,
+      hostBytes,
+      dedicatedRecommendation,
+      probe.reason ?? '',
+    );
+    // An explicit --memory that cannot be applied must not exit 0, for the same
+    // reason the invalid-value branch above sets it: a CI run that asked for a
+    // size and got none should fail, not report success having changed nothing.
+    if (flagMemory !== undefined) process.exitCode = 1;
     return;
   }
 
@@ -723,7 +814,14 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     // delegating here, and a "everything looks good" outcome must not exit 1.
     process.exitCode = 0;
     await offerRuntimeMemory(opts.memory);
-    clack.outro(pc.green('Everything looks good! No issues to fix.'));
+    // The memory step can fail on its own - an explicit --memory this CLI
+    // cannot apply exits non-zero - and closing with "everything looks good"
+    // over a non-zero exit is the kind of contradiction a CI log gets read for.
+    clack.outro(
+      process.exitCode
+        ? pc.yellow('Checks passed, but the requested runtime memory was not applied.')
+        : pc.green('Everything looks good! No issues to fix.'),
+    );
     return;
   }
 
@@ -734,7 +832,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     clack.log.warn(
       `${failures.length} ${failures.length === 1 ? 'issue' : 'issues'} found, but there is no interactive terminal to run the setup prompts:\n`,
     );
-    reportRemainingFailures(failures);
+    reportRemainingFailures(failures, opts.engine);
     process.exitCode = 1;
     clack.outro(pc.yellow('Re-run ' + pc.bold('clustercode onboard') + ' from an interactive terminal.'));
     return;
@@ -839,7 +937,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
 
   // Print the actual remediation for each remaining failure. This lands last so
   // it can't be pushed off-screen by a later step's success message.
-  reportRemainingFailures(remainingFailures);
+  reportRemainingFailures(remainingFailures, opts.engine);
 
   process.exitCode = 1;
   clack.outro(

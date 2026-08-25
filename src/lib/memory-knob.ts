@@ -76,22 +76,45 @@ export function memoryKnob(
   }
 
   if (engine === 'docker') {
-    // Under the WSL2 backend Docker Desktop's own memory slider is disabled and
-    // WSL's global config governs the VM, so sending a Windows user to Docker
-    // Desktop settings sends them somewhere that cannot change anything.
-    return platform === 'win32'
-      ? {
-          kind: 'external',
-          where: 'set [wsl2] memory= in .wslconfig',
-          reason:
-            'Docker memory is governed by [wsl2] memory= in .wslconfig (WSL2 backend) or by Docker Desktop settings (Hyper-V backend) — set it there, not from the CLI',
-          followUp: 'then run `wsl --shutdown` for it to take effect',
-        }
-      : {
-          kind: 'external',
-          where: 'raise it in Docker Desktop settings',
-          reason: 'Docker memory is set in Docker Desktop settings, not from the CLI',
-        };
+    if (platform !== 'win32') {
+      return {
+        kind: 'external',
+        where: 'raise it in Docker Desktop settings',
+        reason: 'Docker memory is set in Docker Desktop settings, not from the CLI',
+      };
+    }
+    // Windows Docker has two backends and they take their memory from different
+    // places. Under WSL2 - the default - Docker Desktop's own memory slider is
+    // disabled and WSL's global config governs the VM, so sending that user to
+    // Docker Desktop settings sends them somewhere that cannot help. Under
+    // Hyper-V the reverse is true and .wslconfig is inert. Naming the wrong one
+    // is the same defect as naming Docker Desktop for every Windows user, one
+    // backend narrower, so an undetected backend names both rather than guessing.
+    const wslBackend = 'set [wsl2] memory= in .wslconfig';
+    const hypervBackend = 'raise it in Docker Desktop settings';
+    if (provider === 'wsl') {
+      return {
+        kind: 'external',
+        where: wslBackend,
+        reason:
+          'Docker on the WSL2 backend takes its memory from [wsl2] memory= in .wslconfig - set it there, not from the CLI',
+        followUp: 'then run `wsl --shutdown` for it to take effect',
+      };
+    }
+    if (provider === 'hyperv') {
+      return {
+        kind: 'external',
+        where: hypervBackend,
+        reason:
+          'Docker on the Hyper-V backend takes its memory from Docker Desktop settings - set it there, not from the CLI',
+      };
+    }
+    return {
+      kind: 'external',
+      where: `${wslBackend} (WSL2 backend), or ${hypervBackend} (Hyper-V backend)`,
+      reason:
+        'Docker memory is governed by [wsl2] memory= in .wslconfig (WSL2 backend) or by Docker Desktop settings (Hyper-V backend) - set it there, not from the CLI',
+    };
   }
 
   const resolved = provider ?? defaultProvider(platform);

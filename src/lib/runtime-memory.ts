@@ -299,6 +299,12 @@ export interface RuntimeMemoryReading {
    * so a reading close to it should not be re-litigated on every doctor run.
    */
   configuredMib?: number;
+  /**
+   * The probed VM backend, when it changes the answer. Only Windows Docker
+   * needs it: WSL2 and Hyper-V take their memory from different places, so an
+   * unprobed reading would have to name both.
+   */
+  provider?: MachineProvider;
 }
 
 /** A reading within this fraction of the configured value counts as "that value". */
@@ -330,9 +336,13 @@ function isDeliberateChoice(engineMib: number, configuredMib: number | undefined
  * knob's own destination, and only the cases it *can* apply are told to run
  * `clustercode onboard`.
  */
-function knobAction(engineName: string | null, platform: NodeJS.Platform): string {
+function knobAction(
+  engineName: string | null,
+  platform: NodeJS.Platform,
+  provider: MachineProvider | undefined,
+): string {
   const engine: EngineName = engineName === 'docker' ? 'docker' : 'podman';
-  return memoryKnob(engine, platform).where;
+  return memoryKnob(engine, platform, provider).where;
 }
 
 /**
@@ -348,14 +358,19 @@ function dedicatedNudge(
   dedicatedRecommendation: number,
   engineName: string | null,
   platform: NodeJS.Platform,
+  provider: MachineProvider | undefined,
 ): string {
   if (configuredMib !== undefined) return '';
   if (engineMib >= dedicatedRecommendation) return '';
-  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — ${knobAction(engineName, platform)})`;
+  // Capacity is what the user actually gets, and it moves in whole DevBoxes. A
+  // machine already fitting 5 that could fit 5.4 has nothing to gain, so a nudge
+  // there asks for a config edit and a full WSL restart in exchange for nothing.
+  if (estimateDevboxes(dedicatedRecommendation) <= estimateDevboxes(engineMib)) return '';
+  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — ${knobAction(engineName, platform, provider)})`;
 }
 
 export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
-  const { engine, hostBytes, engineName, platform, configuredMib } = reading;
+  const { engine, hostBytes, engineName, platform, configuredMib, provider } = reading;
   const name = 'runtime-memory';
 
   if (!engine) {
@@ -389,7 +404,7 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
 
   if (engineName === 'docker') {
     const base = `Docker memory: ${gib(engine.memTotalBytes)} GiB of ${gib(hostBytes)} GiB host — ${fitPhrase(devboxes)}`;
-    const where = knobAction(engineName, platform);
+    const where = knobAction(engineName, platform, provider);
 
     if (devboxes < 1) {
       return { name, status: 'warn', detail: `${base}; ${where}` };
@@ -404,7 +419,7 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     return {
       name,
       status: 'pass',
-      detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform)}`,
+      detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform, provider)}`,
     };
   }
 
@@ -425,7 +440,7 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
   return {
     name,
     status: 'pass',
-    detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform)}`,
+    detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform, provider)}`,
   };
 }
 
@@ -437,8 +452,27 @@ function execSilent(cmd: string): string | null {
   }
 }
 
+/**
+ * Which VM backend Docker Desktop is running, read from the guest kernel string.
+ *
+ * The two Windows backends take their memory from different places — WSL2 from
+ * .wslconfig, Hyper-V from Docker Desktop's own settings — and Docker reports
+ * no backend field, so the kernel is the discriminator: WSL2 guests carry a
+ * `-microsoft-standard-WSL2` kernel, Hyper-V guests run LinuxKit. Anything else
+ * stays 'unknown', which makes callers name both rather than guess wrong.
+ */
+export function parseDockerBackend(kernelVersion: string | null): MachineProvider {
+  if (!kernelVersion) return 'unknown';
+  if (/wsl2?\b/i.test(kernelVersion)) return 'wsl';
+  if (/linuxkit/i.test(kernelVersion)) return 'hyperv';
+  return 'unknown';
+}
+
 /** `podman machine list` works while the machine is stopped; `inspect` has no VMType field. */
 export function detectMachineProvider(engineName: string): MachineProvider {
+  if (engineName === 'docker') {
+    return parseDockerBackend(execSilent('docker info --format "{{.KernelVersion}}"'));
+  }
   if (engineName !== 'podman') return 'unknown';
   return parseMachineProvider(execSilent('podman machine list --format "{{.VMType}}"'));
 }
@@ -488,6 +522,13 @@ export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
     hostBytes: totalmem(),
     engineName,
     platform: process.platform,
+    // Probed only where it changes the answer. Windows Docker has two backends
+    // with different memory knobs; everywhere else the platform already decides,
+    // so this avoids a process spawn on the common path.
+    provider:
+      engineName === 'docker' && process.platform === 'win32'
+        ? detectMachineProvider('docker')
+        : undefined,
     configuredMib: configuredMib !== undefined && Number.isFinite(configuredMib) ? configuredMib : undefined,
   });
 }

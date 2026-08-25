@@ -90,9 +90,10 @@ describe('onboard', () => {
     assert.match(stdout, /podman\|docker/);
   });
 
-  // A typo must not fall through to "install nothing and exit 0": the flag
-  // exists so an unattended run can pick an engine, and an unattended run has
-  // no one to notice it silently did the wrong thing.
+  // A typo must not fall through to "install nothing and exit 0". The flag is
+  // validated before the wizard opens rather than at the point of use, so the
+  // failure is a message about the flag instead of a wizard that runs, asks
+  // which engine to install, and quietly ignores what was passed.
   it('onboard rejects an unknown --engine value before doing anything', () => {
     const { stdout, exitCode } = runCli(['onboard', '--engine', 'podmn']);
     assert.equal(exitCode, 1);

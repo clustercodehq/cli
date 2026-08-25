@@ -81,7 +81,9 @@ clustercode onboard --memory 8192
 ```
 
 On Windows, this is governed by `.wslconfig`; applying a change restarts every
-WSL distribution on the machine.
+WSL distribution on the machine. On native Linux there is nothing to apply —
+containers run directly on the host, so nothing caps them below your RAM and
+`--memory` reports that instead of changing anything.
 
 On Windows, a container engine installed by the wizard is not on the PATH that
 the current terminal inherited, so the CLI re-resolves it from the default
@@ -103,7 +105,7 @@ The two are not equivalent, and the difference is memory:
 |---|---|---|
 | `doctor` reports memory and DevBox capacity | yes | yes |
 | Same sizing math, warnings and nudges | yes | yes |
-| `onboard --memory` can apply a change | yes | **no** |
+| `onboard --memory` can apply a change | yes, on Windows and macOS | **no** |
 | Automatic install | Windows, macOS, Debian/Ubuntu, Fedora | same |
 | Usable without further steps | yes | Linux needs a re-login |
 
@@ -117,7 +119,8 @@ backend, and Docker Desktop > Settings > Resources on macOS.
 On native Linux neither engine has a memory knob: containers run as host
 processes, so nothing caps them below your RAM. What Docker needs there and
 Podman does not is group membership — the install runs
-`sudo usermod -aG docker $USER`, and group changes only apply at login, so the
+`sudo usermod -aG docker` for the invoking user (the account behind `sudo`, not
+`root`), and group changes only apply at login, so the
 wizard tells you to log out and back in (or run `newgrp docker`) before
 `docker` works without `sudo`.
 

@@ -28,9 +28,18 @@ export function planMemoryApply(
   engineName: string,
   memoryMib: number,
 ): ApplyPlan {
-  // An engine we do not know about gets the same treatment as one we cannot
-  // size: report, never guess at a command sequence for it.
-  const engine: EngineName = engineName === 'docker' ? 'docker' : 'podman';
+  // An engine we do not recognise gets no command sequence at all. Coercing
+  // anything non-Docker to Podman meant a future engine name, or an empty one,
+  // would be handed `podman machine set` or a .wslconfig rewrite on a machine
+  // with no Podman on it.
+  if (engineName !== 'podman' && engineName !== 'docker') {
+    return {
+      kind: 'unsupported',
+      steps: [],
+      reason: `Unknown container engine "${engineName}" — this CLI can only size Podman`,
+    };
+  }
+  const engine: EngineName = engineName;
   const knob = memoryKnob(engine, platform, provider);
 
   if (knob.kind !== 'cli') {
