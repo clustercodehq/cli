@@ -31,23 +31,26 @@ describe('validateRuntimeMemoryMb', () => {
   });
 
   test('rejects more than the machine can safely give away, naming the cap', () => {
-    const err = validateRuntimeMemoryMb('65536', HOST_32GB);
+    const err = validateRuntimeMemoryMb('65536', HOST_32GB, 'win32');
     assert.match(err!, /28672/);
   });
 
-  // These pin the safety-hole fix: on win32 the cap is maxSafeRuntimeMib, not
+  // These pin the safety-hole fix. Platform is passed EXPLICITLY: the cap is
+  // platform-specific, so without it these assert a Windows-only outcome and
+  // fail on a Linux CI runner, where there is no VM and no reserve.
+  // On win32 the cap is maxSafeRuntimeMib, not
   // 100% of the host (32768 MB here) — a value of exactly the host's RAM must
   // now be rejected, and the message must name the machine-specific cap
   // (28672 = 32768 - 4096, the win32 reserve maxSafeRuntimeMib carves out).
   test('rejects 100% of host RAM — that used to be the (unsafe) ceiling', () => {
-    const err = validateRuntimeMemoryMb('32768', HOST_32GB);
+    const err = validateRuntimeMemoryMb('32768', HOST_32GB, 'win32');
     assert.match(err!, /cannot exceed/i);
     assert.match(err!, /28672/);
   });
 
   test('accepts exactly maxSafeRuntimeMib and rejects one MB above it', () => {
-    assert.equal(validateRuntimeMemoryMb('28672', HOST_32GB), null);
-    assert.match(validateRuntimeMemoryMb('28673', HOST_32GB)!, /28672/);
+    assert.equal(validateRuntimeMemoryMb('28672', HOST_32GB, 'win32'), null);
+    assert.match(validateRuntimeMemoryMb('28673', HOST_32GB, 'win32')!, /28672/);
   });
 
   test('allows any value at or below host when the host size is unknown', () => {
