@@ -4,7 +4,6 @@ import {
   installInstructions,
   dockerStartPlan,
   dockerDesktopCandidates,
-  memoryConfigurability,
   engineChoiceOptions,
 } from '../../src/lib/engine-install.js';
 
@@ -43,15 +42,53 @@ describe('installInstructions', () => {
     }
   });
 
-  // Deliberate, and the reason is a re-login the wizard cannot perform: a
-  // correct Linux Docker install ends with `usermod -aG docker`, which does not
-  // take effect until the user logs out. Automating up to that point would leave
-  // them at a `docker info` that still fails with a permission error.
-  test('Linux Docker is manual-only and says why sudo alone is not enough', () => {
-    const { install, manual } = installInstructions('docker', 'linux', 'debian');
-    assert.deepEqual(install, []);
-    assert.match(manual, /usermod -aG docker/);
-    assert.match(manual, /log out/i);
+  // Linux Docker installs the distribution package, symmetric with Podman, and
+  // adds the two steps Podman does not need: enabling the daemon and putting the
+  // user in the `docker` group. The group change is the one thing the wizard
+  // cannot finish, so it must come back as a postInstall note rather than being
+  // left for the user to discover via a permission error.
+  test('Linux Docker installs from the distribution package, like Podman', () => {
+    const debian = installInstructions('docker', 'linux', 'debian');
+    assert.deepEqual(debian.install, [
+      'sudo apt update',
+      'sudo apt install -y docker.io',
+      'sudo systemctl enable --now docker',
+      'sudo usermod -aG docker $USER',
+    ]);
+    assert.deepEqual(installInstructions('docker', 'linux', 'fedora').install, [
+      'sudo dnf install -y moby-engine',
+      'sudo systemctl enable --now docker',
+      'sudo usermod -aG docker $USER',
+    ]);
+  });
+
+  test('an automatic Linux Docker install reports the re-login it cannot perform', () => {
+    for (const distro of ['debian', 'fedora'] as const) {
+      const { postInstall } = installInstructions('docker', 'linux', distro);
+      assert.ok(postInstall, distro);
+      assert.match(postInstall!, /docker` group/, distro);
+      assert.match(postInstall!, /newgrp docker/, distro);
+    }
+  });
+
+  test('an unrecognised distribution falls back to manual, with no dangling note', () => {
+    const unknown = installInstructions('docker', 'linux', 'unknown');
+    assert.deepEqual(unknown.install, []);
+    assert.equal(unknown.postInstall, undefined);
+    assert.match(unknown.manual, /docs\.docker\.com/);
+  });
+
+  // Anything the wizard runs unattended must not stop to ask a question.
+  test('no automatic step is interactive', () => {
+    for (const platform of PLATFORMS) {
+      for (const engine of ['podman', 'docker'] as const) {
+        for (const distro of ['debian', 'fedora', 'unknown'] as const) {
+          for (const cmd of installInstructions(engine, platform, distro).install) {
+            if (/^sudo (apt|dnf) install/.test(cmd)) assert.match(cmd, /\s-y\s/, cmd);
+          }
+        }
+      }
+    }
   });
 
   test('Linux Podman follows the distribution package manager', () => {
@@ -127,34 +164,6 @@ describe('dockerDesktopCandidates', () => {
   });
 });
 
-describe('memoryConfigurability', () => {
-  test('only Podman on a VM platform is CLI-configurable', () => {
-    assert.equal(memoryConfigurability('podman', 'win32').kind, 'cli');
-    assert.equal(memoryConfigurability('podman', 'darwin').kind, 'cli');
-    assert.equal(memoryConfigurability('docker', 'win32').kind, 'external');
-    assert.equal(memoryConfigurability('docker', 'darwin').kind, 'external');
-  });
-
-  test('native Linux has no knob for either engine', () => {
-    for (const engine of ['podman', 'docker'] as const) {
-      assert.equal(memoryConfigurability(engine, 'linux').kind, 'none');
-    }
-  });
-
-  // Docker Desktop's own memory slider is disabled under the WSL2 backend, so
-  // sending a Windows user to Docker Desktop settings sends them somewhere that
-  // cannot change anything. This must agree with the doctor check's `where`.
-  test('Windows Docker points at .wslconfig, not Docker Desktop settings', () => {
-    const { where } = memoryConfigurability('docker', 'win32');
-    assert.match(where, /\.wslconfig/);
-    assert.doesNotMatch(where, /Docker Desktop/);
-  });
-
-  test('macOS Docker points at Docker Desktop settings', () => {
-    assert.match(memoryConfigurability('docker', 'darwin').where, /Docker Desktop/);
-  });
-});
-
 describe('engineChoiceOptions', () => {
   test('Podman leads and is marked recommended on every platform', () => {
     for (const platform of PLATFORMS) {
@@ -174,9 +183,16 @@ describe('engineChoiceOptions', () => {
     }
   });
 
-  test('on Linux, where neither engine is configurable, Docker is not falsely penalised', () => {
-    const docker = engineChoiceOptions('linux')[1];
+  // On native Linux neither engine has a memory knob, so penalising Docker for
+  // one would be false. What is true there is the group membership it needs.
+  test('on Linux the Docker hint names the group, not a memory limitation', () => {
+    const docker = engineChoiceOptions('linux', 'debian')[1];
     assert.doesNotMatch(docker.hint, /not configurable from the CLI/i);
-    assert.match(docker.hint, /manual install/i);
+    assert.match(docker.hint, /docker` group/);
+    assert.match(docker.hint, /re-login/);
+  });
+
+  test('on a distribution with no package, the Docker hint says the install is manual', () => {
+    assert.match(engineChoiceOptions('linux', 'unknown')[1].hint, /manual install/i);
   });
 });

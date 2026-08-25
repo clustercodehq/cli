@@ -104,19 +104,22 @@ The two are not equivalent, and the difference is memory:
 | `doctor` reports memory and DevBox capacity | yes | yes |
 | Same sizing math, warnings and nudges | yes | yes |
 | `onboard --memory` can apply a change | yes | **no** |
-| Automatic install on Windows / macOS | yes | yes |
-| Automatic install on Linux | yes (apt / dnf) | **no** — see below |
+| Automatic install | Windows, macOS, Debian/Ubuntu, Fedora | same |
+| Usable without further steps | yes | Linux needs a re-login |
 
-Podman is recommended for that reason alone. Choosing Docker is supported and
-the wizard says up front where its memory knob actually lives: `[wsl2] memory=`
-in `.wslconfig` on Windows (Docker Desktop's own slider is disabled under the
-WSL2 backend), and Docker Desktop → Settings → Resources on macOS. On native
-Linux neither engine has a knob — containers run as host processes, so nothing
-caps them below your RAM.
+Podman is recommended for the memory reason alone. Choosing Docker is fully
+supported: the wizard installs it (winget on Windows, the `docker-desktop` cask
+on macOS, your distribution's package on Debian/Ubuntu and Fedora) and says up
+front where its memory knob actually lives — `[wsl2] memory=` in `.wslconfig`
+on Windows, since Docker Desktop's own slider is disabled under the WSL2
+backend, and Docker Desktop > Settings > Resources on macOS.
 
-Linux Docker installs are manual by design: a working setup ends with
-`sudo usermod -aG docker $USER`, which does not take effect until you log out
-and back in, and no wizard can carry you through a re-login.
+On native Linux neither engine has a memory knob: containers run as host
+processes, so nothing caps them below your RAM. What Docker needs there and
+Podman does not is group membership — the install runs
+`sudo usermod -aG docker $USER`, and group changes only apply at login, so the
+wizard tells you to log out and back in (or run `newgrp docker`) before
+`docker` works without `sudo`.
 
 #### Sizing your worker
 

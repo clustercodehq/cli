@@ -22,11 +22,11 @@ import {
 import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
 import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
+import { memoryKnob, type MemoryKnob } from '../lib/memory-knob.js';
 import {
   installInstructions,
   dockerStartPlan,
   dockerDesktopCandidates,
-  memoryConfigurability,
   engineChoiceOptions,
   type EngineName,
   type InstallInstructions,
@@ -238,6 +238,11 @@ async function startContainerRuntime(engineName: string, flagMemory?: string): P
   return recheck.status === 'pass';
 }
 
+/** The knob's destination plus whatever else the user has to do afterwards. */
+function knobDestination(knob: MemoryKnob): string {
+  return knob.followUp ? `${knob.where}, ${knob.followUp}` : knob.where;
+}
+
 function engineLabel(engine: EngineName): string {
   return engine === 'docker' ? 'Docker' : 'Podman';
 }
@@ -253,7 +258,7 @@ function engineLabel(engine: EngineName): string {
 async function chooseEngine(flagEngine?: EngineName): Promise<EngineName | null> {
   let engine = flagEngine;
   if (engine === undefined) {
-    const options = engineChoiceOptions(process.platform);
+    const options = engineChoiceOptions(process.platform, detectLinuxDistro());
     const picked = await clack.select({
       message: 'Which container engine should ClusterCode use?',
       options,
@@ -262,11 +267,12 @@ async function chooseEngine(flagEngine?: EngineName): Promise<EngineName | null>
     engine = picked as EngineName;
   }
 
-  const memory = memoryConfigurability(engine, process.platform);
-  if (memory.kind === 'external') {
+  const knob = memoryKnob(engine, process.platform);
+  if (knob.kind === 'external') {
     clack.log.warn(
       `${engineLabel(engine)}: ClusterCode cannot set the container runtime memory for you — ` +
-        `${memory.where}. \`clustercode doctor\` still reports how much it has and how many DevBoxes that fits.`,
+        `${knobDestination(knob)}. \`clustercode doctor\` still reports how much it has and how many ` +
+        'DevBoxes that fits.',
     );
   }
   return engine;
@@ -391,6 +397,8 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
     );
   }
 
+  if (instructions.postInstall) clack.log.warn(instructions.postInstall);
+
   const recheck = checkContainerRuntime();
   if (recheck.status === 'pass') {
     clack.log.success(recheck.detail);
@@ -500,10 +508,10 @@ function reportUnconfigurableMemory(
   dedicatedRecommendation: number,
 ): void {
   if (engineName !== 'podman' && engineName !== 'docker') return;
-  const memory = memoryConfigurability(engineName, platform);
+  const knob = memoryKnob(engineName, platform);
   // 'none' means no knob exists anywhere (native Linux) — there is nothing to
   // tell the user to go do, so saying it would be noise on every run.
-  if (memory.kind !== 'external') return;
+  if (knob.kind !== 'external') return;
 
   const current = probeEngineCapacity(engineName);
   clack.log.step('Container runtime memory');
@@ -521,7 +529,7 @@ function reportUnconfigurableMemory(
     }
   }
   clack.log.warn(
-    `${engineName === 'docker' ? 'Docker' : 'Podman'} memory is not configurable from this CLI — ${memory.where}.`,
+    `${engineName === 'docker' ? 'Docker' : 'Podman'} memory is not configurable from this CLI — ${knobDestination(knob)}.`,
   );
 }
 

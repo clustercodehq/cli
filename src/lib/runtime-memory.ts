@@ -7,6 +7,9 @@
  * exported so they can be unit-tested without a container runtime installed.
  */
 
+import { memoryKnob } from './memory-knob.js';
+import type { EngineName } from './engine-install.js';
+
 export type MachineProvider = 'wsl' | 'hyperv' | 'applehv' | 'qemu' | 'unknown';
 
 export interface EngineCapacity {
@@ -320,17 +323,16 @@ function isDeliberateChoice(engineMib: number, configuredMib: number | undefined
 }
 
 /**
- * Where a dedicated-worker nudge should point. `onboard` can resize a Podman
- * machine, but it can never resize a Docker engine — that knob lives in
- * .wslconfig on Windows or in Docker Desktop settings everywhere else. Must
- * agree with the `where` computed in the `docker` branch below and with
- * `planMemoryApply`'s `unsupported` reason for docker.
+ * Where a nudge or warning should point the user.
+ *
+ * Delegates to `memoryKnob()` rather than re-deriving it, so this check and
+ * `planMemoryApply` cannot disagree: anything the CLI cannot apply gets the
+ * knob's own destination, and only the cases it *can* apply are told to run
+ * `clustercode onboard`.
  */
-function dedicatedAction(engineName: string | null, platform: NodeJS.Platform): string {
-  if (engineName === 'docker') {
-    return platform === 'win32' ? 'set [wsl2] memory= in .wslconfig' : 'raise it in Docker Desktop settings';
-  }
-  return 'see `clustercode onboard`';
+function knobAction(engineName: string | null, platform: NodeJS.Platform): string {
+  const engine: EngineName = engineName === 'docker' ? 'docker' : 'podman';
+  return memoryKnob(engine, platform).where;
 }
 
 /**
@@ -349,7 +351,7 @@ function dedicatedNudge(
 ): string {
   if (configuredMib !== undefined) return '';
   if (engineMib >= dedicatedRecommendation) return '';
-  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — ${dedicatedAction(engineName, platform)})`;
+  return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — ${knobAction(engineName, platform)})`;
 }
 
 export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
@@ -387,14 +389,7 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
 
   if (engineName === 'docker') {
     const base = `Docker memory: ${gib(engine.memTotalBytes)} GiB of ${gib(hostBytes)} GiB host — ${fitPhrase(devboxes)}`;
-    // Where the knob actually lives differs by platform: with the WSL2 backend
-    // Docker Desktop's own sliders are disabled and WSL's global config governs
-    // memory, so pointing a Windows user at Docker Desktop sends them somewhere
-    // that cannot change anything.
-    const where =
-      platform === 'win32'
-        ? 'set [wsl2] memory= in .wslconfig'
-        : 'raise it in Docker Desktop settings';
+    const where = knobAction(engineName, platform);
 
     if (devboxes < 1) {
       return { name, status: 'warn', detail: `${base}; ${where}` };

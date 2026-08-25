@@ -4,11 +4,13 @@
  *
  * Two engines are supported and they are not equivalent. Podman is the default
  * because the CLI can size its memory allocation on every platform we support;
- * Docker is diagnosed but never resized (see `memoryConfigurability`). Anywhere
+ * Docker is diagnosed but never resized (see `memoryKnob`). Anywhere
  * the wizard offers a choice, that difference has to be stated — picking Docker
  * without knowing it forfeits `--memory` is the failure mode this module exists
  * to prevent.
  */
+
+import { memoryKnob } from './memory-knob.js';
 
 export type EngineName = 'podman' | 'docker';
 export type LinuxDistro = 'debian' | 'fedora' | 'unknown';
@@ -18,6 +20,13 @@ export interface InstallInstructions {
   install: string[];
   /** Copy-pasteable fallback, always populated. */
   manual: string;
+  /**
+   * Something the user must still do by hand after a successful automatic
+   * install — a re-login, a first launch. Printed once, after the install
+   * succeeds, and never silently skipped: an install that needs a further step
+   * and does not say so is worse than one that refused to start.
+   */
+  postInstall?: string;
 }
 
 const PODMAN_DOCS = 'https://podman.io/docs/installation';
@@ -82,7 +91,7 @@ function podmanInstructions(platform: NodeJS.Platform, distro: LinuxDistro): Ins
   };
 }
 
-function dockerInstructions(platform: NodeJS.Platform): InstallInstructions {
+function dockerInstructions(platform: NodeJS.Platform, distro: LinuxDistro): InstallInstructions {
   if (platform === 'darwin') {
     return {
       install: ['brew install --cask docker-desktop'],
@@ -118,34 +127,64 @@ function dockerInstructions(platform: NodeJS.Platform): InstallInstructions {
     };
   }
 
-  // Linux Docker Engine is deliberately manual. A correct install adds an apt/dnf
-  // repository, and the post-install step that makes `docker` usable without sudo
-  // adds your user to the `docker` group — which only takes effect after you log
-  // out and back in. A wizard cannot carry you through a re-login, and running
-  // the rest of onboarding as root to paper over it would leave a root-owned
-  // ~/.clustercode behind.
+  // Symmetric with Podman: install the distribution's own package rather than
+  // adding Docker's upstream repository. Unlike Podman, Docker needs its daemon
+  // enabled and the invoking user placed in the `docker` group — both scripted
+  // here, with the re-login that the group change requires reported afterwards.
+  const packageInstall =
+    distro === 'debian'
+      ? ['sudo apt update', 'sudo apt install -y docker.io']
+      : distro === 'fedora'
+        ? ['sudo dnf install -y moby-engine']
+        : null;
+
+  const manual = [
+    'Install Docker Engine:',
+    ...(packageInstall
+      ? packageInstall.map((c) => `  ${c}`)
+      : ['  https://docs.docker.com/engine/install/']),
+    '  sudo systemctl enable --now docker',
+    '',
+    'Then allow your user to run Docker without sudo:',
+    '  sudo usermod -aG docker $USER',
+    '  (log out and back in for the group change to apply)',
+    '',
+    "For the newest Docker rather than your distribution's package, see:",
+    '  https://docs.docker.com/engine/install/',
+    '',
+    'Verify with:',
+    '  docker info',
+  ].join('\n');
+
+  if (!packageInstall) return { install: [], manual };
+
   return {
-    install: [],
-    manual: [
-      'Install Docker Engine for your distribution:',
-      '  https://docs.docker.com/engine/install/',
-      '',
-      'Then allow your user to run Docker without sudo:',
-      '  sudo usermod -aG docker $USER',
-      '  (log out and back in for the group change to apply)',
-      '',
-      'Verify with:',
-      '  docker info',
-    ].join('\n'),
+    install: [...packageInstall, 'sudo systemctl enable --now docker', 'sudo usermod -aG docker $USER'],
+    manual,
+    postInstall: LINUX_DOCKER_GROUP_NOTE,
   };
 }
+
+/**
+ * The one thing an automatic Linux Docker install cannot finish for you.
+ *
+ * Group membership is read at login, so the `docker` group this install just
+ * added does not apply to the shell running the wizard. Without this note the
+ * next `docker info` fails with a permission error that looks like a broken
+ * install rather than a pending re-login.
+ */
+export const LINUX_DOCKER_GROUP_NOTE = [
+  'Your user was added to the `docker` group, which only takes effect at login.',
+  'Log out and back in, or start a new session with:',
+  '  newgrp docker',
+].join('\n');
 
 export function installInstructions(
   engine: EngineName,
   platform: NodeJS.Platform,
   distro: LinuxDistro = 'unknown',
 ): InstallInstructions {
-  return engine === 'docker' ? dockerInstructions(platform) : podmanInstructions(platform, distro);
+  return engine === 'docker' ? dockerInstructions(platform, distro) : podmanInstructions(platform, distro);
 }
 
 /**
@@ -204,40 +243,6 @@ export function dockerDesktopCandidates(platform: NodeJS.Platform, env: NodeJS.P
 }
 
 /**
- * Whether `clustercode` can change this engine's memory allocation, and where
- * the knob lives when it cannot.
- *
- * Single source of truth for the wizard's copy. `planMemoryApply` decides the
- * same question for the apply path; both must name the same place, and on
- * Windows that place is .wslconfig even for Docker — Docker Desktop's own
- * memory slider is disabled under the WSL2 backend, so pointing a Windows user
- * at Docker Desktop settings sends them somewhere that cannot help.
- */
-export interface MemoryConfigurability {
-  /** 'cli' — `clustercode onboard --memory` works. 'external' — a knob exists, elsewhere. 'none' — no knob exists. */
-  kind: 'cli' | 'external' | 'none';
-  /** Where the knob is, phrased to complete "set it by …" / "there is no …". */
-  where: string;
-}
-
-export function memoryConfigurability(
-  engine: EngineName,
-  platform: NodeJS.Platform,
-): MemoryConfigurability {
-  // Native Linux runs containers as host processes for either engine: there is
-  // no virtual machine, so nothing caps the engine below the host's own RAM.
-  if (platform === 'linux') {
-    return { kind: 'none', where: 'containers run directly on the host, so nothing caps them below your RAM' };
-  }
-  if (engine === 'podman') {
-    return { kind: 'cli', where: 'clustercode onboard --memory <mb>' };
-  }
-  return platform === 'win32'
-    ? { kind: 'external', where: 'set [wsl2] memory= in .wslconfig, then run `wsl --shutdown`' }
-    : { kind: 'external', where: 'Docker Desktop → Settings → Resources' };
-}
-
-/**
  * The choice offered when no engine is installed.
  *
  * Podman leads and is labelled recommended because of the memory difference,
@@ -245,18 +250,22 @@ export function memoryConfigurability(
  * the dedicated-worker recommendation all stop applying, and someone picking
  * from a two-item list deserves to know that before they pick.
  */
-function dockerHint(platform: NodeJS.Platform, manualInstall: boolean): string {
-  const memory = memoryConfigurability('docker', platform);
-  const install = manualInstall ? 'manual install; ' : '';
-  return memory.kind === 'external'
-    ? `${install}memory is not configurable from the CLI — ${memory.where}`
-    : `${install}same capacity as Podman here`;
+function dockerHint(platform: NodeJS.Platform, distro: LinuxDistro): string {
+  const knob = memoryKnob('docker', platform);
+  if (knob.kind === 'external') {
+    return `memory is not configurable from the CLI — ${knob.where}`;
+  }
+  // Native Linux: capacity is identical to Podman's, so the honest difference
+  // is the group membership Docker needs and the re-login that implies.
+  return installInstructions('docker', platform, distro).install.length === 0
+    ? 'manual install on this distribution; same capacity as Podman'
+    : 'same capacity as Podman; needs the `docker` group and a re-login';
 }
 
 export function engineChoiceOptions(
   platform: NodeJS.Platform,
+  distro: LinuxDistro = 'unknown',
 ): { value: EngineName; label: string; hint: string }[] {
-  const dockerManual = installInstructions('docker', platform).install.length === 0;
   return [
     {
       value: 'podman',
@@ -269,7 +278,7 @@ export function engineChoiceOptions(
     {
       value: 'docker',
       label: 'Docker',
-      hint: dockerHint(platform, dockerManual),
+      hint: dockerHint(platform, distro),
     },
   ];
 }
