@@ -44,20 +44,45 @@ function execSilent(cmd: string, timeout?: number): string | null {
   }
 }
 
-// RHEL-likes are kept apart from Fedora rather than folded into it. They share
-// `dnf`, so for Podman the two are interchangeable, but Docker is not packaged
-// the same way: `moby-engine` is a Fedora package, and offering a stock RHEL,
-// CentOS Stream or Rocky user an automatic install of it means promising a
-// package that is not in their repositories. Fedora's own `ID=fedora` is
-// matched first, so only the derivatives fall through to the narrower answer.
+/**
+ * Classify a distribution from the contents of /etc/os-release.
+ *
+ * RHEL-likes are kept apart from Fedora rather than folded into it. They share
+ * `dnf`, so for Podman the two are interchangeable, but Docker is not packaged
+ * the same way: `moby-engine` is a Fedora package, and offering a stock RHEL,
+ * CentOS Stream or Rocky user an automatic install of it means promising a
+ * package that is not in their repositories. Fedora's own `ID=fedora` is
+ * matched first, so only the derivatives fall through to the narrower answer.
+ *
+ * Exported and taking its input as a string so it can be tested against real
+ * os-release files. It used to read the file itself, which meant the only way to
+ * test the classification was to test the thing it fed — and a test that calls
+ * `installInstructions(..., 'rhel')` directly proves nothing about whether any
+ * real machine is classified as 'rhel'.
+ */
+export function classifyLinuxDistro(osRelease: string, hasDnf: boolean): LinuxDistro {
+  if (/ID_LIKE=.*debian|ID=ubuntu|ID=debian/i.test(osRelease)) return 'debian';
+  const rhelLike =
+    /^ID="?fedora/im.test(osRelease)
+      ? 'fedora'
+      : /ID_LIKE=.*(rhel|fedora|centos)|ID=(rhel|centos|rocky|almalinux|amzn)/i.test(osRelease)
+        ? 'rhel'
+        : null;
+  // Every automatic command on both RHEL-like paths is a `dnf` command. Amazon
+  // Linux 2 declares `ID_LIKE="centos rhel fedora"` but ships only `yum`, so
+  // classifying on the declaration alone hands it `sudo dnf install -y podman`
+  // and a `dnf: command not found`. Ask the machine instead of the label.
+  if (rhelLike && !hasDnf) return 'unknown';
+  return rhelLike ?? 'unknown';
+}
+
 function detectLinuxDistro(): LinuxDistro {
   try {
     const osRelease = execSync('cat /etc/os-release', { encoding: 'utf-8' });
-    if (/ID_LIKE=.*debian|ID=ubuntu|ID=debian/i.test(osRelease)) return 'debian';
-    if (/^ID="?fedora/im.test(osRelease)) return 'fedora';
-    if (/ID_LIKE=.*(rhel|fedora|centos)|ID=(rhel|centos|rocky|almalinux)/i.test(osRelease)) return 'rhel';
-  } catch { /* ignore */ }
-  return 'unknown';
+    return classifyLinuxDistro(osRelease, execSilent('command -v dnf') !== null);
+  } catch {
+    return 'unknown';
+  }
 }
 
 /**
@@ -199,7 +224,11 @@ async function startDocker(): Promise<boolean> {
   const spinner = clack.spinner();
   spinner.start('Waiting for Docker to start...');
   const deadline = plan.waitSeconds;
-  for (let elapsed = 0; elapsed < deadline; elapsed += POLL_INTERVAL_SECONDS) {
+  // Measured, not accumulated: each probe can itself block for up to the poll
+  // interval, so summing the sleeps under-counts and a "60 second" wait ran for
+  // about 120. The message states a deadline; the loop must honour that one.
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) / 1000 < deadline) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_SECONDS * 1000));
     // Bounded: while Docker Desktop is mid-start the CLI's named-pipe connect
     // can block for many seconds, so an untimed probe turns a "60 second" wait
@@ -456,7 +485,15 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
 
   // The install worked. Dumping the manual instructions here would contradict
   // the re-login note printed moments ago and send the user round the loop again.
-  if (isGroupPending(recheck)) {
+  //
+  // Gated on the same condition as the note above, and for the same reason one
+  // step further on: `isGroupPending` reads a permission error off the socket,
+  // and that error looks identical whether the group was granted-but-not-yet-
+  // effective or never granted at all. Telling someone whose `usermod` FAILED to
+  // log out and back in sends them round a loop that can never terminate — they
+  // return to the same error, forever. When the group add did not run, the
+  // manual instructions are the only thing that can actually help.
+  if (isGroupPending(recheck) && failedCommands.length === 0) {
     clack.log.success(`${engineLabel(engine)} installed.`);
     reportGroupPending();
     return false;
@@ -577,15 +614,24 @@ function reportUnconfigurableMemory(
   hostBytes: number,
   dedicatedRecommendation: number,
   reason: string,
+  explicitRequest: boolean,
 ): void {
   if (engineName !== 'podman' && engineName !== 'docker') return;
   // The PROBED provider, not a re-derived default. Re-deriving it here reopens
   // the dead end this function exists to close: a Windows Docker install on the
   // Hyper-V backend would be sent to .wslconfig, which cannot size it.
   const knob = memoryKnob(engineName, platform, provider);
-  // 'none' means no knob exists anywhere (native Linux) — there is nothing to
-  // tell the user to go do, so saying it would be noise on every run.
-  if (knob.kind === 'none') return;
+  // 'none' means no knob exists anywhere (native Linux). There is nothing to go
+  // do, so on a normal run this would be noise — but someone who typed
+  // `--memory 8192` asked a direct question and deserves a direct answer rather
+  // than silence followed by an unexplained "not applied".
+  if (knob.kind === 'none') {
+    if (explicitRequest) {
+      clack.log.step('Container runtime memory');
+      clack.log.info(`Nothing to apply: ${knob.reason}.`);
+    }
+    return;
+  }
 
   const current = probeEngineCapacity(engineName);
   clack.log.step('Container runtime memory');
@@ -615,16 +661,30 @@ function reportUnconfigurableMemory(
 }
 
 /**
+ * Whether an explicit `--memory` that could not be applied should fail the run.
+ *
+ * Everywhere a knob exists, it should: a CI run that asked for a size, got
+ * none, and exited 0 is indistinguishable from one that worked. Native Linux is
+ * the exception, and not as a courtesy — there is no VM, so the engine already
+ * has the whole host and any request is already met or exceeded. Failing there
+ * would break a fleet script running one `onboard --memory N` across a mixed
+ * estate, on precisely the machines that need it least.
+ */
+function unappliedMemoryIsFailure(knob: MemoryKnob): boolean {
+  return knob.kind !== 'none';
+}
+
+/**
  * Offer to resize the container runtime.
  *
  * Unlike the other steps this runs even when nothing is failing: an
  * under-provisioned runtime is a healthy check, but it silently caps how much
  * work this worker is given.
  */
-async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void> {
+async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boolean> {
   const runtime = checkContainerRuntime();
   const engineName = runtime.engine?.name;
-  if (!engineName) return;
+  if (!engineName) return true;
 
   const hostBytes = totalmem();
   const platform = process.platform;
@@ -638,8 +698,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   // otherwise exit 0 having changed nothing.
   if (flagMemory !== undefined && requested === null) {
     clack.log.error(validateRuntimeMemoryMb(flagMemory, hostBytes) ?? 'Invalid --memory value');
-    process.exitCode = 1;
-    return;
+    return false;
   }
 
   const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
@@ -651,12 +710,12 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
       hostBytes,
       dedicatedRecommendation,
       probe.reason ?? '',
+      flagMemory !== undefined,
     );
-    // An explicit --memory that cannot be applied must not exit 0, for the same
-    // reason the invalid-value branch above sets it: a CI run that asked for a
-    // size and got none should fail, not report success having changed nothing.
-    if (flagMemory !== undefined) process.exitCode = 1;
-    return;
+    const knob = engineName === 'podman' || engineName === 'docker'
+      ? memoryKnob(engineName, platform, provider)
+      : null;
+    return flagMemory === undefined || !knob || !unappliedMemoryIsFailure(knob);
   }
 
   const current = probeEngineCapacity(engineName);
@@ -672,13 +731,13 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
 
   let target = requested;
   if (target === null) {
-    if (!process.stdin.isTTY) return;
+    if (!process.stdin.isTTY) return true;
     // 0 means the machine is too small to give anything away without starving
     // the host, for either use. Say so rather than prompting with an invalid
     // default.
     if (dedicatedRecommendation === 0) {
       clack.log.warn('This machine does not have enough RAM to increase the runtime allocation.');
-      return;
+      return true;
     }
 
     // A ceiling is not the same commitment as a reservation, and users
@@ -712,7 +771,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
       message: 'How should the container runtime memory be sized?',
       options: useOptions,
     });
-    if (clack.isCancel(choice) || choice === 'keep') return;
+    if (clack.isCancel(choice) || choice === 'keep') return true;
 
     if (choice === 'dedicated' || choice === 'shared') {
       target = (choice === 'dedicated' ? dedicatedRecommendation : sharedRecommendation) as number;
@@ -725,7 +784,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
         // not `null`. Matches the existing usage in src/commands/login.ts.
         validate: (v = '') => validateRuntimeMemoryMb(v, hostBytes) ?? undefined,
       });
-      if (clack.isCancel(answer)) return;
+      if (clack.isCancel(answer)) return true;
       target = Number(String(answer).trim());
     }
   }
@@ -740,7 +799,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   // never matches and would re-apply (and re-run `wsl --shutdown`) every run.
   if (currentMib !== null && Math.abs(target - currentMib) / target < 0.07) {
     clack.log.info('Already about that size — nothing to change.');
-    return;
+    return true;
   }
 
   const plan = planMemoryApply(provider, process.platform, engineName, target);
@@ -755,7 +814,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
 
   if (process.stdin.isTTY) {
     const ok = await clack.confirm({ message: 'Apply this change?' });
-    if (clack.isCancel(ok) || !ok) return;
+    if (clack.isCancel(ok) || !ok) return true;
   } else if (!flagMemory) {
     // No TTY and no explicit --memory: a stored config value is not consent to
     // restart every WSL distribution on the machine unattended.
@@ -763,14 +822,16 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
       `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
         `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
     );
-    return;
+    return true;
   }
 
   if (plan.kind === 'wslconfig') {
     const written = applyWslMemory(target);
     if (!written.ok) {
       clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
-      return;
+      // An apply that was ATTEMPTED and failed is a stronger failure than one
+      // the CLI declined to attempt, and used to be the quieter of the two.
+      return false;
     }
     clack.log.success(`Updated ${wslConfigPath()}`);
   }
@@ -778,7 +839,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   const ran = runApplySteps(plan.steps);
   if (!ran.ok) {
     clack.log.error(`Failed at: ${ran.failed}`);
-    return;
+    return false;
   }
 
   // Re-probe rather than reporting the requested number: a malformed .wslconfig
@@ -789,6 +850,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   if (after.status === 'pass') clack.log.success(after.detail);
   else clack.log.warn(after.detail);
   clack.log.info('Restart the worker for the new capacity to be advertised.');
+  return true;
 }
 
 export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
@@ -813,14 +875,17 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     // Explicitly clear the exit code: doctor sets process.exitCode = 1 before
     // delegating here, and a "everything looks good" outcome must not exit 1.
     process.exitCode = 0;
-    await offerRuntimeMemory(opts.memory);
-    // The memory step can fail on its own - an explicit --memory this CLI
-    // cannot apply exits non-zero - and closing with "everything looks good"
-    // over a non-zero exit is the kind of contradiction a CI log gets read for.
+    // The memory step can fail on its own - an explicit --memory this CLI could
+    // not apply - and closing with "everything looks good" over a non-zero exit
+    // is the kind of contradiction a CI log gets read for. The step reports its
+    // own outcome rather than writing process.exitCode, because the OTHER call
+    // site below re-runs the checks afterwards and would overwrite it.
+    const memoryOk = await offerRuntimeMemory(opts.memory);
+    if (!memoryOk) process.exitCode = 1;
     clack.outro(
-      process.exitCode
-        ? pc.yellow('Checks passed, but the requested runtime memory was not applied.')
-        : pc.green('Everything looks good! No issues to fix.'),
+      memoryOk
+        ? pc.green('Everything looks good! No issues to fix.')
+        : pc.yellow('Checks passed, but the requested runtime memory was not applied.'),
     );
     return;
   }
@@ -893,7 +958,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     );
   }
 
-  await offerRuntimeMemory(opts.memory);
+  const memoryOk = await offerRuntimeMemory(opts.memory);
 
   // Pre-warm the worker binary so the first `clustercode worker` starts instantly.
   const { readInstalled, ensureWorkerBinary } = await import('../lib/worker-binary.js');
@@ -930,8 +995,15 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
 
   const remainingFailures = finalResults.filter((r) => r.status === 'fail');
   if (remainingFailures.length === 0) {
-    process.exitCode = 0;
-    clack.outro(pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.'));
+    // Fixing the checks does not retroactively apply a --memory this CLI could
+    // not apply. Reporting "all issues resolved" and exiting 0 here is how the
+    // memory failure used to vanish on the path where the wizard did work.
+    process.exitCode = memoryOk ? 0 : 1;
+    clack.outro(
+      memoryOk
+        ? pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.')
+        : pc.yellow('Issues resolved, but the requested runtime memory was not applied.'),
+    );
     return;
   }
 

@@ -97,8 +97,33 @@ export function isSocketPermissionError(stderr: string): boolean {
 }
 
 /** Detail text for an engine that is running but unreachable by this user. */
+/**
+ * The phrase both "running, but you cannot reach it" details share, and the one
+ * `checkRuntimeMemory` matches on to tell a denied engine from a stopped one.
+ *
+ * A function rather than a `const` because checks.ts and runtime-memory.ts
+ * import each other: whichever module the process enters first leaves the
+ * other's top-level bindings in the temporal dead zone, and a `const` read
+ * across that cycle throws. Function declarations are hoisted, so this one is
+ * callable from either entry order.
+ */
+export function socketDeniedPhrase(): string {
+  return 'not permitted for this user';
+}
+
 export const DOCKER_GROUP_PENDING =
-  'not permitted for this user — log out and back in to pick up the `docker` group';
+  `${socketDeniedPhrase()} — log out and back in to pick up the \`docker\` group`;
+
+/**
+ * The same symptom on any other engine.
+ *
+ * Only Docker's install puts the user in a group, so only Docker's failure is
+ * cured by logging out. Rootless Podman has no `docker` group to join: a denied
+ * socket there means something else entirely (a rootful socket, a stale
+ * CONTAINER_HOST), and sending that user to `newgrp docker` is advice for a
+ * different product.
+ */
+export const SOCKET_NOT_PERMITTED = `running, but its socket is ${socketDeniedPhrase()}`;
 
 export function checkAuth(): CheckResult {
   const creds = readCredentials();
@@ -259,9 +284,11 @@ function evaluateEngine(engine: DetectedEngine): CheckResult {
   return {
     name: 'container-runtime',
     status: 'fail',
-    detail: isSocketPermissionError(probe.stderr)
-      ? `${label} is running, but ${DOCKER_GROUP_PENDING}`
-      : `${label} found but not running`,
+    detail: !isSocketPermissionError(probe.stderr)
+      ? `${label} found but not running`
+      : engine.name === 'docker'
+        ? `${label} is running, but ${DOCKER_GROUP_PENDING}`
+        : `${label} is ${SOCKET_NOT_PERMITTED}`,
     engine: engineInfo,
   };
 }

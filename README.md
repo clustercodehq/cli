@@ -106,7 +106,7 @@ The two are not equivalent, and the difference is memory:
 | `doctor` reports memory and DevBox capacity | yes | yes |
 | Same sizing math, warnings and nudges | yes | yes |
 | `onboard --memory` can apply a change | yes, on Windows and macOS | **no** |
-| Automatic install | Windows, macOS, Debian/Ubuntu, Fedora | same |
+| Automatic install | Windows, macOS, Debian/Ubuntu, Fedora, RHEL-likes | same, minus RHEL-likes |
 | Usable without further steps | yes | Linux needs a re-login |
 
 Podman is recommended for the memory reason alone. Choosing Docker is fully

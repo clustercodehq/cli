@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateRuntimeMemory, estimateDevboxes } from '../../src/lib/runtime-memory.js';
+import { evaluateRuntimeMemory, estimateDevboxes, checkRuntimeMemory } from '../../src/lib/runtime-memory.js';
+import { DOCKER_GROUP_PENDING, SOCKET_NOT_PERMITTED } from '../../src/lib/checks.js';
 
 const MIB = 1024 * 1024;
 const HOST_32GB = 32768 * MIB;
@@ -341,5 +342,35 @@ describe('evaluateRuntimeMemory', () => {
       assert.equal(r.status, 'pass');
       assert.match(r.detail, /dedicated worker/);
     });
+  });
+});
+
+describe('checkRuntimeMemory', () => {
+  const runtime = (status: 'fail' | 'warn', detail: string) => ({
+    name: 'container-runtime', status, detail,
+    engine: { name: 'docker', version: '27.0.0' },
+  });
+
+  test('tells a stopped engine to start', () => {
+    const r = checkRuntimeMemory(runtime('fail', 'Docker found but not running'));
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /start/i);
+  });
+
+  // Telling someone to start an engine that is already running sends them round
+  // the same loop, so the two "cannot reach it" details must not get that advice.
+  for (const detail of [`Docker is running, but ${DOCKER_GROUP_PENDING}`, `Docker is ${SOCKET_NOT_PERMITTED}`]) {
+    test(`does not say "start" for: ${detail}`, () => {
+      const r = checkRuntimeMemory(runtime('fail', detail));
+      assert.equal(r.status, 'warn');
+      assert.doesNotMatch(r.detail, /start/i);
+      assert.match(r.detail, /not reachable by this user/i);
+    });
+  }
+
+  test('warns without an engine name when nothing is installed', () => {
+    const r = checkRuntimeMemory({ name: 'container-runtime', status: 'fail', detail: 'No container runtime found' });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /no container runtime detected/i);
   });
 });

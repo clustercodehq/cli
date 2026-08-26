@@ -129,6 +129,11 @@ interface DoctorCheck {
   engine?: { name: string; version: string };
 }
 
+/** Host PATH minus any directory that could contribute a real podman/docker. */
+function realEnginesRemoved(): string[] {
+  return (process.env.PATH ?? '').split(isWin ? ';' : ':').filter((dir) => !/podman|docker|redhat/i.test(dir));
+}
+
 function runDoctor(env: Record<string, string> = {}): { checks: Record<string, DoctorCheck> } {
   const fullEnv = {
     ...process.env,
@@ -138,8 +143,16 @@ function runDoctor(env: Record<string, string> = {}): { checks: Record<string, D
     ORCHESTRATOR_URL: 'http://127.0.0.1:19999',
     PORTAL_URL: 'http://127.0.0.1:19998',
     HEALTH_CHECK_TIMEOUT_MS: '500',
-    // Prepend stubDir to PATH so our stubs are found first
-    PATH: `${stubDir}${isWin ? ';' : ':'}${process.env.PATH}`,
+    // Prepend stubDir to PATH so our stubs are found first, and strip every real
+    // engine the host happens to have. Both halves are load-bearing: this suite
+    // asserts what doctor says about STUBBED engines, and doctor deliberately
+    // reports any WORKING engine it can find. Installing Docker Desktop on a dev
+    // box was enough to turn "reports fail when podman machine is not running"
+    // green-to-red, because the real Docker answered where the stub said no.
+    PATH: [stubDir, ...realEnginesRemoved()].join(isWin ? ';' : ':'),
+    // The well-known-directory probe reaches engines that are not on PATH at all,
+    // so stripping PATH alone does not isolate the test from the host.
+    CLUSTERCODE_NO_ENGINE_PATH_PROBE: '1',
     ...env,
   };
 
