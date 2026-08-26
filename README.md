@@ -4,6 +4,10 @@ CLI to set up, authenticate, and run ClusterCode workers.
 
 ## Install
 
+Requires **Node.js 20.12.0 or newer**. The CLI checks this at startup and
+exits with an explanation if the version is too old — earlier versions fail to
+load at all, with an error pointing inside `node_modules`.
+
 ```bash
 npm install -g @clustercode/cli@alpha
 ```
