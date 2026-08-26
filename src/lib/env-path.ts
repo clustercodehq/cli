@@ -179,8 +179,13 @@ export interface LocatedEngine {
  * Find a container engine, repairing a stale PATH if the first look comes up
  * empty. Used right after an install to decide whether it actually worked.
  */
-export function locateContainerEngine(): LocatedEngine | null {
-  const engines: Array<'podman' | 'docker'> = ['podman', 'docker'];
+export function locateContainerEngine(prefer?: 'podman' | 'docker'): LocatedEngine | null {
+  // Podman first by default, but a caller that just installed a specific engine
+  // on the user's instruction must get that one back. Without this, choosing
+  // Docker and then finding a stray Podman on disk would silently onboard the
+  // engine the user declined.
+  const engines: Array<'podman' | 'docker'> =
+    prefer === 'docker' ? ['docker', 'podman'] : ['podman', 'docker'];
 
   for (const name of engines) {
     const path = resolveExecutable(name);

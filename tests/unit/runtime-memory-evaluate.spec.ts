@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateRuntimeMemory } from '../../src/lib/runtime-memory.js';
+import { evaluateRuntimeMemory, estimateDevboxes, checkRuntimeMemory } from '../../src/lib/runtime-memory.js';
+import { DOCKER_GROUP_PENDING, SOCKET_NOT_PERMITTED } from '../../src/lib/checks.js';
 
 const MIB = 1024 * 1024;
 const HOST_32GB = 32768 * MIB;
@@ -160,6 +161,7 @@ describe('evaluateRuntimeMemory', () => {
     const small = { memTotalBytes: 2048 * MIB, cpus: 2 };
     const win = evaluateRuntimeMemory({
       engine: small, hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32',
+      provider: 'wsl',
     });
     const mac = evaluateRuntimeMemory({
       engine: small, hostBytes: HOST_32GB, engineName: 'docker', platform: 'darwin',
@@ -233,6 +235,7 @@ describe('evaluateRuntimeMemory', () => {
       const r = evaluateRuntimeMemory({
         engine: { memTotalBytes: BELOW_DEDICATED_MIB * MIB, cpus: 8 },
         hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32',
+        provider: 'wsl',
       });
       assert.equal(r.status, 'pass');
       assert.doesNotMatch(r.detail, /clustercode onboard/);
@@ -257,6 +260,7 @@ describe('evaluateRuntimeMemory', () => {
       const r = evaluateRuntimeMemory({
         engine: { memTotalBytes: 8192 * MIB, cpus: 8 },
         hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32',
+        provider: 'wsl',
       });
       assert.equal(r.status, 'warn');
       assert.match(r.detail, /more host memory is available/);
@@ -274,5 +278,99 @@ describe('evaluateRuntimeMemory', () => {
       assert.doesNotMatch(r.detail, /clustercode onboard/);
       assert.match(r.detail, /Docker Desktop/);
     });
+  });
+
+  // Windows Docker has two backends that take memory from different places.
+  // Naming .wslconfig to a Hyper-V user is the same defect as naming Docker
+  // Desktop to a WSL2 user, one backend narrower.
+  describe('the Windows Docker backend split', () => {
+    const dockerWin = (provider?: 'wsl' | 'hyperv') =>
+      evaluateRuntimeMemory({
+        engine: { memTotalBytes: 8192 * MIB, cpus: 8 },
+        hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32', provider,
+      }).detail;
+
+    test('a Hyper-V backend is sent to Docker Desktop, never to .wslconfig', () => {
+      const detail = dockerWin('hyperv');
+      assert.match(detail, /Docker Desktop/);
+      assert.doesNotMatch(detail, /\.wslconfig/);
+    });
+
+    test('a WSL2 backend is sent to .wslconfig, never to Docker Desktop', () => {
+      const detail = dockerWin('wsl');
+      assert.match(detail, /\.wslconfig/);
+      assert.doesNotMatch(detail, /Docker Desktop/);
+    });
+
+    test('an undetected backend names both rather than guessing one', () => {
+      const detail = dockerWin(undefined);
+      assert.match(detail, /\.wslconfig/);
+      assert.match(detail, /Docker Desktop/);
+    });
+  });
+
+  // A nudge asks for a manual config edit and a full WSL restart. Capacity moves
+  // in whole DevBoxes, so one that does not add a DevBox asks for that in
+  // exchange for nothing - the same "nagged on a pass" defect as before.
+  describe('nudges that would buy nothing', () => {
+    // Sizes chosen from the real arithmetic rather than by eye: on a 31 GiB host
+    // the dedicated recommendation is 25600 MiB, and both it and a 23552 MiB
+    // engine fit exactly 5 default DevBoxes once the scheduler's reserve is
+    // taken out. That is the shape seen on real hardware, where doctor advised a
+    // .wslconfig edit and a full WSL restart for zero extra DevBoxes.
+    const HOST_31GIB = 31 * 1024 * MIB;
+
+    test('is suppressed when the recommendation fits no more DevBoxes', () => {
+      assert.equal(estimateDevboxes(23552), estimateDevboxes(25600));
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: 23552 * MIB, cpus: 8 },
+        hostBytes: HOST_31GIB, engineName: 'podman', platform: 'win32',
+      });
+      assert.equal(r.status, 'pass');
+      assert.doesNotMatch(r.detail, /dedicated worker/);
+    });
+
+    test('still fires when it does add a DevBox', () => {
+      // 20480 MiB is above the shared recommendation, so this is a PASS and
+      // reaches the nudge rather than the warn branch. It fits 4 against a
+      // recommendation that fits 5 - a whole extra DevBox, worth the restart.
+      assert.ok(estimateDevboxes(20480) < estimateDevboxes(25600));
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: 20480 * MIB, cpus: 8 },
+        hostBytes: HOST_31GIB, engineName: 'podman', platform: 'win32',
+      });
+      assert.equal(r.status, 'pass');
+      assert.match(r.detail, /dedicated worker/);
+    });
+  });
+});
+
+describe('checkRuntimeMemory', () => {
+  const runtime = (status: 'fail' | 'warn', detail: string) => ({
+    name: 'container-runtime', status, detail,
+    engine: { name: 'docker', version: '27.0.0' },
+  });
+
+  test('tells a stopped engine to start', () => {
+    const r = checkRuntimeMemory(runtime('fail', 'Docker found but not running'));
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /start/i);
+  });
+
+  // Telling someone to start an engine that is already running sends them round
+  // the same loop, so the two "cannot reach it" details must not get that advice.
+  for (const detail of [`Docker is running, but ${DOCKER_GROUP_PENDING}`, `Docker is ${SOCKET_NOT_PERMITTED}`]) {
+    test(`does not say "start" for: ${detail}`, () => {
+      const r = checkRuntimeMemory(runtime('fail', detail));
+      assert.equal(r.status, 'warn');
+      assert.doesNotMatch(r.detail, /start/i);
+      assert.match(r.detail, /not reachable by this user/i);
+    });
+  }
+
+  test('warns without an engine name when nothing is installed', () => {
+    const r = checkRuntimeMemory({ name: 'container-runtime', status: 'fail', detail: 'No container runtime found' });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /no container runtime detected/i);
   });
 });

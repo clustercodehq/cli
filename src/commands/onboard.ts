@@ -2,11 +2,13 @@ import { Command } from 'commander';
 import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { totalmem } from 'node:os';
 import {
   runAllChecks,
   checkContainerRuntime,
   checkWsl,
+  DOCKER_GROUP_PENDING,
   type CheckResult,
 } from '../lib/checks.js';
 import {
@@ -21,28 +23,71 @@ import {
 import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
 import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
+import { memoryKnob, type MemoryKnob } from '../lib/memory-knob.js';
+import type { MachineProvider } from '../lib/runtime-memory.js';
+import {
+  installInstructions,
+  dockerStartPlan,
+  dockerDesktopCandidates,
+  engineChoiceOptions,
+  type EngineName,
+  type InstallInstructions,
+  type LinuxDistro,
+} from '../lib/engine-install.js';
 import { releaseStdin } from '../lib/tty.js';
 
-function execSilent(cmd: string): string | null {
+function execSilent(cmd: string, timeout?: number): string | null {
   try {
-    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout }).trim();
   } catch {
     return null;
   }
 }
 
-function detectLinuxDistro(): 'debian' | 'fedora' | 'unknown' {
+/**
+ * Classify a distribution from the contents of /etc/os-release.
+ *
+ * RHEL-likes are kept apart from Fedora rather than folded into it. They share
+ * `dnf`, so for Podman the two are interchangeable, but Docker is not packaged
+ * the same way: `moby-engine` is a Fedora package, and offering a stock RHEL,
+ * CentOS Stream or Rocky user an automatic install of it means promising a
+ * package that is not in their repositories. Fedora's own `ID=fedora` is
+ * matched first, so only the derivatives fall through to the narrower answer.
+ *
+ * Exported and taking its input as a string so it can be tested against real
+ * os-release files. It used to read the file itself, which meant the only way to
+ * test the classification was to test the thing it fed — and a test that calls
+ * `installInstructions(..., 'rhel')` directly proves nothing about whether any
+ * real machine is classified as 'rhel'.
+ */
+export function classifyLinuxDistro(osRelease: string, hasDnf: boolean): LinuxDistro {
+  if (/ID_LIKE=.*debian|ID=ubuntu|ID=debian/i.test(osRelease)) return 'debian';
+  const rhelLike =
+    /^ID="?fedora/im.test(osRelease)
+      ? 'fedora'
+      : /ID_LIKE=.*(rhel|fedora|centos)|ID=(rhel|centos|rocky|almalinux|amzn)/i.test(osRelease)
+        ? 'rhel'
+        : null;
+  // Every automatic command on both RHEL-like paths is a `dnf` command. Amazon
+  // Linux 2 declares `ID_LIKE="centos rhel fedora"` but ships only `yum`, so
+  // classifying on the declaration alone hands it `sudo dnf install -y podman`
+  // and a `dnf: command not found`. Ask the machine instead of the label.
+  if (rhelLike && !hasDnf) return 'unknown';
+  return rhelLike ?? 'unknown';
+}
+
+function detectLinuxDistro(): LinuxDistro {
   try {
     const osRelease = execSync('cat /etc/os-release', { encoding: 'utf-8' });
-    if (/ID_LIKE=.*debian|ID=ubuntu|ID=debian/i.test(osRelease)) return 'debian';
-    if (/ID_LIKE=.*fedora|ID=fedora|ID_LIKE=.*rhel|ID=rhel/i.test(osRelease)) return 'fedora';
-  } catch { /* ignore */ }
-  return 'unknown';
+    return classifyLinuxDistro(osRelease, execSilent('command -v dnf') !== null);
+  } catch {
+    return 'unknown';
+  }
 }
 
 /**
  * Commands for the automatic path (`install`) and the copy-pasteable fallback
- * (`manual`).
+ * (`manual`), for the engine the user chose.
  *
  * `install` deliberately covers installation ONLY — starting the runtime is left
  * to startContainerRuntime(), which checks for an existing Podman machine first.
@@ -50,76 +95,8 @@ function detectLinuxDistro(): 'debian' | 'fedora' | 'unknown' {
  * init against an already-initialized machine, which errors out and aborted the
  * sequence before `podman machine start` ever ran.
  */
-function getInstallInstructions(): { install: string[]; manual: string } {
-  const platform = process.platform;
-
-  if (platform === 'darwin') {
-    return {
-      install: ['brew install podman'],
-      manual: [
-        'Install Podman:',
-        '  brew install podman',
-        '  podman machine init',
-        '  podman machine start',
-        '',
-        'Or download from: https://podman.io/docs/installation#macos',
-      ].join('\n'),
-    };
-  }
-
-  if (platform === 'win32') {
-    return {
-      // -e --id pins the exact package (a fuzzy name match can prompt for
-      // disambiguation), and the accept/interactivity flags keep winget from
-      // blocking on an agreement prompt inside a non-interactive child process.
-      install: [
-        'winget install -e --id RedHat.Podman --accept-package-agreements --accept-source-agreements --disable-interactivity',
-      ],
-      manual: [
-        'Install Podman:',
-        '  winget install -e --id RedHat.Podman',
-        '  podman machine init',
-        '  podman machine start',
-        '',
-        'Or download from: https://podman.io/docs/installation#windows',
-        '',
-        'Note: WSL2 is required. If not installed:',
-        '  wsl --install',
-        '  (restart your computer after WSL2 installation)',
-        '',
-        'After installing, open a NEW terminal so podman is on your PATH.',
-      ].join('\n'),
-    };
-  }
-
-  // Linux
-  const distro = detectLinuxDistro();
-  if (distro === 'debian') {
-    return {
-      install: ['sudo apt update', 'sudo apt install -y podman'],
-      manual: [
-        'Install Podman:',
-        '  sudo apt update && sudo apt install -y podman',
-      ].join('\n'),
-    };
-  }
-  if (distro === 'fedora') {
-    return {
-      install: ['sudo dnf install -y podman'],
-      manual: [
-        'Install Podman:',
-        '  sudo dnf install -y podman',
-      ].join('\n'),
-    };
-  }
-
-  return {
-    install: [],
-    manual: [
-      'Install Podman for your distribution:',
-      '  https://podman.io/docs/installation#linux',
-    ].join('\n'),
-  };
+function getInstallInstructions(engine: EngineName = 'podman'): InstallInstructions {
+  return installInstructions(engine, process.platform, detectLinuxDistro());
 }
 
 interface CommandOutcome {
@@ -206,6 +183,69 @@ function buildMachineInitCommand(flagMemory?: string): string {
   return mib === null ? 'podman machine init' : `podman machine init --memory ${mib}`;
 }
 
+/** How often to re-probe `docker info` while waiting for Docker Desktop. */
+const POLL_INTERVAL_SECONDS = 2;
+
+/** First Docker Desktop executable that actually exists on this machine. */
+function findDockerDesktop(): string | null {
+  for (const candidate of dockerDesktopCandidates(process.platform, process.env)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Start an installed Docker and wait until it can actually serve containers.
+ *
+ * Returning true means `docker info` succeeded, not that a launch command
+ * exited zero: launching Docker Desktop returns immediately while the engine
+ * takes tens of seconds to come up, so the exit code says nothing useful.
+ */
+async function startDocker(): Promise<boolean> {
+  const plan = dockerStartPlan(process.platform, findDockerDesktop());
+
+  if (plan.kind === 'manual') {
+    clack.log.error(plan.reason);
+    return false;
+  }
+
+  if (plan.kind === 'systemd') {
+    clack.log.step('Starting Docker...');
+    if (!runCommand(plan.command).ok) {
+      clack.log.error('Failed to start Docker.');
+      return false;
+    }
+    return true;
+  }
+
+  clack.log.step('Starting Docker Desktop...');
+  runCommand(plan.command);
+
+  const spinner = clack.spinner();
+  spinner.start('Waiting for Docker to start...');
+  const deadline = plan.waitSeconds;
+  // Measured, not accumulated: each probe can itself block for up to the poll
+  // interval, so summing the sleeps under-counts and a "60 second" wait ran for
+  // about 120. The message states a deadline; the loop must honour that one.
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) / 1000 < deadline) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_SECONDS * 1000));
+    // Bounded: while Docker Desktop is mid-start the CLI's named-pipe connect
+    // can block for many seconds, so an untimed probe turns a "60 second" wait
+    // into minutes and a wedged pipe hangs the wizard outright.
+    if (execSilent('docker info', POLL_INTERVAL_SECONDS * 1000)) {
+      spinner.stop('Docker is running.');
+      return true;
+    }
+  }
+  spinner.stop('Docker did not start in time.');
+  clack.log.error(
+    `Docker Desktop did not become ready within ${deadline}s. ` +
+      'It may still be starting — wait for its window to say "Engine running", then re-run this command.',
+  );
+  return false;
+}
+
 async function startContainerRuntime(engineName: string, flagMemory?: string): Promise<boolean> {
   if (engineName === 'podman') {
     // Podman on Linux runs containers directly — there is no VM to init or start.
@@ -232,36 +272,82 @@ async function startContainerRuntime(engineName: string, flagMemory?: string): P
       clack.log.error('Failed to start Podman machine.');
       return false;
     }
-  } else {
-    // Docker — try to start the daemon
-    if (process.platform === 'darwin') {
-      clack.log.step('Starting Docker Desktop...');
-      runCommand('open -a Docker');
-      // Give it a moment to start
-      clack.log.info('Waiting for Docker to start...');
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
-        if (execSilent('docker info')) return true;
-      }
-      clack.log.error('Docker did not start in time.');
-      return false;
-    } else {
-      clack.log.step('Starting Docker...');
-      if (!runCommand('sudo systemctl start docker').ok) {
-        clack.log.error('Failed to start Docker.');
-        return false;
-      }
-    }
+  } else if (!(await startDocker())) {
+    return false;
   }
 
   const recheck = checkContainerRuntime();
   return recheck.status === 'pass';
 }
 
-async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
+/** The knob's destination plus whatever else the user has to do afterwards. */
+function knobDestination(knob: MemoryKnob): string {
+  return knob.followUp ? `${knob.where}, ${knob.followUp}` : knob.where;
+}
+
+/** Is this check failing only because a `docker` group membership has not taken effect? */
+function isGroupPending(check: CheckResult): boolean {
+  return check.detail.includes(DOCKER_GROUP_PENDING);
+}
+
+/**
+ * The one accurate thing to say when Docker is installed, running, and simply
+ * not reachable until the user logs in again.
+ */
+function reportGroupPending(): void {
+  clack.log.warn(`Docker is installed and running, but ${DOCKER_GROUP_PENDING}.`);
+  clack.log.info(
+    `Log out and back in, then re-run ${pc.bold('clustercode onboard')}. ` +
+      `To use it in this terminal without logging out: ${pc.dim('newgrp docker')}`,
+  );
+}
+
+function engineLabel(engine: EngineName): string {
+  return engine === 'docker' ? 'Docker' : 'Podman';
+}
+
+/**
+ * Which engine to install. Returns null when the user cancels.
+ *
+ * The memory consequence is printed after the choice rather than only in the
+ * option hint: picking Docker silently forfeits `--memory`, the sizing prompt
+ * and the dedicated-worker recommendation, and that is worth one line of
+ * confirmation rather than a discovery three commands later.
+ */
+async function chooseEngine(flagEngine?: EngineName): Promise<EngineName | null> {
+  let engine = flagEngine;
+  if (engine === undefined) {
+    const options = engineChoiceOptions(process.platform, detectLinuxDistro());
+    const picked = await clack.select({
+      message: 'Which container engine should ClusterCode use?',
+      options,
+    });
+    if (clack.isCancel(picked)) return null;
+    engine = picked as EngineName;
+  }
+
+  const knob = memoryKnob(engine, process.platform);
+  if (knob.kind === 'external') {
+    clack.log.warn(
+      `${engineLabel(engine)}: ClusterCode cannot set the container runtime memory for you — ` +
+        `${knobDestination(knob)}. \`clustercode doctor\` still reports how much it has and how many ` +
+        'DevBoxes that fits.',
+    );
+  }
+  return engine;
+}
+
+async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName): Promise<boolean> {
   // First check if it's installed but not running
   const currentCheck = checkContainerRuntime();
   if (currentCheck.engine) {
+    // The daemon is up and the user simply cannot reach it yet. Offering to
+    // start it would run a command that succeeds and changes nothing, leaving
+    // the wizard to fail again for the same reason on every re-run.
+    if (isGroupPending(currentCheck)) {
+      reportGroupPending();
+      return false;
+    }
     // Installed but not running — just need to start it
     clack.log.info(`${currentCheck.engine.name} v${currentCheck.engine.version} is installed but not running.`);
     const shouldStart = await clack.confirm({
@@ -278,18 +364,24 @@ async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
     return false;
   }
 
-  // Not installed at all — offer to install
-  const instructions = getInstallInstructions();
+  // Not installed at all — pick an engine, then offer to install it.
+  const engine = await chooseEngine(flagEngine);
+  if (engine === null) return false;
+
+  const instructions = getInstallInstructions(engine);
 
   if (instructions.install.length === 0) {
     clack.log.info(instructions.manual);
-    return false;
+    console.log();
+    const done = await clack.confirm({ message: 'Have you completed the installation?' });
+    if (clack.isCancel(done) || !done) return false;
+    return checkContainerRuntime().status === 'pass';
   }
 
   const approach = await clack.select({
     message: 'How would you like to proceed?',
     options: [
-      { value: 'auto', label: 'Automatic — install Podman and dependencies for me' },
+      { value: 'auto', label: `Automatic — install ${engineLabel(engine)} and dependencies for me` },
       { value: 'manual', label: 'Manual — show me the commands to run myself' },
     ],
   });
@@ -348,7 +440,7 @@ async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
     }
   }
 
-  const located = locateContainerEngine();
+  const located = locateContainerEngine(engine);
   if (!located) {
     clack.log.error(
       failedCommands.length > 0
@@ -361,6 +453,13 @@ async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
     return false;
   }
 
+  if (located.name !== engine) {
+    clack.log.warn(
+      `You chose ${engineLabel(engine)}, but only ${located.name} could be found afterwards — ` +
+        'continuing with it. Open a new terminal and re-run if that is wrong.',
+    );
+  }
+
   if (located.viaPathRepair) {
     // The installer updated the machine PATH, but this process (and the shell
     // that launched it) started beforehand, so both inherited a stale copy.
@@ -371,10 +470,33 @@ async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
     );
   }
 
+  // Only claim the group was granted if the command that grants it actually ran.
+  // Printing it after a failed `usermod` tells the user to log out for a change
+  // that was never made, and they come back to the same permission error.
+  if (instructions.postInstall && failedCommands.length === 0) {
+    clack.log.warn(instructions.postInstall);
+  }
+
   const recheck = checkContainerRuntime();
   if (recheck.status === 'pass') {
     clack.log.success(recheck.detail);
     return true;
+  }
+
+  // The install worked. Dumping the manual instructions here would contradict
+  // the re-login note printed moments ago and send the user round the loop again.
+  //
+  // Gated on the same condition as the note above, and for the same reason one
+  // step further on: `isGroupPending` reads a permission error off the socket,
+  // and that error looks identical whether the group was granted-but-not-yet-
+  // effective or never granted at all. Telling someone whose `usermod` FAILED to
+  // log out and back in sends them round a loop that can never terminate — they
+  // return to the same error, forever. When the group add did not run, the
+  // manual instructions are the only thing that can actually help.
+  if (isGroupPending(recheck) && failedCommands.length === 0) {
+    clack.log.success(`${engineLabel(engine)} installed.`);
+    reportGroupPending();
+    return false;
   }
 
   clack.log.info('Installed successfully. Now starting the runtime...');
@@ -395,7 +517,7 @@ async function fixContainerRuntime(flagMemory?: string): Promise<boolean> {
  * old outro said only "Fix manually and re-run", leaving the user with no idea
  * what "manually" meant.
  */
-function remediationHint(check: CheckResult): string | null {
+function remediationHint(check: CheckResult, preferredEngine?: EngineName): string | null {
   switch (check.name) {
     case 'auth':
       return 'Run: clustercode login';
@@ -408,13 +530,25 @@ function remediationHint(check: CheckResult): string | null {
         'Then restart your computer.',
       ].join('\n');
     case 'container-runtime':
+      // Nothing is wrong with the install: the daemon is up and the group has
+      // not taken effect. Telling this user to start Docker is the advice that
+      // made the Linux install loop forever.
+      if (isGroupPending(check)) {
+        return [
+          'Docker is running; your user just cannot reach it yet.',
+          'Log out and back in, or for this terminal only:',
+          '  newgrp docker',
+        ].join('\n');
+      }
       // Already installed, just not started — don't tell them to reinstall it.
       if (check.engine) {
         return check.engine.name === 'podman'
           ? ['Start Podman:', '  podman machine init   (first time only)', '  podman machine start'].join('\n')
-          : `Start ${check.engine.name}, then re-run this command.`;
+          : dockerStartHint();
       }
-      return getInstallInstructions().manual;
+      // Nothing installed. Honour an explicit --engine so the last thing on
+      // screen is not instructions for the engine the user declined.
+      return getInstallInstructions(preferredEngine).manual;
     case 'orchestrator':
       return 'Check the orchestrator URL:\n  clustercode config set orchestrator-url <url>';
     default:
@@ -422,11 +556,23 @@ function remediationHint(check: CheckResult): string | null {
   }
 }
 
+/** What to run to get an installed-but-stopped Docker going, per platform. */
+function dockerStartHint(): string {
+  const plan = dockerStartPlan(process.platform, findDockerDesktop());
+  if (plan.kind === 'systemd') return ['Start Docker:', `  ${plan.command}`].join('\n');
+  if (plan.kind === 'manual') return 'Start Docker Desktop, wait for it to report "Engine running", then re-run this command.';
+  return [
+    'Start Docker Desktop:',
+    `  ${plan.command}`,
+    'Wait for it to report "Engine running", then re-run this command.',
+  ].join('\n');
+}
+
 /** Print each failing check with the command that fixes it. */
-function reportRemainingFailures(failures: CheckResult[]): void {
+function reportRemainingFailures(failures: CheckResult[], preferredEngine?: EngineName): void {
   for (const failure of failures) {
     console.log(`  ${pc.red('✗')} ${failure.detail}`);
-    const hint = remediationHint(failure);
+    const hint = remediationHint(failure, preferredEngine);
     if (hint) {
       console.log(hint.split('\n').map((line) => `      ${pc.dim(line)}`).join('\n'));
     }
@@ -453,16 +599,92 @@ export function resolveRequestedMemoryMib(
 }
 
 /**
+ * Say what the runtime has and where its size is set, for the engines this CLI
+ * cannot resize.
+ *
+ * Returning silently here is what made Docker feel unsupported rather than
+ * merely un-configurable: the wizard skipped the whole memory step without a
+ * word, so a Docker user had no way to learn that the number exists, that it
+ * caps their DevBox count, or that a knob for it lives one file away.
+ */
+function reportUnconfigurableMemory(
+  engineName: string,
+  platform: NodeJS.Platform,
+  provider: MachineProvider,
+  hostBytes: number,
+  dedicatedRecommendation: number,
+  reason: string,
+  explicitRequest: boolean,
+): void {
+  if (engineName !== 'podman' && engineName !== 'docker') return;
+  // The PROBED provider, not a re-derived default. Re-deriving it here reopens
+  // the dead end this function exists to close: a Windows Docker install on the
+  // Hyper-V backend would be sent to .wslconfig, which cannot size it.
+  const knob = memoryKnob(engineName, platform, provider);
+  // 'none' means no knob exists anywhere (native Linux). There is nothing to go
+  // do, so on a normal run this would be noise — but someone who typed
+  // `--memory 8192` asked a direct question and deserves a direct answer rather
+  // than silence followed by an unexplained "not applied".
+  if (knob.kind === 'none') {
+    if (explicitRequest) {
+      clack.log.step('Container runtime memory');
+      clack.log.info(`Nothing to apply: ${knob.reason}.`);
+    }
+    return;
+  }
+
+  const current = probeEngineCapacity(engineName);
+  clack.log.step('Container runtime memory');
+  if (current) {
+    const currentMib = Math.floor(current.memTotalBytes / 1024 / 1024);
+    clack.log.info(
+      `Currently ${(currentMib / 1024).toFixed(1)} GiB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)} GiB ` +
+        `— fits ~${estimateDevboxes(currentMib)} default (4 GiB) DevBoxes`,
+    );
+    // Only when the extra memory actually buys a DevBox. Below one whole 4 GiB
+    // slot the recommendation reads as "you are short" while changing nothing,
+    // which is the same empty nudge suppressed in the doctor check.
+    if (estimateDevboxes(dedicatedRecommendation) > estimateDevboxes(currentMib)) {
+      clack.log.info(
+        `A dedicated worker could use up to ${(dedicatedRecommendation / 1024).toFixed(1)} GiB ` +
+          `(~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes).`,
+      );
+    }
+  }
+  // One warning, not two: the caller used to print `probe.reason` as well, so
+  // `--memory` on Docker said the same thing twice in different words.
+  clack.log.warn(
+    knob.kind === 'external'
+      ? `${engineName === 'docker' ? 'Docker' : 'Podman'} memory is not configurable from this CLI — ${knobDestination(knob)}.`
+      : `Cannot set runtime memory: ${reason || knob.reason}`,
+  );
+}
+
+/**
+ * Whether an explicit `--memory` that could not be applied should fail the run.
+ *
+ * Everywhere a knob exists, it should: a CI run that asked for a size, got
+ * none, and exited 0 is indistinguishable from one that worked. Native Linux is
+ * the exception, and not as a courtesy — there is no VM, so the engine already
+ * has the whole host and any request is already met or exceeded. Failing there
+ * would break a fleet script running one `onboard --memory N` across a mixed
+ * estate, on precisely the machines that need it least.
+ */
+function unappliedMemoryIsFailure(knob: MemoryKnob): boolean {
+  return knob.kind !== 'none';
+}
+
+/**
  * Offer to resize the container runtime.
  *
  * Unlike the other steps this runs even when nothing is failing: an
  * under-provisioned runtime is a healthy check, but it silently caps how much
  * work this worker is given.
  */
-async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void> {
+async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boolean> {
   const runtime = checkContainerRuntime();
   const engineName = runtime.engine?.name;
-  if (!engineName) return;
+  if (!engineName) return true;
 
   const hostBytes = totalmem();
   const platform = process.platform;
@@ -476,14 +698,24 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   // otherwise exit 0 having changed nothing.
   if (flagMemory !== undefined && requested === null) {
     clack.log.error(validateRuntimeMemoryMb(flagMemory, hostBytes) ?? 'Invalid --memory value');
-    process.exitCode = 1;
-    return;
+    return false;
   }
 
   const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
   if (probe.kind === 'unsupported') {
-    if (flagMemory) clack.log.warn(`Cannot set runtime memory: ${probe.reason}`);
-    return;
+    reportUnconfigurableMemory(
+      engineName,
+      platform,
+      provider,
+      hostBytes,
+      dedicatedRecommendation,
+      probe.reason ?? '',
+      flagMemory !== undefined,
+    );
+    const knob = engineName === 'podman' || engineName === 'docker'
+      ? memoryKnob(engineName, platform, provider)
+      : null;
+    return flagMemory === undefined || !knob || !unappliedMemoryIsFailure(knob);
   }
 
   const current = probeEngineCapacity(engineName);
@@ -499,13 +731,13 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
 
   let target = requested;
   if (target === null) {
-    if (!process.stdin.isTTY) return;
+    if (!process.stdin.isTTY) return true;
     // 0 means the machine is too small to give anything away without starving
     // the host, for either use. Say so rather than prompting with an invalid
     // default.
     if (dedicatedRecommendation === 0) {
       clack.log.warn('This machine does not have enough RAM to increase the runtime allocation.');
-      return;
+      return true;
     }
 
     // A ceiling is not the same commitment as a reservation, and users
@@ -539,7 +771,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
       message: 'How should the container runtime memory be sized?',
       options: useOptions,
     });
-    if (clack.isCancel(choice) || choice === 'keep') return;
+    if (clack.isCancel(choice) || choice === 'keep') return true;
 
     if (choice === 'dedicated' || choice === 'shared') {
       target = (choice === 'dedicated' ? dedicatedRecommendation : sharedRecommendation) as number;
@@ -552,7 +784,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
         // not `null`. Matches the existing usage in src/commands/login.ts.
         validate: (v = '') => validateRuntimeMemoryMb(v, hostBytes) ?? undefined,
       });
-      if (clack.isCancel(answer)) return;
+      if (clack.isCancel(answer)) return true;
       target = Number(String(answer).trim());
     }
   }
@@ -567,7 +799,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   // never matches and would re-apply (and re-run `wsl --shutdown`) every run.
   if (currentMib !== null && Math.abs(target - currentMib) / target < 0.07) {
     clack.log.info('Already about that size — nothing to change.');
-    return;
+    return true;
   }
 
   const plan = planMemoryApply(provider, process.platform, engineName, target);
@@ -582,7 +814,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
 
   if (process.stdin.isTTY) {
     const ok = await clack.confirm({ message: 'Apply this change?' });
-    if (clack.isCancel(ok) || !ok) return;
+    if (clack.isCancel(ok) || !ok) return true;
   } else if (!flagMemory) {
     // No TTY and no explicit --memory: a stored config value is not consent to
     // restart every WSL distribution on the machine unattended.
@@ -590,14 +822,16 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
       `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
         `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
     );
-    return;
+    return true;
   }
 
   if (plan.kind === 'wslconfig') {
     const written = applyWslMemory(target);
     if (!written.ok) {
       clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
-      return;
+      // An apply that was ATTEMPTED and failed is a stronger failure than one
+      // the CLI declined to attempt, and used to be the quieter of the two.
+      return false;
     }
     clack.log.success(`Updated ${wslConfigPath()}`);
   }
@@ -605,7 +839,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   const ran = runApplySteps(plan.steps);
   if (!ran.ok) {
     clack.log.error(`Failed at: ${ran.failed}`);
-    return;
+    return false;
   }
 
   // Re-probe rather than reporting the requested number: a malformed .wslconfig
@@ -616,9 +850,10 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<void>
   if (after.status === 'pass') clack.log.success(after.detail);
   else clack.log.warn(after.detail);
   clack.log.info('Restart the worker for the new capacity to be advertised.');
+  return true;
 }
 
-export async function runOnboard(opts: { memory?: string } = {}): Promise<void> {
+export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
   try {
     await runOnboardInner(opts);
   } finally {
@@ -626,7 +861,7 @@ export async function runOnboard(opts: { memory?: string } = {}): Promise<void> 
   }
 }
 
-async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
+async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
   clack.intro(pc.bold('ClusterCode Onboarding'));
 
   const spinner = clack.spinner();
@@ -640,8 +875,18 @@ async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
     // Explicitly clear the exit code: doctor sets process.exitCode = 1 before
     // delegating here, and a "everything looks good" outcome must not exit 1.
     process.exitCode = 0;
-    await offerRuntimeMemory(opts.memory);
-    clack.outro(pc.green('Everything looks good! No issues to fix.'));
+    // The memory step can fail on its own - an explicit --memory this CLI could
+    // not apply - and closing with "everything looks good" over a non-zero exit
+    // is the kind of contradiction a CI log gets read for. The step reports its
+    // own outcome rather than writing process.exitCode, because the OTHER call
+    // site below re-runs the checks afterwards and would overwrite it.
+    const memoryOk = await offerRuntimeMemory(opts.memory);
+    if (!memoryOk) process.exitCode = 1;
+    clack.outro(
+      memoryOk
+        ? pc.green('Everything looks good! No issues to fix.')
+        : pc.yellow('Checks passed, but the requested runtime memory was not applied.'),
+    );
     return;
   }
 
@@ -652,7 +897,7 @@ async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
     clack.log.warn(
       `${failures.length} ${failures.length === 1 ? 'issue' : 'issues'} found, but there is no interactive terminal to run the setup prompts:\n`,
     );
-    reportRemainingFailures(failures);
+    reportRemainingFailures(failures, opts.engine);
     process.exitCode = 1;
     clack.outro(pc.yellow('Re-run ' + pc.bold('clustercode onboard') + ' from an interactive terminal.'));
     return;
@@ -702,7 +947,7 @@ async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
   // Fix: container runtime
   if (failures.some((f) => f.name === 'container-runtime')) {
     clack.log.step('Container runtime not available');
-    await fixContainerRuntime(opts.memory);
+    await fixContainerRuntime(opts.memory, opts.engine);
   }
 
   // Fix: orchestrator connectivity
@@ -713,7 +958,7 @@ async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
     );
   }
 
-  await offerRuntimeMemory(opts.memory);
+  const memoryOk = await offerRuntimeMemory(opts.memory);
 
   // Pre-warm the worker binary so the first `clustercode worker` starts instantly.
   const { readInstalled, ensureWorkerBinary } = await import('../lib/worker-binary.js');
@@ -750,14 +995,21 @@ async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
 
   const remainingFailures = finalResults.filter((r) => r.status === 'fail');
   if (remainingFailures.length === 0) {
-    process.exitCode = 0;
-    clack.outro(pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.'));
+    // Fixing the checks does not retroactively apply a --memory this CLI could
+    // not apply. Reporting "all issues resolved" and exiting 0 here is how the
+    // memory failure used to vanish on the path where the wizard did work.
+    process.exitCode = memoryOk ? 0 : 1;
+    clack.outro(
+      memoryOk
+        ? pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.')
+        : pc.yellow('Issues resolved, but the requested runtime memory was not applied.'),
+    );
     return;
   }
 
   // Print the actual remediation for each remaining failure. This lands last so
   // it can't be pushed off-screen by a later step's success message.
-  reportRemainingFailures(remainingFailures);
+  reportRemainingFailures(remainingFailures, opts.engine);
 
   process.exitCode = 1;
   clack.outro(
@@ -765,9 +1017,21 @@ async function runOnboardInner(opts: { memory?: string } = {}): Promise<void> {
   );
 }
 
+export interface OnboardOptions {
+  memory?: string;
+  /** Which engine to install when none is present. Ignored when one already is. */
+  engine?: EngineName;
+}
+
 export const onboardCommand = new Command('onboard')
   .description('Interactive setup wizard — fix all health check issues')
   .option('--memory <mb>', 'Memory (MB) to allocate to the container runtime')
-  .action(async (opts: { memory?: string }) => {
-    await runOnboard(opts);
+  .option('--engine <name>', 'Container engine to install if none is present (podman|docker)')
+  .action(async (opts: { memory?: string; engine?: string }) => {
+    if (opts.engine !== undefined && opts.engine !== 'podman' && opts.engine !== 'docker') {
+      console.error(`Unknown engine "${opts.engine}". Use podman or docker.`);
+      process.exitCode = 1;
+      return;
+    }
+    await runOnboard({ memory: opts.memory, engine: opts.engine as EngineName | undefined });
   });

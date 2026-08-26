@@ -84,6 +84,25 @@ describe('onboard', () => {
     assert.match(stdout, /setup|wizard|fix/i);
   });
 
+  it('onboard --help documents both engine choices', () => {
+    const { stdout } = runCli(['onboard', '--help'], { isolateHome: false });
+    assert.match(stdout, /--engine/);
+    assert.match(stdout, /podman\|docker/);
+  });
+
+  // A typo must not fall through to "install nothing and exit 0". The flag is
+  // validated before the wizard opens rather than at the point of use, so the
+  // failure is a message about the flag instead of a wizard that runs, asks
+  // which engine to install, and quietly ignores what was passed.
+  it('onboard rejects an unknown --engine value before doing anything', () => {
+    const { stdout, exitCode } = runCli(['onboard', '--engine', 'podmn']);
+    assert.equal(exitCode, 1);
+    assert.match(stdout, /Unknown engine "podmn"/);
+    assert.match(stdout, /podman or docker/);
+    // Nothing ran: the wizard never opened its box.
+    assert.doesNotMatch(stdout, /ClusterCode Onboarding/);
+  });
+
   it('onboard with no issues to fix runs checks', () => {
     // Pre-seed credentials and worker config so auth + worker checks pass
     writeCredentials('onboard-test@clustercode.io');

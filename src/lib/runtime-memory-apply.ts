@@ -3,6 +3,8 @@ import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { patchWslConfig, type MachineProvider } from './runtime-memory.js';
+import { memoryKnob } from './memory-knob.js';
+import type { EngineName } from './engine-install.js';
 
 export interface ApplyPlan {
   kind: 'wslconfig' | 'machine-set' | 'unsupported';
@@ -16,9 +18,9 @@ export interface ApplyPlan {
 /**
  * Decide how (and whether) this machine's runtime memory can be changed.
  *
- * The WSL provider ignores podman's own memory settings entirely — `machine
- * init --memory` is silently dropped and `machine set --memory` hard-errors —
- * so on Windows the only real knob is WSL's own global config.
+ * Whether it can be changed at all is not decided here — `memoryKnob()` owns
+ * that, so the `doctor` check and this planner cannot drift apart. All this
+ * function adds is the command sequence for the cases the CLI does own.
  */
 export function planMemoryApply(
   provider: MachineProvider,
@@ -26,26 +28,25 @@ export function planMemoryApply(
   engineName: string,
   memoryMib: number,
 ): ApplyPlan {
-  if (platform === 'linux') {
+  // An engine we do not recognise gets no command sequence at all. Coercing
+  // anything non-Docker to Podman meant a future engine name, or an empty one,
+  // would be handed `podman machine set` or a .wslconfig rewrite on a machine
+  // with no Podman on it.
+  if (engineName !== 'podman' && engineName !== 'docker') {
     return {
       kind: 'unsupported',
       steps: [],
-      reason: 'Podman on Linux runs containers directly — there is no virtual machine to size',
+      reason: `Unknown container engine "${engineName}" — this CLI can only size Podman`,
     };
   }
+  const engine: EngineName = engineName;
+  const knob = memoryKnob(engine, platform, provider);
 
-  if (engineName === 'docker') {
-    return {
-      kind: 'unsupported',
-      steps: [],
-      reason:
-        platform === 'win32'
-          ? 'Docker memory is governed by [wsl2] memory= in .wslconfig (WSL2 backend) or by Docker Desktop settings (Hyper-V backend) — set it there, not from the CLI'
-          : 'Docker memory is set in Docker Desktop settings, not from the CLI',
-    };
+  if (knob.kind !== 'cli') {
+    return { kind: 'unsupported', steps: [], reason: knob.reason };
   }
 
-  if (provider === 'wsl') {
+  if (knob.via === 'wslconfig') {
     return {
       kind: 'wslconfig',
       steps: [`Set memory=${memoryMib}MB in .wslconfig`, 'wsl --shutdown', 'podman machine start'],
@@ -53,21 +54,13 @@ export function planMemoryApply(
     };
   }
 
-  if (provider === 'applehv' || provider === 'hyperv' || provider === 'qemu') {
-    return {
-      kind: 'machine-set',
-      steps: [
-        'podman machine stop',
-        `podman machine set --memory ${memoryMib}`,
-        'podman machine start',
-      ],
-    };
-  }
-
   return {
-    kind: 'unsupported',
-    steps: [],
-    reason: 'Could not determine the Podman machine type',
+    kind: 'machine-set',
+    steps: [
+      'podman machine stop',
+      `podman machine set --memory ${memoryMib}`,
+      'podman machine start',
+    ],
   };
 }
 

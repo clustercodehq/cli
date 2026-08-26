@@ -63,6 +63,68 @@ function execSilent(cmd: string): string | null {
   }
 }
 
+/**
+ * Run a probe, keeping whatever it wrote to stderr on failure.
+ *
+ * `execSilent` throws the reason away, which is fine for "is this installed"
+ * but not for `docker info`: a daemon that is down and a daemon the current
+ * user is not permitted to reach both fail, and they need opposite advice.
+ */
+function execProbe(cmd: string): { ok: boolean; stderr: string } {
+  try {
+    execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] });
+    return { ok: true, stderr: '' };
+  } catch (err) {
+    const e = err as { stderr?: Buffer | string };
+    const raw = e.stderr;
+    const stderr = raw === undefined ? '' : typeof raw === 'string' ? raw : decodeConsoleOutput(raw);
+    return { ok: false, stderr };
+  }
+}
+
+/**
+ * Did this fail because the user is not in the `docker` group?
+ *
+ * A fresh Linux Docker install adds the user to that group, but group
+ * membership is only read at login, so `docker info` in the very session that
+ * ran the install is refused. Without this distinction the wizard reports
+ * "found but not running" and sends the user to `systemctl start docker` —
+ * which is already running — so they follow that advice forever and never
+ * learn that a re-login is the actual fix.
+ */
+export function isSocketPermissionError(stderr: string): boolean {
+  return /permission denied/i.test(stderr) && /docker\.sock|dial unix|connect/i.test(stderr);
+}
+
+/** Detail text for an engine that is running but unreachable by this user. */
+/**
+ * The phrase both "running, but you cannot reach it" details share, and the one
+ * `checkRuntimeMemory` matches on to tell a denied engine from a stopped one.
+ *
+ * A function rather than a `const` because checks.ts and runtime-memory.ts
+ * import each other: whichever module the process enters first leaves the
+ * other's top-level bindings in the temporal dead zone, and a `const` read
+ * across that cycle throws. Function declarations are hoisted, so this one is
+ * callable from either entry order.
+ */
+export function socketDeniedPhrase(): string {
+  return 'not permitted for this user';
+}
+
+export const DOCKER_GROUP_PENDING =
+  `${socketDeniedPhrase()} — log out and back in to pick up the \`docker\` group`;
+
+/**
+ * The same symptom on any other engine.
+ *
+ * Only Docker's install puts the user in a group, so only Docker's failure is
+ * cured by logging out. Rootless Podman has no `docker` group to join: a denied
+ * socket there means something else entirely (a rootful socket, a stale
+ * CONTAINER_HOST), and sending that user to `newgrp docker` is advice for a
+ * different product.
+ */
+export const SOCKET_NOT_PERMITTED = `running, but its socket is ${socketDeniedPhrase()}`;
+
 export function checkAuth(): CheckResult {
   const creds = readCredentials();
   if (!creds) {
@@ -202,17 +264,33 @@ function evaluateEngine(engine: DetectedEngine): CheckResult {
   // For Podman on macOS/Windows, check machine status directly since `podman info`
   // can exit non-zero even when a machine is running (socket connection issues).
   const needsMachine = engine.name === 'podman' && (process.platform === 'darwin' || process.platform === 'win32');
-  const usable = needsMachine ? isPodmanMachineRunning() : execSilent(`${engine.name} info`) !== null;
+  if (needsMachine) {
+    return isPodmanMachineRunning()
+      ? { name: 'container-runtime', status: 'pass', detail: label, engine: engineInfo }
+      : {
+          name: 'container-runtime',
+          status: 'fail',
+          // Status only — onboarding prints the start commands as this check's remediation.
+          detail: `${label} found but not running`,
+          engine: engineInfo,
+        };
+  }
 
-  return usable
-    ? { name: 'container-runtime', status: 'pass', detail: label, engine: engineInfo }
-    : {
-        name: 'container-runtime',
-        status: 'fail',
-        // Status only — onboarding prints the start commands as this check's remediation.
-        detail: `${label} found but not running`,
-        engine: engineInfo,
-      };
+  const probe = execProbe(`${engine.name} info`);
+  if (probe.ok) {
+    return { name: 'container-runtime', status: 'pass', detail: label, engine: engineInfo };
+  }
+
+  return {
+    name: 'container-runtime',
+    status: 'fail',
+    detail: !isSocketPermissionError(probe.stderr)
+      ? `${label} found but not running`
+      : engine.name === 'docker'
+        ? `${label} is running, but ${DOCKER_GROUP_PENDING}`
+        : `${label} is ${SOCKET_NOT_PERMITTED}`,
+    engine: engineInfo,
+  };
 }
 
 export function checkContainerRuntime(): CheckResult {

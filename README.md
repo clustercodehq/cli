@@ -81,12 +81,48 @@ clustercode onboard --memory 8192
 ```
 
 On Windows, this is governed by `.wslconfig`; applying a change restarts every
-WSL distribution on the machine.
+WSL distribution on the machine. On native Linux there is nothing to apply —
+containers run directly on the host, so nothing caps them below your RAM and
+`--memory` reports that instead of changing anything.
 
 On Windows, a container engine installed by the wizard is not on the PATH that
 the current terminal inherited, so the CLI re-resolves it from the default
 install location for the rest of the session. Open a new terminal to use
 `podman` directly.
+
+#### Choosing a container engine
+
+When no engine is installed, the wizard asks which one to set up. Pass
+`--engine podman` or `--engine docker` to skip the question:
+
+```bash
+clustercode onboard --engine docker
+```
+
+The two are not equivalent, and the difference is memory:
+
+| | Podman | Docker |
+|---|---|---|
+| `doctor` reports memory and DevBox capacity | yes | yes |
+| Same sizing math, warnings and nudges | yes | yes |
+| `onboard --memory` can apply a change | yes, on Windows and macOS | **no** |
+| Automatic install | Windows, macOS, Debian/Ubuntu, Fedora, RHEL-likes | same, minus RHEL-likes |
+| Usable without further steps | yes | Linux needs a re-login |
+
+Podman is recommended for the memory reason alone. Choosing Docker is fully
+supported: the wizard installs it (winget on Windows, the `docker-desktop` cask
+on macOS, your distribution's package on Debian/Ubuntu and Fedora) and says up
+front where its memory knob actually lives — `[wsl2] memory=` in `.wslconfig`
+on Windows, since Docker Desktop's own slider is disabled under the WSL2
+backend, and Docker Desktop > Settings > Resources on macOS.
+
+On native Linux neither engine has a memory knob: containers run as host
+processes, so nothing caps them below your RAM. What Docker needs there and
+Podman does not is group membership — the install runs
+`sudo usermod -aG docker` for the invoking user (the account behind `sudo`, not
+`root`), and group changes only apply at login, so the
+wizard tells you to log out and back in (or run `newgrp docker`) before
+`docker` works without `sudo`.
 
 #### Sizing your worker
 
