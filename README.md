@@ -9,12 +9,8 @@ exits with an explanation if the version is too old — earlier versions fail to
 load at all, with an error pointing inside `node_modules`.
 
 ```bash
-npm install -g @clustercode/cli@alpha
+npm install -g @clustercode/cli
 ```
-
-> This is an alpha prerelease published under the `alpha` dist-tag, so install it
-> explicitly with `@alpha` (a bare `@clustercode/cli` resolves to `latest`, which
-> has no stable release yet).
 
 The `clustercode` command is then available globally.
 
