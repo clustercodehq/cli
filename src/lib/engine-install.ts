@@ -4,13 +4,13 @@
  *
  * Two engines are supported and they are not equivalent. Podman is the default
  * because the CLI can size its memory allocation on every platform we support;
- * Docker is diagnosed but never resized (see `memoryKnob`). Anywhere
+ * Docker is diagnosed but never resized (see `resourceKnob`). Anywhere
  * the wizard offers a choice, that difference has to be stated — picking Docker
  * without knowing it forfeits `--memory` is the failure mode this module exists
  * to prevent.
  */
 
-import { memoryKnob } from './memory-knob.js';
+import { resourceKnob } from './resource-knob.js';
 
 export type EngineName = 'podman' | 'docker';
 export type LinuxDistro = 'debian' | 'fedora' | 'rhel' | 'unknown';
@@ -271,7 +271,7 @@ export function dockerDesktopCandidates(platform: NodeJS.Platform, env: NodeJS.P
  * from a two-item list deserves to know that before they pick.
  */
 function dockerHint(platform: NodeJS.Platform, distro: LinuxDistro): string {
-  const knob = memoryKnob('docker', platform);
+  const knob = resourceKnob('memory', 'docker', platform);
   if (knob.kind === 'external') {
     return `memory is not configurable from the CLI — ${knob.where}`;
   }

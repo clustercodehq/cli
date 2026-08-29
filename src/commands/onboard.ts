@@ -20,10 +20,10 @@ import {
   devboxFitTable,
   formatFitTable,
 } from '../lib/runtime-memory.js';
-import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
+import { planResourceApply, applyWslSetting, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
 import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
-import { memoryKnob, type MemoryKnob } from '../lib/memory-knob.js';
+import { resourceKnob, type ResourceKnob } from '../lib/resource-knob.js';
 import type { MachineProvider } from '../lib/runtime-memory.js';
 import {
   installInstructions,
@@ -281,7 +281,7 @@ async function startContainerRuntime(engineName: string, flagMemory?: string): P
 }
 
 /** The knob's destination plus whatever else the user has to do afterwards. */
-function knobDestination(knob: MemoryKnob): string {
+function knobDestination(knob: ResourceKnob): string {
   return knob.followUp ? `${knob.where}, ${knob.followUp}` : knob.where;
 }
 
@@ -326,7 +326,7 @@ async function chooseEngine(flagEngine?: EngineName): Promise<EngineName | null>
     engine = picked as EngineName;
   }
 
-  const knob = memoryKnob(engine, process.platform);
+  const knob = resourceKnob('memory', engine, process.platform);
   if (knob.kind === 'external') {
     clack.log.warn(
       `${engineLabel(engine)}: ClusterCode cannot set the container runtime memory for you — ` +
@@ -620,7 +620,7 @@ function reportUnconfigurableMemory(
   // The PROBED provider, not a re-derived default. Re-deriving it here reopens
   // the dead end this function exists to close: a Windows Docker install on the
   // Hyper-V backend would be sent to .wslconfig, which cannot size it.
-  const knob = memoryKnob(engineName, platform, provider);
+  const knob = resourceKnob('memory', engineName, platform, provider);
   // 'none' means no knob exists anywhere (native Linux). There is nothing to go
   // do, so on a normal run this would be noise — but someone who typed
   // `--memory 8192` asked a direct question and deserves a direct answer rather
@@ -670,7 +670,7 @@ function reportUnconfigurableMemory(
  * would break a fleet script running one `onboard --memory N` across a mixed
  * estate, on precisely the machines that need it least.
  */
-function unappliedMemoryIsFailure(knob: MemoryKnob): boolean {
+function unappliedMemoryIsFailure(knob: ResourceKnob): boolean {
   return knob.kind !== 'none';
 }
 
@@ -701,7 +701,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     return false;
   }
 
-  const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
+  const probe = planResourceApply('memory', provider, platform, engineName, requested ?? dedicatedRecommendation);
   if (probe.kind === 'unsupported') {
     reportUnconfigurableMemory(
       engineName,
@@ -713,7 +713,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
       flagMemory !== undefined,
     );
     const knob = engineName === 'podman' || engineName === 'docker'
-      ? memoryKnob(engineName, platform, provider)
+      ? resourceKnob('memory', engineName, platform, provider)
       : null;
     return flagMemory === undefined || !knob || !unappliedMemoryIsFailure(knob);
   }
@@ -802,7 +802,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     return true;
   }
 
-  const plan = planMemoryApply(provider, process.platform, engineName, target);
+  const plan = planResourceApply('memory', provider, process.platform, engineName, target);
   clack.log.info(['Will run:', ...plan.steps.map((s) => `  ${pc.dim(s)}`)].join('\n'));
   if (plan.warning) clack.log.warn(plan.warning);
 
@@ -826,7 +826,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   }
 
   if (plan.kind === 'wslconfig') {
-    const written = applyWslMemory(target);
+    const written = applyWslSetting('memory', target);
     if (!written.ok) {
       clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
       // An apply that was ATTEMPTED and failed is a stronger failure than one
