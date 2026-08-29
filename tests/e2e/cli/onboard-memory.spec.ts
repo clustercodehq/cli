@@ -172,12 +172,47 @@ describe('onboard memory step on an engine the CLI cannot size', () => {
 
   // The warning used to be printed twice - once as the planner's raw reason and
   // once as the wizard's own phrasing - saying the same thing in different words.
+  // Scoped to the memory warning specifically. The CPU step runs on the same
+  // engine and correctly prints its own; an unscoped count would read that
+  // second, different warning as this bug returning.
   it('warns once, not twice', () => {
     seedConfigs();
     createDockerStub(EIGHT_GIB);
 
     const { stdout } = runOnboard(['--memory', '8192']);
-    const warnings = stdout.match(/Cannot set runtime memory|not configurable from this CLI/g) ?? [];
+    const warnings = stdout.match(/Cannot set runtime memory|Docker memory is not configurable/g) ?? [];
     assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}:\n${stdout}`);
+  });
+
+  // The CPU step is a separate surface with the same failure mode.
+  it('warns once about CPU too, and separately from memory', () => {
+    seedConfigs();
+    createDockerStub(EIGHT_GIB);
+
+    const { stdout } = runOnboard(['--cpus', '4']);
+    const warnings = stdout.match(/Cannot set runtime CPU|Docker CPU is not configurable/g) ?? [];
+    assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}:\n${stdout}`);
+  });
+
+  // Same contract as --memory: a request the CLI could not apply must not exit 0.
+  it('does not claim success when --cpus could not be applied', () => {
+    seedConfigs();
+    createDockerStub(EIGHT_GIB);
+
+    const { stdout, exitCode } = runOnboard(['--cpus', '4']);
+    assert.equal(exitCode, 1, stdout);
+    assert.doesNotMatch(stdout, /Everything looks good/);
+    assert.match(stdout, /runtime CPU was not applied/);
+  });
+
+  // Both unapplied, one sentence. A run naming only memory would leave the
+  // reader to discover the CPU request had also been dropped.
+  it('names both resources when neither could be applied', () => {
+    seedConfigs();
+    createDockerStub(EIGHT_GIB);
+
+    const { stdout, exitCode } = runOnboard(['--memory', '8192', '--cpus', '4']);
+    assert.equal(exitCode, 1, stdout);
+    assert.match(stdout, /runtime memory and CPU was not applied/);
   });
 });

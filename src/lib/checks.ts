@@ -12,8 +12,9 @@ import {
 import { readInstalled } from './worker-binary.js';
 import { augmentPathWithKnownEngineDirs, resolveExecutable } from './env-path.js';
 import { checkRuntimeMemory } from './runtime-memory.js';
+import { checkRuntimeCpu } from './runtime-cpu.js';
 
-export { checkRuntimeMemory };
+export { checkRuntimeMemory, checkRuntimeCpu };
 
 export interface CheckResult {
   name: string;
@@ -109,6 +110,26 @@ export function isSocketPermissionError(stderr: string): boolean {
  */
 export function socketDeniedPhrase(): string {
   return 'not permitted for this user';
+}
+
+/**
+ * Why a resource reading is unavailable, for the checks that measure the engine
+ * rather than find it.
+ *
+ * "Start it" is the right advice for a stopped engine and the wrong advice for
+ * one that is running and merely unreachable - that user starts what is already
+ * started, gets the same error, and repeats. The container-runtime check has
+ * already told them the real fix, so point at it rather than contradicting it a
+ * line below.
+ *
+ * Shared by the memory and CPU checks so the two cannot describe the same
+ * engine differently. Hoisted for the same reason `socketDeniedPhrase` is: this
+ * module and the ones that call it import each other.
+ */
+export function unavailableReason(runtime: CheckResult, engineName: string): string {
+  return runtime.detail.includes(socketDeniedPhrase())
+    ? `${engineName} is not reachable by this user (see above)`
+    : 'start the container runtime and re-run to measure it';
 }
 
 export const DOCKER_GROUP_PENDING =
@@ -416,6 +437,7 @@ export async function runAllChecks(): Promise<CheckResult[]> {
   results.push(
     containerRuntime,
     checkRuntimeMemory(containerRuntime),
+    checkRuntimeCpu(containerRuntime),
     checkDiskSpace(),
     checkMemory(),
   );

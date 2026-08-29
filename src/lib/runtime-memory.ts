@@ -295,7 +295,7 @@ export function patchWslConfig(
 import { execSync } from 'node:child_process';
 import { totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
-import { decodeConsoleOutput, socketDeniedPhrase } from './checks.js';
+import { decodeConsoleOutput, unavailableReason } from './checks.js';
 // Imported from the underlying store, not from './config.js': config.ts
 // imports MIN_RUNTIME_MEMORY_MIB from this module, and importing config.ts
 // back here would create a cycle.
@@ -527,18 +527,10 @@ export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
   }
 
   if (runtime.status !== 'pass') {
-    // "Start it" is the right advice for a stopped engine and the wrong advice
-    // for one that is running and merely unreachable — that user starts what is
-    // already started, gets the same error, and repeats. The container-runtime
-    // check has already told them the real fix, so point at it rather than
-    // contradicting it one line below.
-    const denied = runtime.detail.includes(socketDeniedPhrase());
     return {
       name: 'runtime-memory',
       status: 'warn',
-      detail: denied
-        ? `Runtime memory unknown — ${engineName} is not reachable by this user (see above)`
-        : 'Runtime memory unknown — start the container runtime and re-run to measure it',
+      detail: `Runtime memory unknown — ${unavailableReason(runtime, engineName)}`,
     };
   }
 
