@@ -8,6 +8,7 @@
  */
 
 import { memoryKnob } from './memory-knob.js';
+import { patchWslConfigEntry, wslMemoryEntry } from './wslconfig.js';
 import type { EngineName } from './engine-install.js';
 
 export type MachineProvider = 'wsl' | 'hyperv' | 'applehv' | 'qemu' | 'unknown';
@@ -107,13 +108,50 @@ export function recommendRuntimeMemoryMib(hostBytes: number): number {
 export type MachineUse = 'dedicated' | 'shared';
 
 /**
- * Memory the host OS keeps for itself, by platform and how the machine is
- * used. Linux has no VM in the way, so there is nothing to reserve on its
- * behalf — the container runtime *is* the host.
+ * Whether the VM is made to give memory back to the host while it runs.
+ *
+ * This is the difference between a ceiling and a claim. A VM that reclaims
+ * hovers near its working set and only approaches the ceiling under load; one
+ * that does not creeps up to the ceiling and stays there, because everything it
+ * has ever touched (the guest's page cache above all) remains charged to the
+ * host until the VM is shut down.
  */
-export function hostReserveMib(platform: NodeJS.Platform, use: MachineUse): number {
+export type HostReclaim = 'enforced' | 'none';
+
+/** Floor on the no-reclaim reserve — the same figure `LEAVE_HOST_MIB` uses. */
+const NO_RECLAIM_RESERVE_MIN_MIB = LEAVE_HOST_MIB;
+/** ...and a proportional share on top, so a large host keeps a large reserve. */
+const NO_RECLAIM_RESERVE_SHARE = 0.25;
+
+/**
+ * Memory the host OS keeps for itself, by platform, how the machine is used,
+ * and whether the VM ever gives memory back.
+ *
+ * Linux has no VM in the way, so there is nothing to reserve on its behalf —
+ * the container runtime *is* the host.
+ *
+ * Without reclaim the VM must be assumed fully inflated: the reserve then has
+ * to cover the host's whole working set rather than its idle footprint, which
+ * is why the dedicated reserve rises to `max(8192, 25% of host)`. The shared
+ * reserve is already sized for a machine someone works on, so it does not move.
+ *
+ * `reclaim` is a required argument on purpose: a caller that forgets it would
+ * otherwise silently keep the optimistic table, which is the exact failure this
+ * function exists to prevent.
+ */
+export function hostReserveMib(
+  platform: NodeJS.Platform,
+  use: MachineUse,
+  reclaim: HostReclaim,
+  hostMib: number,
+): number {
   if (platform === 'linux') return 0;
-  return use === 'dedicated' ? 6144 : 12288;
+  if (use === 'shared') return 12288;
+  if (reclaim === 'enforced') return 6144;
+  return Math.max(
+    NO_RECLAIM_RESERVE_MIN_MIB,
+    Math.floor(Math.max(0, hostMib) * NO_RECLAIM_RESERVE_SHARE),
+  );
 }
 
 /**
@@ -128,10 +166,11 @@ export function recommendForUse(
   hostBytes: number,
   platform: NodeJS.Platform,
   use: MachineUse,
+  reclaim: HostReclaim,
 ): number {
   if (!Number.isFinite(hostBytes) || hostBytes <= 0) return 0;
   const hostMib = Math.floor(hostBytes / MIB);
-  const reserve = hostReserveMib(platform, use);
+  const reserve = hostReserveMib(platform, use, reclaim, hostMib);
 
   const raw =
     use === 'dedicated' ? hostMib - reserve : Math.min(Math.floor(hostMib * 0.5), hostMib - reserve);
@@ -228,55 +267,7 @@ export function formatFitTable(rows: FitRow[]): string {
  * unrelated sections all survive verbatim.
  */
 export function patchWslConfig(existing: string | null, memoryMib: number): string {
-  if (!Number.isFinite(memoryMib) || memoryMib <= 0) {
-    throw new Error('WSL memory must be a positive number of MiB');
-  }
-  // WSL treats an unsuffixed size as BYTES, so the suffix is mandatory.
-  const entry = `memory=${memoryMib}MB`;
-
-  if (!existing || existing.trim() === '') return `[wsl2]\n${entry}\n`;
-
-  const eol = existing.includes('\r\n') ? '\r\n' : '\n';
-  const lines = existing.split(/\r?\n/);
-
-  // The optional `[;#]` tail matters: a hand-edited .wslconfig often carries a
-  // trailing comment on the section line. Without it we would not recognize the
-  // section, append a SECOND [wsl2] block, and the user's setting could silently
-  // never take effect while we report success.
-  const isSectionHeader = (line: string) => /^\s*\[[^\]]*\]\s*([;#].*)?$/.test(line);
-  const isWsl2Header = (line: string) => /^\s*\[\s*wsl2\s*\]\s*([;#].*)?$/i.test(line);
-  const isMemoryKey = (line: string) => /^\s*memory\s*=/i.test(line);
-
-  const headerIdx = lines.findIndex(isWsl2Header);
-
-  if (headerIdx === -1) {
-    // No [wsl2] section: append one, keeping a blank line before it.
-    const body = existing.replace(/\s*$/, '');
-    return `${body}${eol}${eol}[wsl2]${eol}${entry}${eol}`;
-  }
-
-  // Find the end of the [wsl2] section (next header, or EOF).
-  let endIdx = lines.length;
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    if (isSectionHeader(lines[i])) {
-      endIdx = i;
-      break;
-    }
-  }
-
-  const memoryIdx = lines.findIndex(
-    (line, i) => i > headerIdx && i < endIdx && isMemoryKey(line),
-  );
-
-  if (memoryIdx !== -1) {
-    lines[memoryIdx] = entry;
-  } else {
-    lines.splice(headerIdx + 1, 0, entry);
-  }
-
-  let out = lines.join(eol);
-  if (!out.endsWith(eol)) out += eol;
-  return out;
+  return patchWslConfigEntry(existing, wslMemoryEntry(memoryMib));
 }
 
 import { execSync } from 'node:child_process';
@@ -287,6 +278,7 @@ import { decodeConsoleOutput, socketDeniedPhrase } from './checks.js';
 // imports MIN_RUNTIME_MEMORY_MIB from this module, and importing config.ts
 // back here would create a cycle.
 import { readAppConfig } from './config-store/index.js';
+import { probeHostReclaim, type HostReclaimStatus } from './host-reclaim.js';
 
 export interface RuntimeMemoryReading {
   engine: EngineCapacity | null;
@@ -305,6 +297,18 @@ export interface RuntimeMemoryReading {
    * unprobed reading would have to name both.
    */
   provider?: MachineProvider;
+  /**
+   * Whether the VM returns memory to the host while it runs. Absent means "not
+   * probed", which is graded as pessimistically as `'off'`: a recommendation
+   * built on an assumption of reclaim that turns out to be wrong is the exact
+   * shape of the failure this field was added for.
+   */
+  reclaim?: HostReclaimStatus;
+}
+
+/** How a probed reclaim status feeds the sizing math. */
+function reclaimForSizing(status: HostReclaimStatus | undefined): HostReclaim {
+  return status === 'enforced' ? 'enforced' : 'none';
 }
 
 /** A reading within this fraction of the configured value counts as "that value". */
@@ -369,9 +373,51 @@ function dedicatedNudge(
   return ` (dedicated worker? up to ${gib(dedicatedRecommendation * MIB)} GiB — ${knobAction(engineName, platform, provider)})`;
 }
 
+/**
+ * What to add to an otherwise-passing line when the host is not actually
+ * getting its reserve back.
+ *
+ * A runtime of a perfectly reasonable size is still a problem when nothing ever
+ * returns what it borrows: `memory=` stops being a ceiling the VM hovers below
+ * and becomes a floor it climbs to. Nothing else in this check can see that,
+ * because every number it compares is a number the runtime was promised.
+ *
+ * Returns '' when there is nothing to say, so the caller keeps its existing
+ * grade. One clause, no newline — `doctor` prints one line per check.
+ */
+function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): string {
+  const { platform, provider, reclaim, engineName, hostBytes } = reading;
+  if (platform !== 'win32') return '';
+  // Only the WSL backend reads .wslconfig; Hyper-V has no such setting, and
+  // saying otherwise sends that user to a file that cannot affect them.
+  if (provider !== undefined && provider !== 'wsl') return '';
+
+  const held = 'memory reclaim is off, so the runtime keeps memory the host may need';
+
+  if (reclaim === 'off') {
+    return engineName === 'docker'
+      ? ` — ${held}; set [experimental] autoMemoryReclaim=gradual in .wslconfig, then \`wsl --shutdown\``
+      : ` — ${held}; run \`clustercode onboard\` to enable it`;
+  }
+
+  if (reclaim === 'unsupported') {
+    const ceiling = recommendForUse(hostBytes, platform, 'dedicated', 'none');
+    const base = ' — memory reclaim needs WSL 2.0 or newer, so the runtime keeps everything it touches';
+    // Only name a smaller number than the runtime already has: telling someone
+    // to lower a 16 GiB runtime to 23 GiB is not an instruction.
+    if (ceiling <= 0 || engineMib <= ceiling) return base;
+    return engineName === 'docker'
+      ? `${base}; lower [wsl2] memory= to ${ceiling}MB`
+      : `${base}; lower to \`clustercode onboard --memory ${ceiling}\``;
+  }
+
+  return '';
+}
+
 export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
-  const { engine, hostBytes, engineName, platform, configuredMib, provider } = reading;
+  const { engine, hostBytes, engineName, platform, configuredMib, provider, reclaim } = reading;
   const name = 'runtime-memory';
+  const sizingReclaim = reclaimForSizing(reclaim);
 
   if (!engine) {
     return {
@@ -397,10 +443,11 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
   // Warn only when the engine is below what we would suggest for a *shared*
   // machine — a dedicated worker at ~50% of the host is a deliberate,
   // correct choice, not a problem to nag about on every run.
-  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared');
+  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared', sizingReclaim);
   const belowSharedRecommendation = hostBytes > 0 && engineMib < sharedRecommendation;
   const deliberate = isDeliberateChoice(engineMib, configuredMib);
-  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated');
+  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated', sizingReclaim);
+  const reclaimNote = reclaimAdvice(reading, engineMib);
 
   if (engineName === 'docker') {
     const base = `Docker memory: ${gib(engine.memTotalBytes)} GiB of ${gib(hostBytes)} GiB host — ${fitPhrase(devboxes)}`;
@@ -414,6 +461,9 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     if (belowSharedRecommendation && !deliberate) {
       return { name, status: 'warn', detail: `${base} — more host memory is available; ${where}` };
     }
+    // A runtime that is holding the host's memory is not a passing reading, and
+    // the nudge (which asks for MORE memory) would be exactly wrong there.
+    if (reclaimNote) return { name, status: 'warn', detail: `${base}${reclaimNote}` };
     // Nothing to do beyond a possible nudge: do not append an action the
     // user has no reason to take.
     return {
@@ -436,6 +486,8 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
       detail: `${base} — more host memory is available; raise with \`clustercode onboard --memory ${dedicatedRecommendation}\``,
     };
   }
+
+  if (reclaimNote) return { name, status: 'warn', detail: `${base}${reclaimNote}` };
 
   return {
     name,
@@ -502,7 +554,48 @@ export function probeEngineCapacity(engineName: string): EngineCapacity | null {
  * on Windows, and doctor is spawned by many e2e tests) and keeps this module
  * from importing back into checks.ts.
  */
-export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
+/**
+ * Everything the memory checks need to spawn a process for, measured once.
+ *
+ * Two checks now read the same runtime — its size, its backend and whether it
+ * gives memory back — and each probe is a process spawn that is slow on
+ * Windows. Passing the measurement between them keeps `doctor` to one round of
+ * probing; it is deliberately NOT memoized, so `onboard` can re-measure after
+ * applying a change rather than reporting the number it asked for.
+ */
+export interface RuntimeProbe {
+  engineName: string | null;
+  engine: EngineCapacity | null;
+  provider: MachineProvider | undefined;
+  reclaim: HostReclaimStatus;
+}
+
+export function probeRuntime(runtime: CheckResult): RuntimeProbe {
+  const engineName = runtime.engine?.name ?? null;
+  // Nothing to measure: no engine, or one that is not answering. The checks
+  // report that case from `runtime` alone, so probing it would only cost time.
+  if (!engineName || runtime.status !== 'pass') {
+    return { engineName, engine: null, provider: undefined, reclaim: 'n/a' };
+  }
+  const platform = process.platform;
+  // Probed only where it changes the answer. On Windows both backends exist for
+  // both engines and they take their memory from different places — and only
+  // the WSL one has a reclaim setting, so a Hyper-V user must not be told to
+  // change a file their VM never reads. Elsewhere the platform already decides,
+  // so this avoids a process spawn on the common path.
+  const provider = platform === 'win32' ? detectMachineProvider(engineName) : undefined;
+  return {
+    engineName,
+    engine: probeEngineCapacity(engineName),
+    provider,
+    reclaim: probeHostReclaim(engineName, platform, provider),
+  };
+}
+
+export function checkRuntimeMemory(
+  runtime: CheckResult,
+  probe: RuntimeProbe = probeRuntime(runtime),
+): CheckResult {
   const engineName = runtime.engine?.name ?? null;
 
   if (!engineName) {
@@ -533,17 +626,12 @@ export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
   const configuredMib = configured !== undefined ? Number(configured) : undefined;
 
   return evaluateRuntimeMemory({
-    engine: probeEngineCapacity(engineName),
+    engine: probe.engine,
     hostBytes: totalmem(),
     engineName,
     platform: process.platform,
-    // Probed only where it changes the answer. Windows Docker has two backends
-    // with different memory knobs; everywhere else the platform already decides,
-    // so this avoids a process spawn on the common path.
-    provider:
-      engineName === 'docker' && process.platform === 'win32'
-        ? detectMachineProvider('docker')
-        : undefined,
+    provider: probe.provider,
+    reclaim: probe.reclaim,
     configuredMib: configuredMib !== undefined && Number.isFinite(configuredMib) ? configuredMib : undefined,
   });
 }

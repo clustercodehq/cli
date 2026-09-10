@@ -61,7 +61,7 @@ describe('evaluateRuntimeMemory', () => {
     });
     assert.equal(r.status, 'warn');
     assert.match(r.detail, /more host memory is available/);
-    assert.match(r.detail, /clustercode onboard --memory 26624/);
+    assert.match(r.detail, /clustercode onboard --memory 24576/);
   });
 
   test('does not warn when the current size matches the user\'s own configured value', () => {
@@ -188,7 +188,8 @@ describe('evaluateRuntimeMemory', () => {
   });
 
   describe('the dedicated-worker nudge on an otherwise passing reading', () => {
-    // HOST_32GB win32: shared recommendation is 16384, dedicated is 26624.
+    // HOST_32GB win32, sized without a probed reclaim status (so: pessimistic,
+    // the no-reclaim reserve): shared recommendation is 16384, dedicated 24576.
     // 20480 MiB passes the shared bar but is still well below dedicated.
     const BELOW_DEDICATED_MIB = 20480;
 
@@ -198,7 +199,7 @@ describe('evaluateRuntimeMemory', () => {
         hostBytes: HOST_32GB, engineName: 'podman', platform: 'win32',
       });
       assert.equal(r.status, 'pass');
-      assert.match(r.detail, /\(dedicated worker\? up to 26\.0 GiB — see `clustercode onboard`\)$/);
+      assert.match(r.detail, /\(dedicated worker\? up to 24\.0 GiB — see `clustercode onboard`\)$/);
       assert.doesNotMatch(r.detail, /\n/);
       assert.deepEqual(Object.keys(r).sort(), ['detail', 'name', 'status']);
     });
@@ -228,7 +229,7 @@ describe('evaluateRuntimeMemory', () => {
         hostBytes: HOST_32GB, engineName: 'docker', platform: 'win32',
       });
       assert.equal(r.status, 'pass');
-      assert.match(r.detail, /dedicated worker\? up to 26\.0 GiB/);
+      assert.match(r.detail, /dedicated worker\? up to 24\.0 GiB/);
     });
 
     test('a passing Docker nudge on win32 points at .wslconfig, not onboard', () => {
@@ -342,6 +343,94 @@ describe('evaluateRuntimeMemory', () => {
       assert.equal(r.status, 'pass');
       assert.match(r.detail, /dedicated worker/);
     });
+  });
+});
+
+// A runtime of a perfectly reasonable size still starves the host when nothing
+// ever returns what it borrows. Nothing else in this check can see that: every
+// other number it compares is a number the runtime was PROMISED.
+describe('memory reclaim', () => {
+  // Sized so the reading passes on its own merits — the reclaim status is the
+  // only thing that can change the grade.
+  const wsl = (over: Partial<Parameters<typeof evaluateRuntimeMemory>[0]>) =>
+    evaluateRuntimeMemory({
+      engine: { memTotalBytes: 23552 * MIB, cpus: 8 },
+      hostBytes: HOST_32GB,
+      engineName: 'podman',
+      platform: 'win32',
+      provider: 'wsl',
+      ...over,
+    });
+
+  test('reclaim off on Podman/WSL warns and points at onboard', () => {
+    const r = wsl({ reclaim: 'off' });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /memory reclaim is off/);
+    assert.match(r.detail, /clustercode onboard/);
+  });
+
+  test('reclaim off on Docker/WSL names the key instead — onboard will not set it', () => {
+    const r = wsl({ reclaim: 'off', engineName: 'docker' });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /autoMemoryReclaim=gradual/);
+    assert.match(r.detail, /wsl --shutdown/);
+    assert.doesNotMatch(r.detail, /clustercode onboard/);
+  });
+
+  test('reclaim enforced restores the ordinary passing line', () => {
+    const r = wsl({ reclaim: 'enforced' });
+    assert.equal(r.status, 'pass');
+    assert.doesNotMatch(r.detail, /reclaim/);
+  });
+
+  test('a warning never turns into a nudge to ask for MORE memory', () => {
+    const r = wsl({ reclaim: 'off' });
+    assert.doesNotMatch(r.detail, /dedicated worker\?/);
+  });
+
+  test('WSL below 2.0 names the no-reclaim ceiling when the runtime is above it', () => {
+    // No-reclaim dedicated on a 32 GiB host is 24576; this runtime is larger.
+    const r = wsl({ reclaim: 'unsupported', engine: { memTotalBytes: 26624 * MIB, cpus: 8 } });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /WSL 2\.0 or newer/);
+    assert.match(r.detail, /clustercode onboard --memory 24576/);
+  });
+
+  test('...and does not tell a smaller runtime to "lower" itself to a bigger number', () => {
+    const r = wsl({ reclaim: 'unsupported', engine: { memTotalBytes: 8192 * MIB, cpus: 8 } });
+    assert.doesNotMatch(r.detail, /lower/);
+  });
+
+  test('a Hyper-V backend is never told about a WSL setting', () => {
+    const r = wsl({ reclaim: 'n/a', provider: 'hyperv' });
+    assert.doesNotMatch(r.detail, /reclaim|autoMemoryReclaim/);
+  });
+
+  for (const platform of ['darwin', 'linux'] as NodeJS.Platform[]) {
+    test(`adds nothing on ${platform}, where there is no such setting`, () => {
+      const r = evaluateRuntimeMemory({
+        engine: { memTotalBytes: 23552 * MIB, cpus: 8 },
+        hostBytes: HOST_32GB, engineName: 'podman', platform, reclaim: 'n/a',
+      });
+      assert.doesNotMatch(r.detail, /reclaim/);
+    });
+  }
+
+  test('keeps the single-line and name/status/detail-only contracts', () => {
+    const r = wsl({ reclaim: 'off' });
+    assert.doesNotMatch(r.detail, /\n/);
+    assert.deepEqual(Object.keys(r).sort(), ['detail', 'name', 'status']);
+  });
+
+  // An unprobed reading is graded as pessimistically as an off one: a
+  // recommendation built on an assumption of reclaim that turns out to be wrong
+  // is the exact failure this field was added for.
+  test('an absent status sizes like no reclaim, not like enforced', () => {
+    const r = evaluateRuntimeMemory({
+      engine: { memTotalBytes: 8192 * MIB, cpus: 8 },
+      hostBytes: HOST_32GB, engineName: 'podman', platform: 'win32',
+    });
+    assert.match(r.detail, /--memory 24576/);
   });
 });
 

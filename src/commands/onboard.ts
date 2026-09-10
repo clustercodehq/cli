@@ -7,6 +7,7 @@ import { totalmem } from 'node:os';
 import {
   runAllChecks,
   checkContainerRuntime,
+  checkHostMemory,
   checkWsl,
   DOCKER_GROUP_PENDING,
   type CheckResult,
@@ -15,13 +16,29 @@ import {
   checkRuntimeMemory,
   detectMachineProvider,
   probeEngineCapacity,
+  probeRuntime,
   recommendForUse,
   estimateDevboxes,
   devboxFitTable,
   formatFitTable,
+  type HostReclaim,
 } from '../lib/runtime-memory.js';
-import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
-import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
+import {
+  planMemoryApply,
+  planWslReclaimApply,
+  applyWslEntries,
+  runApplySteps,
+  wslConfigPath,
+  type ApplyPlan,
+} from '../lib/runtime-memory-apply.js';
+import { probeHostReclaim } from '../lib/host-reclaim.js';
+import { WSL_RECLAIM_ENTRY, wslMemoryEntry } from '../lib/wslconfig.js';
+import {
+  readCredentials,
+  readAppConfig,
+  rememberRuntimeMemory,
+  validateRuntimeMemoryMb,
+} from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
 import { memoryKnob, type MemoryKnob } from '../lib/memory-knob.js';
 import type { MachineProvider } from '../lib/runtime-memory.js';
@@ -690,8 +707,23 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   const platform = process.platform;
   const provider = detectMachineProvider(engineName);
   const requested = resolveRequestedMemoryMib(flagMemory, readAppConfig().RUNTIME_MEMORY_MB, hostBytes);
-  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated');
-  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared');
+
+  // Sizing depends on whether the VM ever gives memory back, because the host
+  // reserve is only real if something enforces it. This CLI can enforce it in
+  // exactly one place — a Podman machine on the WSL backend, whose .wslconfig
+  // it already owns — so that is the only case sized optimistically; a host
+  // where reclaim is already on is sized the same way even if we did not set it.
+  const reclaimStatus = probeHostReclaim(engineName, platform, provider);
+  const reclaimEligible =
+    platform === 'win32' &&
+    provider === 'wsl' &&
+    engineName === 'podman' &&
+    reclaimStatus !== 'unsupported';
+  const reclaim: HostReclaim =
+    reclaimEligible || reclaimStatus === 'enforced' ? 'enforced' : 'none';
+
+  const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated', reclaim);
+  const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared', reclaim);
 
   // An explicitly-passed --memory that fails validation must be an error, not a
   // silent fall-through to the prompt: a CI run that typos `--memory 8GB` would
@@ -746,9 +778,11 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     // pick one.
     const ceilingNote =
       platform === 'win32'
-        ? 'This is a ceiling, not a reservation — memory is used only while DevBoxes run, and Windows gets most of it back when they stop.'
+        ? reclaimEligible
+          ? 'This is a ceiling, not a reservation — memory is used while DevBoxes run and returned to Windows gradually while the runtime is idle.'
+          : 'Without memory reclaim (WSL 2.0+), the runtime keeps everything it has touched until `wsl --shutdown`, so treat this number as fully used.'
         : platform === 'darwin'
-          ? 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, though macOS may not release it back until the machine restarts.'
+          ? 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, and macOS does not release it back until the machine restarts, so treat this number as fully used.'
           : null;
     if (ceilingNote) clack.log.info(ceilingNote);
 
@@ -798,35 +832,66 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   // so an engine given 24576 MB reports meaningfully less. An exact comparison
   // never matches and would re-apply (and re-run `wsl --shutdown`) every run.
   if (currentMib !== null && Math.abs(target - currentMib) / target < 0.07) {
+    // The size being right is not the same as the host being safe: a VM that
+    // never returns what it borrows starves the host at any ceiling. This is
+    // the path the machines that hit that already take, so it is the one that
+    // has to be able to fix them — with no new flag and no resize.
+    if (reclaimEligible && reclaimStatus === 'off') {
+      const plan = planWslReclaimApply();
+      clack.log.warn(
+        'Memory reclaim is off, so the runtime keeps memory the host may need until `wsl --shutdown`.',
+      );
+      const consent = await confirmApply(
+        plan,
+        flagMemory !== undefined,
+        'Memory reclaim is off, but there is no terminal to confirm the change. ' +
+          `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
+      );
+      if (consent !== 'go') return true;
+
+      const written = applyWslEntries([WSL_RECLAIM_ENTRY]);
+      if (!written.ok) {
+        clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
+        return false;
+      }
+      clack.log.success(`Updated ${wslConfigPath()}`);
+
+      const ran = runApplySteps(plan.steps);
+      if (!ran.ok) {
+        clack.log.error(`Failed at: ${ran.failed}`);
+        return false;
+      }
+      reportAfterApply();
+      if (requested !== null) rememberRuntimeMemory(target);
+      return true;
+    }
+
     clack.log.info('Already about that size — nothing to change.');
+    // Still a deliberate choice worth recording: without it, doctor keeps
+    // treating a size the user asked for as an install default and nagging.
+    if (requested !== null) rememberRuntimeMemory(target);
     return true;
   }
 
-  const plan = planMemoryApply(provider, process.platform, engineName, target);
-  clack.log.info(['Will run:', ...plan.steps.map((s) => `  ${pc.dim(s)}`)].join('\n'));
-  if (plan.warning) clack.log.warn(plan.warning);
-
-  // Both apply paths tear down the container runtime. If a worker is serving
-  // DevBoxes right now, this kills them — say so before asking, not after.
-  if (execSilent('podman ps --format "{{.Names}}"')) {
-    clack.log.warn('Containers are running — applying this will stop them.');
-  }
-
-  if (process.stdin.isTTY) {
-    const ok = await clack.confirm({ message: 'Apply this change?' });
-    if (clack.isCancel(ok) || !ok) return true;
-  } else if (!flagMemory) {
+  const plan = planMemoryApply(provider, process.platform, engineName, target, {
+    reclaim: reclaimEligible,
+  });
+  const consent = await confirmApply(
+    plan,
+    flagMemory !== undefined,
     // No TTY and no explicit --memory: a stored config value is not consent to
     // restart every WSL distribution on the machine unattended.
-    clack.log.warn(
-      `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
-        `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
-    );
-    return true;
-  }
+    `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
+      `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
+  );
+  if (consent !== 'go') return true;
 
   if (plan.kind === 'wslconfig') {
-    const written = applyWslMemory(target);
+    // One read, one backup, one write, whether or not reclaim rides along.
+    const written = applyWslEntries([
+      wslMemoryEntry(target),
+      ...(reclaimEligible ? [WSL_RECLAIM_ENTRY] : []),
+    ]);
     if (!written.ok) {
       clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
       // An apply that was ATTEMPTED and failed is a stronger failure than one
@@ -849,8 +914,54 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   // failure this can legitimately still be a warning.
   if (after.status === 'pass') clack.log.success(after.detail);
   else clack.log.warn(after.detail);
+  rememberRuntimeMemory(target);
   clack.log.info('Restart the worker for the new capacity to be advertised.');
   return true;
+}
+
+/**
+ * Show a plan, say what it costs, and get consent for it.
+ *
+ * Shared by the resize and the reclaim-only paths so they cannot drift: both
+ * restart every WSL distribution on the machine, and both must refuse to do
+ * that unattended on the strength of a stored config value alone.
+ */
+async function confirmApply(
+  plan: ApplyPlan,
+  hasExplicitFlag: boolean,
+  nonInteractiveHint: string,
+): Promise<'go' | 'skip'> {
+  clack.log.info(['Will run:', ...plan.steps.map((s) => `  ${pc.dim(s)}`)].join('\n'));
+  if (plan.warning) clack.log.warn(plan.warning);
+
+  // Both apply paths tear down the container runtime. If a worker is serving
+  // DevBoxes right now, this kills them — say so before asking, not after.
+  if (execSilent('podman ps --format "{{.Names}}"')) {
+    clack.log.warn('Containers are running — applying this will stop them.');
+  }
+
+  if (process.stdin.isTTY) {
+    const ok = await clack.confirm({ message: 'Apply this change?' });
+    return clack.isCancel(ok) || !ok ? 'skip' : 'go';
+  }
+  if (!hasExplicitFlag) {
+    clack.log.warn(nonInteractiveHint);
+    return 'skip';
+  }
+  return 'go';
+}
+
+/** Re-measure after a reclaim-only apply: the runtime's size did not change, so the host's own figure is the only evidence anything happened. */
+function reportAfterApply(): void {
+  const runtime = checkContainerRuntime();
+  // Measured now, not memoized from before the apply — that is the whole point
+  // of re-probing — but measured once for both lines.
+  const probe = probeRuntime(runtime);
+  for (const result of [checkRuntimeMemory(runtime, probe), checkHostMemory(runtime, probe)]) {
+    if (result.status === 'pass') clack.log.success(result.detail);
+    else clack.log.warn(result.detail);
+  }
+  clack.log.info('Restart the worker for the new capacity to be advertised.');
 }
 
 export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {

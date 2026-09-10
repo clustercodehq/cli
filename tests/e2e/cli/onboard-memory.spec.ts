@@ -1,9 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync, execSync, spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { tmpdir, totalmem } from 'node:os';
 import assert from 'node:assert/strict';
 
 /**
@@ -179,5 +179,116 @@ describe('onboard memory step on an engine the CLI cannot size', () => {
     const { stdout } = runOnboard(['--memory', '8192']);
     const warnings = stdout.match(/Cannot set runtime memory|not configurable from this CLI/g) ?? [];
     assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}:\n${stdout}`);
+  });
+});
+
+/**
+ * Podman on the WSL backend: the one configuration this CLI actually writes
+ * .wslconfig for, and the one where `memory=` alone is not enough to keep the
+ * host safe.
+ *
+ * `wsl --shutdown` restarts every WSL distribution on the machine, so this runs
+ * ONLY once `where wsl` has confirmed the stub shadows the real wsl.exe — a
+ * real one here would tear down whatever the developer is running.
+ */
+describe('onboard memory step on Podman over WSL', () => {
+  const STUB_MARKER = 'CLUSTERCODE_STUB_WSL';
+  const TARGET_MIB = 8192;
+  // Host-size independent: 8 GiB is a valid allocation on any host with at
+  // least 12 GiB, which the guard below enforces rather than assumes.
+  const HOST_BIG_ENOUGH = totalmem() / 1024 / 1024 >= 12288;
+
+  /** The .wslconfig shape this fix exists for: sized, commented, no reclaim. */
+  const WSLG_COMMENT = [
+    '# WSLg disabled: this Windows build is too old for the GUI components,',
+    '# which fail to start with a DLL error on every launch and leave a broken',
+    '# service running in the background.',
+    '# Delete these four lines to re-enable it.',
+  ].join('\r\n');
+  const EXISTING_WSLCONFIG = ['[wsl2]', 'memory=25600MB', WSLG_COMMENT, 'guiApplications=false', ''].join('\r\n');
+
+  function createPodmanWslStubs(engineMemTotalBytes: number): void {
+    writeFileSync(join(stubDir, 'podman.cmd'), [
+      '@echo off',
+      'echo %* | findstr /C:"--version" >nul 2>&1 && (echo podman version 5.2.0 & exit /b 0)',
+      'echo %* | findstr /C:"{{.Running}}" >nul 2>&1 && (echo true & exit /b 0)',
+      'echo %* | findstr /C:"{{.VMType}}" >nul 2>&1 && (echo wsl & exit /b 0)',
+      `echo %* | findstr /C:"{{.Host.MemTotal}}" >nul 2>&1 && (echo ${engineMemTotalBytes} 8 & exit /b 0)`,
+      'echo %* | findstr /C:"machine start" >nul 2>&1 && (exit /b 0)',
+      'exit /b 1',
+    ].join('\r\n'));
+    writeFileSync(join(stubDir, 'wsl.cmd'), [
+      '@echo off',
+      'echo %* | findstr /C:"--version" >nul 2>&1 && (echo WSL version: 2.7.13.0 & exit /b 0)',
+      `echo %* | findstr /C:"--status" >nul 2>&1 && (echo ${STUB_MARKER} Default Version: 2 & exit /b 0)`,
+      'echo %* | findstr /C:"--shutdown" >nul 2>&1 && (exit /b 0)',
+      'exit /b 1',
+    ].join('\r\n'));
+  }
+
+  /**
+   * Refuse to run unless `wsl` really resolves to the stub.
+   *
+   * Probed through the same shell resolution `runApplySteps` uses, and by the
+   * stub's own marker rather than by a path comparison: this must be evidence
+   * that `wsl --shutdown` will hit the stub, not an argument that it should.
+   */
+  function stubShadowsRealWsl(): boolean {
+    try {
+      return execSync('wsl --status', {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: pathWithoutRealEngines() },
+      }).includes(STUB_MARKER);
+    } catch {
+      return false;
+    }
+  }
+
+  function skipUnlessStubbed(): boolean {
+    if (stubShadowsRealWsl()) return false;
+    // Loud, because a silent pass here would look like coverage of the one path
+    // that rewrites .wslconfig.
+    console.log('SKIP: the wsl stub does not shadow the real wsl.exe on this machine');
+    return true;
+  }
+
+  it('writes the size, enables reclaim, and records the choice', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+    seedConfigs();
+    createPodmanWslStubs(25600 * 1024 * 1024);
+    if (skipUnlessStubbed()) return; // never run `wsl --shutdown` for real
+
+    const { stdout, exitCode } = runOnboard(['--memory', String(TARGET_MIB)]);
+    assert.equal(exitCode, 0, stdout);
+
+    const wslconfig = readFileSync(join(tempHome, '.wslconfig'), 'utf-8');
+    assert.match(wslconfig, /memory=8192MB/);
+    assert.match(wslconfig, /\[experimental\]/);
+    assert.match(wslconfig, /autoMemoryReclaim=gradual/);
+
+    // F7: an applied size that leaves no trace is re-litigated by doctor on
+    // every run, and cannot be offered back on the next onboard.
+    const config = JSON.parse(readFileSync(join(tempHome, '.clustercode', 'config.json'), 'utf-8'));
+    assert.equal(config.RUNTIME_MEMORY_MB, String(TARGET_MIB));
+  });
+
+  it('leaves a hand-written comment block byte-identical', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+    seedConfigs();
+    createPodmanWslStubs(25600 * 1024 * 1024);
+    writeFileSync(join(tempHome, '.wslconfig'), EXISTING_WSLCONFIG, 'utf-8');
+    if (skipUnlessStubbed()) return;
+
+    const { exitCode, stdout } = runOnboard(['--memory', String(TARGET_MIB)]);
+    assert.equal(exitCode, 0, stdout);
+
+    const wslconfig = readFileSync(join(tempHome, '.wslconfig'), 'utf-8');
+    assert.ok(wslconfig.includes(WSLG_COMMENT), wslconfig);
+    assert.match(wslconfig, /guiApplications=false/);
+    assert.match(wslconfig, /memory=8192MB/);
+    assert.match(wslconfig, /autoMemoryReclaim=gradual/);
+    // CRLF in, CRLF out.
+    assert.doesNotMatch(wslconfig, /[^\r]\n/);
+    // The original is kept, once.
+    assert.equal(readFileSync(join(tempHome, '.wslconfig.bak'), 'utf-8'), EXISTING_WSLCONFIG);
   });
 });

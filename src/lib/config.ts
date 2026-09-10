@@ -169,6 +169,19 @@ export function writeAppConfig(config: AppConfig): void {
   writeJson(getConfigPath(), config);
 }
 
+/**
+ * Record a runtime memory size the user actually chose.
+ *
+ * Without this, an applied `--memory` left no trace: the next `doctor` run had
+ * no way to tell a deliberate choice from an install default and re-litigated
+ * it every time, and a re-run of `onboard` had no stored value to offer back.
+ * Merges into the existing config rather than replacing it, so it cannot drop
+ * WORKER_NAME.
+ */
+export function rememberRuntimeMemory(memoryMib: number): void {
+  writeAppConfig({ ...readAppConfig(), RUNTIME_MEMORY_MB: String(memoryMib) });
+}
+
 export function getOrchestratorUrl(): string {
   return process.env.ORCHESTRATOR_URL || 'https://console.clustercode.io';
 }
