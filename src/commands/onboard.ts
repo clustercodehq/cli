@@ -31,12 +31,14 @@ import {
   wslConfigPath,
   type ApplyPlan,
 } from '../lib/runtime-memory-apply.js';
-import { probeHostReclaim } from '../lib/host-reclaim.js';
+import { probeHostReclaim, currentWslVersionStamp } from '../lib/host-reclaim.js';
+import { verifyReclaim } from '../lib/reclaim-verify.js';
 import { WSL_RECLAIM_ENTRY, wslMemoryEntry } from '../lib/wslconfig.js';
 import {
   readCredentials,
   readAppConfig,
   rememberRuntimeMemory,
+  rememberReclaimVerdict,
   validateRuntimeMemoryMb,
 } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
@@ -698,7 +700,12 @@ function unappliedMemoryIsFailure(knob: MemoryKnob): boolean {
  * under-provisioned runtime is a healthy check, but it silently caps how much
  * work this worker is given.
  */
-async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boolean> {
+async function offerRuntimeMemory(
+  flagMemory: string | undefined,
+  // True when the user asked for the measurement explicitly; the interactive
+  // offer then stays quiet rather than asking for what was already requested.
+  verifyRequested = false,
+): Promise<boolean> {
   const runtime = checkContainerRuntime();
   const engineName = runtime.engine?.name;
   if (!engineName) return true;
@@ -709,18 +716,18 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   const requested = resolveRequestedMemoryMib(flagMemory, readAppConfig().RUNTIME_MEMORY_MB, hostBytes);
 
   // Sizing depends on whether the VM ever gives memory back, because the host
-  // reserve is only real if something enforces it. This CLI can enforce it in
-  // exactly one place — a Podman machine on the WSL backend, whose .wslconfig
-  // it already owns — so that is the only case sized optimistically; a host
-  // where reclaim is already on is sized the same way even if we did not set it.
+  // reserve is only real if something enforces it — and *writing* the setting
+  // is not enforcing it. It has been measured accepted and inert, so only a
+  // recorded measurement ('enforced') buys the smaller reserve. Eligibility
+  // still decides whether the entry gets written; it no longer decides sizing,
+  // which is what let a machine be sized on a promise it had never kept.
   const reclaimStatus = probeHostReclaim(engineName, platform, provider);
   const reclaimEligible =
     platform === 'win32' &&
     provider === 'wsl' &&
     engineName === 'podman' &&
     reclaimStatus !== 'unsupported';
-  const reclaim: HostReclaim =
-    reclaimEligible || reclaimStatus === 'enforced' ? 'enforced' : 'none';
+  const reclaim: HostReclaim = reclaimStatus === 'enforced' ? 'enforced' : 'none';
 
   const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated', reclaim);
   const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared', reclaim);
@@ -778,9 +785,13 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     // pick one.
     const ceilingNote =
       platform === 'win32'
-        ? reclaimEligible
+        ? reclaimStatus === 'enforced'
           ? 'This is a ceiling, not a reservation — memory is used while DevBoxes run and returned to Windows gradually while the runtime is idle.'
-          : 'Without memory reclaim (WSL 2.0+), the runtime keeps everything it has touched until `wsl --shutdown`, so treat this number as fully used.'
+          : reclaimStatus === 'configured'
+            ? 'Memory reclaim is configured but has not been verified on this machine — this number is sized as if it does not work; run `clustercode onboard --verify-reclaim` to check.'
+            : reclaimStatus === 'inert'
+              ? 'Memory reclaim does not return memory on this Windows build, so treat this number as fully used.'
+              : 'Without memory reclaim (WSL 2.0+), the runtime keeps everything it has touched until `wsl --shutdown`, so treat this number as fully used.'
         : platform === 'darwin'
           ? 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, and macOS does not release it back until the machine restarts, so treat this number as fully used.'
           : null;
@@ -863,6 +874,19 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
       }
       reportAfterApply();
       if (requested !== null) rememberRuntimeMemory(target);
+      // Reclaim is now requested. Whether it *works* is a separate question,
+      // and this is the moment the answer is worth the most: the size was
+      // chosen as if it does not.
+      if (!verifyRequested) {
+        await offerReclaimVerification({
+          hostBytes,
+          platform,
+          provider,
+          engineName,
+          currentMib,
+          flagMemory,
+        });
+      }
       return true;
     }
 
@@ -873,18 +897,60 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     return true;
   }
 
-  const plan = planMemoryApply(provider, process.platform, engineName, target, {
-    reclaim: reclaimEligible,
-  });
-  const consent = await confirmApply(
-    plan,
-    flagMemory !== undefined,
+  const outcome = await applyMemoryTarget({
+    provider,
+    platform,
+    engineName,
+    target,
+    reclaimEligible,
+    hasExplicitFlag: flagMemory !== undefined,
     // No TTY and no explicit --memory: a stored config value is not consent to
     // restart every WSL distribution on the machine unattended.
-    `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
+    nonInteractiveHint:
+      `Runtime memory differs from ${target}MB, but there is no terminal to confirm the change. ` +
       `Re-run with ${pc.bold(`--memory ${target}`)} to apply it non-interactively.`,
-  );
-  if (consent !== 'go') return true;
+  });
+  if (outcome === 'failed') return false;
+
+  // Same question as the reclaim-only path, at the same moment: the setting was
+  // just written, and nothing yet says it does anything on this machine.
+  if (outcome === 'applied' && reclaimEligible && reclaimStatus === 'off' && !verifyRequested) {
+    await offerReclaimVerification({
+      hostBytes,
+      platform,
+      provider,
+      engineName,
+      currentMib: target,
+      flagMemory,
+    });
+  }
+  return true;
+}
+
+type ApplyOutcome = 'applied' | 'skipped' | 'failed';
+
+/**
+ * Write a runtime size and restart into it.
+ *
+ * Extracted so the post-verification resize offer runs exactly the same plan,
+ * consent and persistence as the ordinary one — a second copy of this would be
+ * a second place for "did we remember the choice?" to go wrong.
+ */
+async function applyMemoryTarget(args: {
+  provider: MachineProvider;
+  platform: NodeJS.Platform;
+  engineName: string;
+  target: number;
+  reclaimEligible: boolean;
+  hasExplicitFlag: boolean;
+  nonInteractiveHint: string;
+}): Promise<ApplyOutcome> {
+  const { provider, platform, engineName, target, reclaimEligible } = args;
+  const plan = planMemoryApply(provider, platform, engineName, target, {
+    reclaim: reclaimEligible,
+  });
+  const consent = await confirmApply(plan, args.hasExplicitFlag, args.nonInteractiveHint);
+  if (consent !== 'go') return 'skipped';
 
   if (plan.kind === 'wslconfig') {
     // One read, one backup, one write, whether or not reclaim rides along.
@@ -896,7 +962,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
       clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
       // An apply that was ATTEMPTED and failed is a stronger failure than one
       // the CLI declined to attempt, and used to be the quieter of the two.
-      return false;
+      return 'failed';
     }
     clack.log.success(`Updated ${wslConfigPath()}`);
   }
@@ -904,7 +970,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   const ran = runApplySteps(plan.steps);
   if (!ran.ok) {
     clack.log.error(`Failed at: ${ran.failed}`);
-    return false;
+    return 'failed';
   }
 
   // Re-probe rather than reporting the requested number: a malformed .wslconfig
@@ -916,7 +982,91 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   else clack.log.warn(after.detail);
   rememberRuntimeMemory(target);
   clack.log.info('Restart the worker for the new capacity to be advertised.');
-  return true;
+  return 'applied';
+}
+
+const VERIFY_PROMPT =
+  'Verify that memory reclaim works on this machine now? Takes about 10 minutes; the runtime must stay idle.';
+
+/**
+ * Run the measurement and act on what it says.
+ *
+ * The offer is made only right after the setting was written, because that is
+ * the one moment where the answer changes what the user should do next — and
+ * never implicitly, because it costs ten minutes of an idle runtime.
+ */
+async function offerReclaimVerification(ctx: {
+  hostBytes: number;
+  platform: NodeJS.Platform;
+  provider: MachineProvider;
+  engineName: string;
+  currentMib: number | null;
+  flagMemory: string | undefined;
+}): Promise<void> {
+  if (!process.stdin.isTTY) return;
+  const consent = await clack.confirm({ message: VERIFY_PROMPT });
+  if (clack.isCancel(consent) || !consent) {
+    reportNoReclaimCeiling(ctx);
+    return;
+  }
+  const result = await runReclaimVerification();
+  if (result !== 'yes') {
+    if (result === 'no') reportNoReclaimCeiling(ctx);
+    return;
+  }
+
+  // Verified: this host has earned the smaller reserve, so the number it was
+  // sized with a moment ago is now needlessly conservative.
+  const enforced = recommendForUse(ctx.hostBytes, ctx.platform, 'dedicated', 'enforced');
+  if (enforced <= 0 || (ctx.currentMib !== null && enforced <= ctx.currentMib)) return;
+  const raise = await clack.confirm({
+    message: `Reclaim verified — raise the runtime to ${(enforced / 1024).toFixed(0)} GiB?`,
+  });
+  if (clack.isCancel(raise) || !raise) return;
+  await applyMemoryTarget({
+    provider: ctx.provider,
+    platform: ctx.platform,
+    engineName: ctx.engineName,
+    target: enforced,
+    reclaimEligible: true,
+    hasExplicitFlag: ctx.flagMemory !== undefined,
+    nonInteractiveHint: `Re-run with ${pc.bold(`--memory ${enforced}`)} to apply it non-interactively.`,
+  });
+}
+
+/** What to do instead when reclaim is not (or not known to be) doing anything. */
+function reportNoReclaimCeiling(ctx: {
+  hostBytes: number;
+  platform: NodeJS.Platform;
+  currentMib: number | null;
+}): void {
+  const ceiling = recommendForUse(ctx.hostBytes, ctx.platform, 'dedicated', 'none');
+  if (ceiling <= 0) return;
+  clack.log.info(
+    `Sized as if reclaim does not work, the ceiling for this machine is ${ceiling}MB.` +
+      (ctx.currentMib !== null && ctx.currentMib > ceiling
+        ? ` Lower it with \`clustercode onboard --memory ${ceiling}\`.`
+        : ''),
+  );
+}
+
+/**
+ * Measure, record, and say what was found.
+ *
+ * An inconclusive run records nothing: the point of the stored verdict is that
+ * it is evidence, and "we could not tell" is not evidence of either answer.
+ */
+export async function runReclaimVerification(): Promise<'yes' | 'no' | 'inconclusive'> {
+  clack.log.step('Verifying memory reclaim');
+  const { result, detail } = await verifyReclaim({ log: (line) => clack.log.info(line) });
+  if (result === 'inconclusive') {
+    clack.log.warn(detail);
+    return result;
+  }
+  rememberReclaimVerdict(result, currentWslVersionStamp());
+  if (result === 'yes') clack.log.success(detail);
+  else clack.log.warn(detail);
+  return result;
 }
 
 /**
@@ -991,8 +1141,9 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     // is the kind of contradiction a CI log gets read for. The step reports its
     // own outcome rather than writing process.exitCode, because the OTHER call
     // site below re-runs the checks afterwards and would overwrite it.
-    const memoryOk = await offerRuntimeMemory(opts.memory);
+    const memoryOk = await offerRuntimeMemory(opts.memory, opts.verifyReclaim === true);
     if (!memoryOk) process.exitCode = 1;
+    if (opts.verifyReclaim) await runReclaimVerification();
     clack.outro(
       memoryOk
         ? pc.green('Everything looks good! No issues to fix.')
@@ -1069,7 +1220,8 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     );
   }
 
-  const memoryOk = await offerRuntimeMemory(opts.memory);
+  const memoryOk = await offerRuntimeMemory(opts.memory, opts.verifyReclaim === true);
+  if (opts.verifyReclaim) await runReclaimVerification();
 
   // Pre-warm the worker binary so the first `clustercode worker` starts instantly.
   const { readInstalled, ensureWorkerBinary } = await import('../lib/worker-binary.js');
@@ -1130,6 +1282,11 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
 
 export interface OnboardOptions {
   memory?: string;
+  /**
+   * Measure whether memory reclaim actually returns memory on this machine.
+   * Never implied: it takes about ten minutes of a deliberately idle runtime.
+   */
+  verifyReclaim?: boolean;
   /** Which engine to install when none is present. Ignored when one already is. */
   engine?: EngineName;
 }
@@ -1138,11 +1295,19 @@ export const onboardCommand = new Command('onboard')
   .description('Interactive setup wizard — fix all health check issues')
   .option('--memory <mb>', 'Memory (MB) to allocate to the container runtime')
   .option('--engine <name>', 'Container engine to install if none is present (podman|docker)')
-  .action(async (opts: { memory?: string; engine?: string }) => {
+  .option(
+    '--verify-reclaim',
+    'Measure whether the runtime returns memory to the host (~10 min; keep the runtime idle)',
+  )
+  .action(async (opts: { memory?: string; engine?: string; verifyReclaim?: boolean }) => {
     if (opts.engine !== undefined && opts.engine !== 'podman' && opts.engine !== 'docker') {
       console.error(`Unknown engine "${opts.engine}". Use podman or docker.`);
       process.exitCode = 1;
       return;
     }
-    await runOnboard({ memory: opts.memory, engine: opts.engine as EngineName | undefined });
+    await runOnboard({
+      memory: opts.memory,
+      engine: opts.engine as EngineName | undefined,
+      verifyReclaim: opts.verifyReclaim,
+    });
   });

@@ -270,6 +270,9 @@ describe('onboard memory step on Podman over WSL', () => {
     // every run, and cannot be offered back on the next onboard.
     const config = JSON.parse(readFileSync(join(tempHome, '.clustercode', 'config.json'), 'utf-8'));
     assert.equal(config.RUNTIME_MEMORY_MB, String(TARGET_MIB));
+    // Writing the setting is not evidence that it does anything: only a
+    // measurement records a verdict, and no measurement was run here.
+    assert.equal(config.RUNTIME_RECLAIM_VERIFIED, undefined);
   });
 
   it('leaves a hand-written comment block byte-identical', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
