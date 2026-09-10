@@ -84,6 +84,22 @@ describe('evaluateHostMemory', () => {
     assert.match(r.detail, /reclaim is on but not keeping up/);
   });
 
+  // Four different diagnoses, four different next steps: "nobody has checked",
+  // "checked, does nothing here", "working but outpaced", "never switched on".
+  test('says reclaim is configured but unverified when nothing has measured it', () => {
+    const r = evaluateHostMemory(
+      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'configured' }),
+    );
+    assert.match(r.detail, /reclaim is configured but unverified/);
+  });
+
+  test('says reclaim is inert when it was measured to do nothing on this build', () => {
+    const r = evaluateHostMemory(
+      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'inert' }),
+    );
+    assert.match(r.detail, /reclaim is on but inert on this build/);
+  });
+
   // A stopped runtime is not what is eating the memory, so telling someone to
   // shrink it is advice that changes nothing about the pressure they are under.
   test('adds no runtime action when the runtime is not running', () => {

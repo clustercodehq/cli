@@ -9,8 +9,11 @@ import {
   getAllowedConfigKeys,
   validateWorkerName,
   validateRuntimeMemoryMb,
+  validateReclaimVerified,
+  rememberReclaimVerdict,
   resetAllConfig,
 } from '../lib/config.js';
+import { currentWslVersionStamp } from '../lib/host-reclaim.js';
 
 export const configCommand = new Command('config')
   .description('Manage ClusterCode CLI configuration');
@@ -43,6 +46,21 @@ configCommand
         process.exitCode = 1;
         return;
       }
+    }
+    if (key === 'RUNTIME_RECLAIM_VERIFIED') {
+      const error = validateReclaimVerified(value);
+      if (error) {
+        console.log(`${pc.red('✗')} ${error}`);
+        process.exitCode = 1;
+        return;
+      }
+      // A verdict is only meaningful next to the WSL build it describes, so
+      // recording one by hand also stamps it — otherwise it would be read back
+      // as unusable and silently ignored.
+      const result = value.trim().toLowerCase() as 'yes' | 'no';
+      rememberReclaimVerdict(result, currentWslVersionStamp());
+      console.log(`${pc.green('✓')} Set ${pc.bold(key)} = ${result}`);
+      return;
     }
     const config = readAppConfig();
     config[key] = value.trim();

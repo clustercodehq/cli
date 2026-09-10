@@ -105,4 +105,20 @@ describe('config', () => {
     const { stdout } = runCli('config', 'get', 'RUNTIME_MEMORY_MB');
     assert.match(stdout, /8192/);
   });
+
+  // A hand-recorded reclaim verdict is stamped with the build it describes, so
+  // it cannot silently outlive an upgrade that changed the behaviour.
+  it('records a reclaim verdict together with the build it was taken against', () => {
+    const set = runCli('config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'yes');
+    assert.equal(set.exitCode, 0, set.stdout);
+    const { stdout } = runCli('config', 'list');
+    assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED = yes/);
+    assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED_WSL/);
+  });
+
+  it('rejects a reclaim verdict that is not an outcome a measurement can have', () => {
+    const { stdout, exitCode } = runCli('config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'maybe');
+    assert.equal(exitCode, 1);
+    assert.match(stdout, /must be yes or no/i);
+  });
 });

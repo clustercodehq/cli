@@ -377,11 +377,83 @@ describe('memory reclaim', () => {
     assert.doesNotMatch(r.detail, /clustercode onboard/);
   });
 
-  test('reclaim enforced restores the ordinary passing line', () => {
+  // Verified is the only status that buys the smaller host reserve, so it is
+  // the only one that can offer a bigger runtime.
+  test('reclaim verified passes and offers the room it just earned', () => {
     const r = wsl({ reclaim: 'enforced' });
+    assert.equal(r.status, 'pass');
+    assert.match(r.detail, /memory reclaim verified/);
+    assert.match(r.detail, /up to 26\.0 GiB/);
+  });
+
+  test('...and says nothing once the runtime is already that big', () => {
+    const r = wsl({ reclaim: 'enforced', engine: { memTotalBytes: 26624 * MIB, cpus: 8 } });
     assert.equal(r.status, 'pass');
     assert.doesNotMatch(r.detail, /reclaim/);
   });
+
+  // The observed host: the setting is present, nothing has ever measured it,
+  // and the runtime was sized as though it works.
+  test('configured but unverified, above the no-reclaim ceiling, warns', () => {
+    const r = wsl({ reclaim: 'configured', engine: { memTotalBytes: 25600 * MIB, cpus: 8 } });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /configured but unverified/);
+    assert.match(r.detail, /--verify-reclaim/);
+    assert.match(r.detail, /--memory 24576/);
+  });
+
+  test('configured but unverified, within the ceiling, is a note on a passing line', () => {
+    const r = wsl({ reclaim: 'configured', engine: { memTotalBytes: 16384 * MIB, cpus: 8 } });
+    assert.equal(r.status, 'pass');
+    assert.match(r.detail, /configured but unverified/);
+    assert.match(r.detail, /verify-reclaim/);
+    assert.doesNotMatch(r.detail, /--memory 24576/);
+  });
+
+  test('Docker on WSL is given the file to edit, not a CLI flag', () => {
+    const r = wsl({
+      reclaim: 'configured',
+      engineName: 'docker',
+      engine: { memTotalBytes: 25600 * MIB, cpus: 8 },
+    });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /\[wsl2\] memory= to 24576MB/);
+    assert.doesNotMatch(r.detail, /--memory 24576/);
+  });
+
+  // Measured and doing nothing. No amount of configuration will change that, so
+  // the only remaining lever is the size itself.
+  test('inert above the ceiling says so and names the size to fall back to', () => {
+    const r = wsl({ reclaim: 'inert', engine: { memTotalBytes: 25600 * MIB, cpus: 8 } });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /does not return memory on this Windows build/);
+    assert.match(r.detail, /--memory 24576/);
+  });
+
+  test('inert within the ceiling is a passing line with a note', () => {
+    const r = wsl({ reclaim: 'inert' });
+    assert.equal(r.status, 'pass');
+    assert.match(r.detail, /inert on this build/);
+    assert.doesNotMatch(r.detail, /--memory/);
+  });
+
+  test('inert on Docker names the file too', () => {
+    const r = wsl({
+      reclaim: 'inert',
+      engineName: 'docker',
+      engine: { memTotalBytes: 25600 * MIB, cpus: 8 },
+    });
+    assert.equal(r.status, 'warn');
+    assert.match(r.detail, /\[wsl2\] memory= to 24576MB/);
+  });
+
+  for (const reclaim of ['configured', 'inert', 'enforced'] as const) {
+    test(`${reclaim} keeps the single-line and name/status/detail-only contracts`, () => {
+      const r = wsl({ reclaim, engine: { memTotalBytes: 25600 * MIB, cpus: 8 } });
+      assert.doesNotMatch(r.detail, /\n/);
+      assert.deepEqual(Object.keys(r).sort(), ['detail', 'name', 'status']);
+    });
+  }
 
   test('a warning never turns into a nudge to ask for MORE memory', () => {
     const r = wsl({ reclaim: 'off' });

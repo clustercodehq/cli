@@ -31,6 +31,7 @@ export type { Credentials, WorkerConfig, AppConfig };
 const ALLOWED_CONFIG_KEYS: ReadonlySet<keyof AppConfig> = new Set([
   'WORKER_NAME',
   'RUNTIME_MEMORY_MB',
+  'RUNTIME_RECLAIM_VERIFIED',
 ]);
 
 export function isAllowedConfigKey(key: string): key is keyof AppConfig {
@@ -180,6 +181,37 @@ export function writeAppConfig(config: AppConfig): void {
  */
 export function rememberRuntimeMemory(memoryMib: number): void {
   writeAppConfig({ ...readAppConfig(), RUNTIME_MEMORY_MB: String(memoryMib) });
+}
+
+/**
+ * Accept a hand-recorded reclaim verdict.
+ *
+ * Deliberately narrow: this is a record of a measurement, so anything other
+ * than the two outcomes a measurement can have is a typo, not a preference.
+ */
+export function validateReclaimVerified(value: string): string | null {
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed !== 'yes' && trimmed !== 'no') {
+    return 'Reclaim verification must be yes or no (or run clustercode onboard --verify-reclaim to measure it)';
+  }
+  return null;
+}
+
+/**
+ * Record a reclaim measurement together with the WSL build it was taken
+ * against.
+ *
+ * The stamp is not decoration: the behaviour being measured is a property of
+ * the WSL build, so a verdict that outlived its build would keep sizing the
+ * runtime on a measurement of different software. Merged in, so recording a
+ * verdict cannot drop the remembered memory size.
+ */
+export function rememberReclaimVerdict(result: 'yes' | 'no', wslVersion: string): void {
+  writeAppConfig({
+    ...readAppConfig(),
+    RUNTIME_RECLAIM_VERIFIED: result,
+    RUNTIME_RECLAIM_VERIFIED_WSL: wslVersion,
+  });
 }
 
 export function getOrchestratorUrl(): string {

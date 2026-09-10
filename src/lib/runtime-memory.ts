@@ -298,10 +298,12 @@ export interface RuntimeMemoryReading {
    */
   provider?: MachineProvider;
   /**
-   * Whether the VM returns memory to the host while it runs. Absent means "not
-   * probed", which is graded as pessimistically as `'off'`: a recommendation
-   * built on an assumption of reclaim that turns out to be wrong is the exact
-   * shape of the failure this field was added for.
+   * Whether the VM returns memory to the host while it runs. Only `'enforced'`
+   * — configured *and* measured to work on this host — is sized optimistically;
+   * `'configured'`, `'inert'`, `'off'`, `'unsupported'` and an absent value are
+   * all graded the same, because a recommendation built on an assumption of
+   * reclaim that turns out to be wrong is the exact shape of the failure this
+   * field was added for.
    */
   reclaim?: HostReclaimStatus;
 }
@@ -374,44 +376,97 @@ function dedicatedNudge(
 }
 
 /**
- * What to add to an otherwise-passing line when the host is not actually
- * getting its reserve back.
+ * What to add to a `runtime-memory` line about the state of memory reclaim.
  *
  * A runtime of a perfectly reasonable size is still a problem when nothing ever
  * returns what it borrows: `memory=` stops being a ceiling the VM hovers below
  * and becomes a floor it climbs to. Nothing else in this check can see that,
  * because every number it compares is a number the runtime was promised.
  *
- * Returns '' when there is nothing to say, so the caller keeps its existing
- * grade. One clause, no newline — `doctor` prints one line per check.
+ * `warn` is separate from the text because two of these clauses belong on a
+ * *passing* line: "configured but nobody has checked" and "checked, works, you
+ * have room to grow" are both notes, not faults. Returns '' when there is
+ * nothing to say, so the caller keeps its existing grade. One clause, no
+ * newline — `doctor` prints one line per check.
  */
-function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): string {
+function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): { text: string; warn: boolean } {
   const { platform, provider, reclaim, engineName, hostBytes } = reading;
-  if (platform !== 'win32') return '';
+  const silent = { text: '', warn: false };
+  if (platform !== 'win32') return silent;
   // Only the WSL backend reads .wslconfig; Hyper-V has no such setting, and
   // saying otherwise sends that user to a file that cannot affect them.
-  if (provider !== undefined && provider !== 'wsl') return '';
+  if (provider !== undefined && provider !== 'wsl') return silent;
 
   const held = 'memory reclaim is off, so the runtime keeps memory the host may need';
+  const ceiling = recommendForUse(hostBytes, platform, 'dedicated', 'none');
+  // Only name a smaller number than the runtime already has: telling someone to
+  // lower a 16 GiB runtime to 23 GiB is not an instruction.
+  const oversized = ceiling > 0 && engineMib > ceiling;
+  const lower =
+    engineName === 'docker'
+      ? `lower [wsl2] memory= to ${ceiling}MB`
+      : `lower to \`clustercode onboard --memory ${ceiling}\``;
 
   if (reclaim === 'off') {
-    return engineName === 'docker'
-      ? ` — ${held}; set [experimental] autoMemoryReclaim=gradual in .wslconfig, then \`wsl --shutdown\``
-      : ` — ${held}; run \`clustercode onboard\` to enable it`;
+    return {
+      warn: true,
+      text:
+        engineName === 'docker'
+          ? ` — ${held}; set [experimental] autoMemoryReclaim=gradual in .wslconfig, then \`wsl --shutdown\``
+          : ` — ${held}; run \`clustercode onboard\` to enable it`,
+    };
   }
 
   if (reclaim === 'unsupported') {
-    const ceiling = recommendForUse(hostBytes, platform, 'dedicated', 'none');
     const base = ' — memory reclaim needs WSL 2.0 or newer, so the runtime keeps everything it touches';
-    // Only name a smaller number than the runtime already has: telling someone
-    // to lower a 16 GiB runtime to 23 GiB is not an instruction.
-    if (ceiling <= 0 || engineMib <= ceiling) return base;
-    return engineName === 'docker'
-      ? `${base}; lower [wsl2] memory= to ${ceiling}MB`
-      : `${base}; lower to \`clustercode onboard --memory ${ceiling}\``;
+    return { warn: true, text: oversized ? `${base}; ${lower}` : base };
   }
 
-  return '';
+  // Requested but never measured. The setting is a request the build is free to
+  // ignore — it has been seen accepted and inert — so a runtime sized as though
+  // it works is running on an assumption, and says so until someone checks.
+  if (reclaim === 'configured') {
+    if (oversized) {
+      return {
+        warn: true,
+        text:
+          ' — memory reclaim is configured but unverified, and the runtime is sized as if it works;' +
+          ` verify with \`clustercode onboard --verify-reclaim\` or ${lower}`,
+      };
+    }
+    return {
+      warn: false,
+      text: ' (memory reclaim configured but unverified — `clustercode onboard --verify-reclaim`)',
+    };
+  }
+
+  // Measured, and it does nothing here. No amount of configuration will change
+  // that, so the only remaining lever is the size itself.
+  if (reclaim === 'inert') {
+    if (oversized) {
+      return {
+        warn: true,
+        text: ` — memory reclaim does not return memory on this Windows build; ${lower}`,
+      };
+    }
+    return { warn: false, text: ' (memory reclaim inert on this build)' };
+  }
+
+  // Measured and working: this host has earned the smaller reserve, which may
+  // be news to a runtime that was sized conservatively before anyone knew.
+  // Deliberately not routed through `dedicatedNudge`, which stays quiet once a
+  // size is stored — the stored size was chosen under the old assumption.
+  if (reclaim === 'enforced') {
+    const enforcedRec = recommendForUse(hostBytes, platform, 'dedicated', 'enforced');
+    if (engineMib < enforcedRec && estimateDevboxes(enforcedRec) > estimateDevboxes(engineMib)) {
+      return {
+        warn: false,
+        text: ` (memory reclaim verified — up to ${gib(enforcedRec * MIB)} GiB; see \`clustercode onboard\`)`,
+      };
+    }
+  }
+
+  return silent;
 }
 
 export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResult {
@@ -463,13 +518,14 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     }
     // A runtime that is holding the host's memory is not a passing reading, and
     // the nudge (which asks for MORE memory) would be exactly wrong there.
-    if (reclaimNote) return { name, status: 'warn', detail: `${base}${reclaimNote}` };
+    if (reclaimNote.warn) return { name, status: 'warn', detail: `${base}${reclaimNote.text}` };
     // Nothing to do beyond a possible nudge: do not append an action the
-    // user has no reason to take.
+    // user has no reason to take. A reclaim note displaces the nudge rather
+    // than joining it — two suggestions on one line is neither.
     return {
       name,
       status: 'pass',
-      detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform, provider)}`,
+      detail: `${base}${reclaimNote.text || dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform, provider)}`,
     };
   }
 
@@ -487,12 +543,12 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
     };
   }
 
-  if (reclaimNote) return { name, status: 'warn', detail: `${base}${reclaimNote}` };
+  if (reclaimNote.warn) return { name, status: 'warn', detail: `${base}${reclaimNote.text}` };
 
   return {
     name,
     status: 'pass',
-    detail: `${base}${dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform, provider)}`,
+    detail: `${base}${reclaimNote.text || dedicatedNudge(configuredMib, engineMib, dedicatedRecommendation, engineName, platform, provider)}`,
   };
 }
 

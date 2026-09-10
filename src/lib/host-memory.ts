@@ -134,8 +134,29 @@ export function evaluateHostMemory(r: HostMemoryReading): CheckResult {
   return {
     name,
     status: 'warn',
-    detail: `${shortfall}; memory reclaim is ${r.reclaim === 'enforced' ? 'on but not keeping up' : 'off'} — see the docs`,
+    detail: `${shortfall}; memory reclaim is ${reclaimPhrase(r.reclaim)} — see the docs`,
   };
+}
+
+/**
+ * How to describe reclaim to someone whose host is already short of memory.
+ *
+ * The four cases are genuinely different diagnoses — a feature that is working
+ * and simply outpaced, one nobody has checked, one measured to do nothing on
+ * this build, and one that was never switched on — and they lead to different
+ * next steps.
+ */
+function reclaimPhrase(reclaim: HostReclaimStatus): string {
+  switch (reclaim) {
+    case 'enforced':
+      return 'on but not keeping up';
+    case 'configured':
+      return 'configured but unverified';
+    case 'inert':
+      return 'on but inert on this build';
+    default:
+      return 'off';
+  }
 }
 
 /**
