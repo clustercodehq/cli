@@ -2,8 +2,14 @@ import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { patchWslConfig, type MachineProvider } from './runtime-memory.js';
+import type { MachineProvider } from './runtime-memory.js';
 import { memoryKnob } from './memory-knob.js';
+import {
+  patchWslConfigEntries,
+  wslMemoryEntry,
+  WSL_RECLAIM_ENTRY,
+  type WslEntry,
+} from './wslconfig.js';
 import type { EngineName } from './engine-install.js';
 
 export interface ApplyPlan {
@@ -27,6 +33,7 @@ export function planMemoryApply(
   platform: NodeJS.Platform,
   engineName: string,
   memoryMib: number,
+  opts: { reclaim?: boolean } = {},
 ): ApplyPlan {
   // An engine we do not recognise gets no command sequence at all. Coercing
   // anything non-Docker to Podman meant a future engine name, or an empty one,
@@ -49,8 +56,12 @@ export function planMemoryApply(
   if (knob.via === 'wslconfig') {
     return {
       kind: 'wslconfig',
-      steps: [`Set memory=${memoryMib}MB in .wslconfig`, 'wsl --shutdown', 'podman machine start'],
-      warning: 'This restarts all WSL distributions, not just the ClusterCode one.',
+      steps: [
+        `Set memory=${memoryMib}MB in [wsl2] of .wslconfig`,
+        ...(opts.reclaim ? [reclaimStep()] : []),
+        ...WSL_RESTART_STEPS,
+      ],
+      warning: WSL_RESTART_WARNING,
     };
   }
 
@@ -64,58 +75,105 @@ export function planMemoryApply(
   };
 }
 
+/** Both .wslconfig paths end the same way: the file is only read at VM start. */
+const WSL_RESTART_STEPS = ['wsl --shutdown', 'podman machine start'];
+const WSL_RESTART_WARNING = 'This restarts all WSL distributions, not just the ClusterCode one.';
+
+function reclaimStep(): string {
+  return `Set ${WSL_RECLAIM_ENTRY.key}=${WSL_RECLAIM_ENTRY.value} in [${WSL_RECLAIM_ENTRY.section}] of .wslconfig`;
+}
+
+/**
+ * Turn on memory reclaim without changing the allocation.
+ *
+ * An install whose `memory=` is already right can still be holding the host's
+ * memory hostage, so the reclaim entry has to be applicable on its own rather
+ * than only as a rider on a resize.
+ */
+export function planWslReclaimApply(): ApplyPlan {
+  return {
+    kind: 'wslconfig',
+    steps: [reclaimStep(), ...WSL_RESTART_STEPS],
+    warning: WSL_RESTART_WARNING,
+  };
+}
+
 export function wslConfigPath(): string {
   return join(homedir(), '.wslconfig');
 }
 
+/** Sentinel for "the file exists but is not UTF-8"; the caller words the fix. */
+const NOT_UTF8 = 'not-utf8';
+
 /**
- * Patch .wslconfig in place, backing it up the first time.
+ * Read .wslconfig, refusing anything that is not UTF-8.
  *
  * The encoding check is not paranoia: Windows PowerShell 5.1's `Set-Content` and
  * `>` write UTF-16LE, and Notepad's legacy "ANSI" save writes Windows-1252 —
  * both realistic origins for a hand-created .wslconfig. Read as utf-8, either
  * one decodes to garbage (NUL-interleaved text, or replacement characters for
  * any byte >= 0x80), and we would rewrite the user's settings with that garbage
- * — destroying the very settings this function exists to preserve. Refuse
- * rather than corrupt.
+ * — destroying the very settings the patcher exists to preserve. Refuse rather
+ * than corrupt. `text: null` with no error means "no file yet".
  */
-export function applyWslMemory(memoryMib: number): { ok: boolean; error?: string } {
+export function readWslConfigUtf8(): { text: string | null; error?: string } {
   const path = wslConfigPath();
   try {
-    let existing: string | null = null;
-    if (existsSync(path)) {
-      const buf = readFileSync(path);
-      // A .wslconfig is plain text — a NUL byte means some UTF-16 variant. This
-      // must be checked separately from the round-trip below: BOM-less UTF-16LE
-      // holding ASCII is byte-for-byte valid UTF-8 (NUL is a legal codepoint), so
-      // it round-trips cleanly and would otherwise slip through and be corrupted.
-      if (buf.includes(0)) {
-        return {
-          ok: false,
-          error: `${path} is not UTF-8 encoded. Set [wsl2] memory=${memoryMib}MB manually.`,
-        };
-      }
-      const decoded = buf.toString('utf-8');
-      // Round-trip rather than sniffing a specific encoding: anything that is
-      // not valid UTF-8 (UTF-16 with a BOM, Windows-1252, ...) fails to
-      // re-encode to the same bytes. Refuse rather than silently rewriting the
-      // user's content as replacement characters.
-      if (!Buffer.from(decoded, 'utf-8').equals(buf)) {
-        return {
-          ok: false,
-          error: `${path} is not UTF-8 encoded. Set [wsl2] memory=${memoryMib}MB manually.`,
-        };
-      }
-      existing = decoded;
-    }
-    if (existing !== null && !existsSync(`${path}.bak`)) {
+    if (!existsSync(path)) return { text: null };
+    const buf = readFileSync(path);
+    // A .wslconfig is plain text — a NUL byte means some UTF-16 variant. This
+    // must be checked separately from the round-trip below: BOM-less UTF-16LE
+    // holding ASCII is byte-for-byte valid UTF-8 (NUL is a legal codepoint), so
+    // it round-trips cleanly and would otherwise slip through and be corrupted.
+    if (buf.includes(0)) return { text: null, error: NOT_UTF8 };
+    const decoded = buf.toString('utf-8');
+    // Round-trip rather than sniffing a specific encoding: anything that is not
+    // valid UTF-8 (UTF-16 with a BOM, Windows-1252, ...) fails to re-encode to
+    // the same bytes.
+    if (!Buffer.from(decoded, 'utf-8').equals(buf)) return { text: null, error: NOT_UTF8 };
+    return { text: decoded };
+  } catch (err) {
+    return { text: null, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** What to tell a user who must now make these changes by hand. */
+function manualInstruction(entries: WslEntry[]): string {
+  return entries.map((e) => `[${e.section}] ${e.key}=${e.value}`).join(' and ');
+}
+
+/**
+ * Patch .wslconfig in place, backing it up the first time.
+ *
+ * Every entry is applied in a single read, a single backup and a single write,
+ * so a change spanning two sections cannot half-land.
+ */
+export function applyWslEntries(entries: WslEntry[]): { ok: boolean; error?: string } {
+  const path = wslConfigPath();
+  const read = readWslConfigUtf8();
+  if (read.error !== undefined) {
+    return {
+      ok: false,
+      error:
+        read.error === NOT_UTF8
+          ? `${path} is not UTF-8 encoded. Set ${manualInstruction(entries)} manually.`
+          : read.error,
+    };
+  }
+  try {
+    if (read.text !== null && !existsSync(`${path}.bak`)) {
       copyFileSync(path, `${path}.bak`);
     }
-    writeFileSync(path, patchWslConfig(existing, memoryMib), 'utf-8');
+    writeFileSync(path, patchWslConfigEntries(read.text, entries), 'utf-8');
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/** Set `[wsl2] memory=` and nothing else. */
+export function applyWslMemory(memoryMib: number): { ok: boolean; error?: string } {
+  return applyWslEntries([wslMemoryEntry(memoryMib)]);
 }
 
 export function runApplySteps(steps: string[]): { ok: boolean; failed?: string } {
