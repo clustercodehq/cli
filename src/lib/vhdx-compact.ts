@@ -151,7 +151,8 @@ export function elevatedRunnerScript(diskpartPath: string, files: ElevationFiles
     '  $rc = 1',
     `  "$_" | Out-File -LiteralPath ${q(files.compactLog)} -Append -Encoding Unicode`,
     '} finally {',
-    `  if (Test-Path -LiteralPath ${q(files.detachScript)}) { diskpart /s (ShortOf ${q(files.detachScript)}) *> ${q(files.detachLog)} }`,
+    // Microsoft asks for at least 15 s between consecutive diskpart scripts, or the next may fail.
+    `  if (Test-Path -LiteralPath ${q(files.detachScript)}) { Start-Sleep -Seconds 15; diskpart /s (ShortOf ${q(files.detachScript)}) *> ${q(files.detachLog)} }`,
     `  Set-Content -LiteralPath ${q(files.done)} -Value $rc -Encoding Ascii`,
     '}',
     'exit $rc',

@@ -116,7 +116,15 @@ describe('elevatedRunnerScript', () => {
     assert.ok(finallyAt > compactAt, script);
     assert.ok(detachAt > finallyAt, script);
     // Only once the detach script exists: a failure before writing it has nothing to detach.
-    assert.match(script, /if \(Test-Path -LiteralPath 'C:\\t\\detach\.txt'\) \{ diskpart/);
+    assert.match(script, /if \(Test-Path -LiteralPath 'C:\\t\\detach\.txt'\) \{ Start-Sleep -Seconds 15; diskpart/);
+  });
+
+  it('leaves diskpart 15 seconds to shut down before running it again', () => {
+    // Microsoft: allow at least 15 seconds between consecutive diskpart scripts,
+    // or the next one might fail.
+    const sleepAt = script.indexOf('Start-Sleep -Seconds 15');
+    assert.ok(sleepAt > script.indexOf('finally {'), script);
+    assert.ok(sleepAt < script.indexOf("diskpart /s (ShortOf 'C:\\t\\detach.txt')"), script);
   });
 
   it('exits with the compact exit code, defaulting to failure and never reading a missing code as success', () => {
