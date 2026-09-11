@@ -844,6 +844,50 @@ async function offerRuntimeMemory(
     }
   }
 
+  // A size above the no-reclaim ceiling is only safe while reclaim is verified.
+  // A stored size can outlive the verdict that justified it — a WSL update
+  // re-opens the question — and the ordinary path would then report "already
+  // about that size" and leave the host exposed without a word.
+  const noReclaimCeiling = storedSizeAboveNoReclaimCeiling({
+    hostBytes,
+    platform,
+    status: reclaimStatus,
+    targetMib: target,
+  });
+  if (noReclaimCeiling !== null) {
+    const canVerify = reclaimVerificationRefusal({ engineName, provider, status: reclaimStatus }) === null;
+    clack.log.warn(
+      `${target}MB is above the ${noReclaimCeiling}MB ceiling for this machine while memory reclaim is not verified, ` +
+        'so the runtime can hold on to memory Windows needs.',
+    );
+    const fromStoredConfig = flagMemory === undefined && requested !== null;
+    if (fromStoredConfig && process.stdin.isTTY && !verifyRequested) {
+      const choice = await clack.select({
+        message: 'What should happen to the runtime size?',
+        options: [
+          ...(canVerify
+            ? [{ value: 'verify' as const, label: 'Verify memory reclaim now (about 10 minutes; the runtime must stay idle)' }]
+            : []),
+          { value: 'lower' as const, label: `Lower the runtime to ${noReclaimCeiling}MB` },
+          { value: 'keep' as const, label: `Keep ${target}MB` },
+        ],
+      });
+      if (clack.isCancel(choice)) return true;
+      if (choice === 'lower') {
+        target = noReclaimCeiling;
+      } else if (choice === 'verify' && (await runReclaimVerification()) !== 'yes') {
+        const lower = await clack.confirm({ message: `Lower the runtime to ${noReclaimCeiling}MB?` });
+        if (!clack.isCancel(lower) && lower) target = noReclaimCeiling;
+      }
+    } else {
+      clack.log.info(
+        canVerify
+          ? `Verify reclaim with \`clustercode onboard --verify-reclaim\`, or lower the runtime with \`clustercode onboard --memory ${noReclaimCeiling}\`.`
+          : `Lower the runtime with \`clustercode onboard --memory ${noReclaimCeiling}\`.`,
+      );
+    }
+  }
+
   // Show what the chosen number actually buys before asking to apply it —
   // regardless of which path picked it (flag, stored config, a preset, or a
   // custom amount).
@@ -1156,6 +1200,25 @@ export async function runReclaimVerification(
   if (result === 'yes') log.success(detail);
   else log.warn(detail);
   return result;
+}
+
+/**
+ * The no-reclaim ceiling, when a runtime size is above it on a host whose
+ * reclaim is not verified — null when there is nothing to say.
+ *
+ * A size chosen while reclaim was verified outlives the verdict that justified
+ * it: a WSL update re-opens the question and sizing turns conservative again,
+ * but the stored number (and the VM already running at it) stays where it was.
+ */
+export function storedSizeAboveNoReclaimCeiling(ctx: {
+  hostBytes: number;
+  platform: NodeJS.Platform;
+  status: HostReclaimStatus;
+  targetMib: number;
+}): number | null {
+  if (ctx.platform !== 'win32' || ctx.status === 'enforced' || ctx.status === 'n/a') return null;
+  const ceiling = recommendForUse(ctx.hostBytes, ctx.platform, 'dedicated', 'none');
+  return ceiling > 0 && ctx.targetMib > ceiling ? ceiling : null;
 }
 
 /**

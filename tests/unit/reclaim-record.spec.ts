@@ -2,6 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   runReclaimVerification,
+  storedSizeAboveNoReclaimCeiling,
   type ReclaimVerificationDeps,
 } from '../../src/commands/onboard.js';
 import { recordManualReclaimVerdict, type ManualVerdictDeps } from '../../src/commands/config.js';
@@ -198,3 +199,29 @@ describe('recordManualReclaimVerdict', () => {
   });
 });
 
+describe('storedSizeAboveNoReclaimCeiling', () => {
+  const HOST_32GIB = 32768 * 1024 * 1024;
+  // No-reclaim dedicated ceiling on 32 GiB is 24576; the old table gave 26624.
+  const base = { hostBytes: HOST_32GIB, platform: 'win32' as NodeJS.Platform, targetMib: 26624 };
+
+  // A size chosen while reclaim was verified outlives the verdict that justified
+  // it: a WSL update re-opens the question, but the stored number stays.
+  test('names the ceiling when a stored size is above it and reclaim is not verified', () => {
+    for (const status of ['configured', 'inert', 'off', 'unsupported'] as const) {
+      assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status }), 24576, status);
+    }
+  });
+
+  test('is quiet when reclaim is verified', () => {
+    assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status: 'enforced' }), null);
+  });
+
+  test('is quiet at or below the ceiling', () => {
+    assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status: 'configured', targetMib: 24576 }), null);
+  });
+
+  test('is quiet where reclaim is not a question', () => {
+    assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status: 'n/a' }), null);
+    assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, platform: 'darwin', status: 'n/a' }), null);
+  });
+});

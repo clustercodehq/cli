@@ -312,4 +312,35 @@ describe('onboard memory step on Podman over WSL', () => {
     // The original is kept, once.
     assert.equal(readFileSync(join(tempHome, '.wslconfig.bak'), 'utf-8'), EXISTING_WSLCONFIG);
   });
+
+  // A size chosen while reclaim was verified outlives the verdict. Here the
+  // verdict carries the wildcard stamp earlier builds wrote, which now matches
+  // no build — so the stored size is above what an unverified host can carry,
+  // and the run must say so instead of "already about that size" alone.
+  it('warns when a stored size is above the ceiling for an unverified host', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+    const hostMib = Math.floor(totalmem() / 1024 / 1024);
+    const storedMib = hostMib - 6144; // the reserve a verified host is sized with
+    seedConfigs();
+    writeFileSync(
+      join(tempHome, '.clustercode', 'config.json'),
+      JSON.stringify({
+        RUNTIME_MEMORY_MB: String(storedMib),
+        RUNTIME_RECLAIM_VERIFIED: 'yes',
+        RUNTIME_RECLAIM_VERIFIED_WSL: 'manual',
+      }),
+    );
+    createPodmanWslStubs(storedMib * 1024 * 1024);
+    writeFileSync(
+      join(tempHome, '.wslconfig'),
+      ['[wsl2]', `memory=${storedMib}MB`, '', '[experimental]', 'autoMemoryReclaim=gradual', ''].join('\r\n'),
+      'utf-8',
+    );
+    if (skipUnlessStubbed()) return;
+
+    const { stdout, exitCode } = runOnboard([]);
+    assert.equal(exitCode, 0, stdout);
+    assert.match(stdout, new RegExp(`${storedMib}MB is above the \\d+MB ceiling`));
+    assert.match(stdout, /--verify-reclaim/);
+    assert.match(stdout, /Already about that size/);
+  });
 });
