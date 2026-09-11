@@ -1,12 +1,18 @@
+import { execFileSync } from 'node:child_process';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  diskpartPathScript,
   diskpartScripts,
   elevatedRunnerScript,
+  elevationFiles,
   elevationLauncherScript,
   encodePowerShell,
-  interpretElevation,
+  interpretDiskpart,
+  interpretLauncher,
   logTail,
+  parseDiskpartPath,
+  PATH_NOT_REPRESENTABLE_EXIT,
   psQuote,
   releaseProbeScript,
   compactPlanSteps,
@@ -54,28 +60,117 @@ describe('psQuote', () => {
   });
 });
 
-describe('elevatedRunnerScript', () => {
-  const paths = { compactScript: 'C:\\t\\compact.txt', detachScript: 'C:\\t\\detach.txt', log: 'C:\\t\\log.txt' };
-  const script = elevatedRunnerScript(paths);
+describe('elevationFiles', () => {
+  it('keeps every file the elevated side touches in the one temporary folder', () => {
+    const f = elevationFiles('C:\\t');
+    assert.deepEqual(f, {
+      dir: 'C:\\t',
+      runScript: 'C:\\t\\run.ps1',
+      compactScript: 'C:\\t\\compact.txt',
+      detachScript: 'C:\\t\\detach.txt',
+      compactLog: 'C:\\t\\compact.log',
+      detachLog: 'C:\\t\\detach.log',
+      started: 'C:\\t\\started',
+      done: 'C:\\t\\done',
+    });
+  });
+});
 
-  it('runs the compact inside try and the detach inside finally', () => {
-    const tryAt = script.indexOf('try {');
-    const compactAt = script.indexOf("diskpart /s 'C:\\t\\compact.txt'");
-    const finallyAt = script.indexOf('finally {');
-    const detachAt = script.indexOf("diskpart /s 'C:\\t\\detach.txt'");
-    assert.ok(tryAt >= 0 && compactAt > tryAt, script);
-    assert.ok(finallyAt > compactAt, script);
-    assert.ok(detachAt > finallyAt, script);
+describe('elevatedRunnerScript', () => {
+  const files = elevationFiles('C:\\t');
+  const script = elevatedRunnerScript(VHDX, files);
+
+  it('writes both diskpart scripts itself, in the OEM code page diskpart reads', () => {
+    const { compact, detach } = diskpartScripts(VHDX);
+    const lines = (text: string) => text.trim().split(/\r\n/).map(psQuote).join(',');
+    assert.ok(
+      script.includes(`${lines(detach)} | Out-File -LiteralPath 'C:\\t\\detach.txt' -Encoding OEM -ErrorAction Stop`),
+      script,
+    );
+    assert.ok(
+      script.includes(`${lines(compact)} | Out-File -LiteralPath 'C:\\t\\compact.txt' -Encoding OEM -ErrorAction Stop`),
+      script,
+    );
   });
 
-  it('exits with the compact exit code, defaulting to failure', () => {
-    assert.match(script, /\$rc = 1/);
-    assert.match(script, /\$rc = \$LASTEXITCODE/);
+  it('keeps a non-ASCII path intact in the script, for PowerShell to convert', () => {
+    const path = 'C:\\Users\\Zoë 漢字\\wsl\\ext4.vhdx';
+    assert.ok(elevatedRunnerScript(path, files).includes(`'select vdisk file="${path}"'`));
+  });
+
+  it('marks that it started before anything else, and that it finished last', () => {
+    const tryAt = script.indexOf('try {');
+    const startedAt = script.indexOf("Set-Content -LiteralPath 'C:\\t\\started'");
+    const writeAt = script.indexOf('Out-File');
+    const doneAt = script.indexOf("Set-Content -LiteralPath 'C:\\t\\done' -Value $rc");
+    const exitAt = script.lastIndexOf('exit $rc');
+    assert.ok(tryAt >= 0 && startedAt > tryAt && writeAt > startedAt, script);
+    assert.ok(doneAt > script.indexOf('finally {') && exitAt > doneAt, script);
+  });
+
+  it('runs the compact inside try and the detach inside finally, each with its own log', () => {
+    const compactAt = script.indexOf("diskpart /s (ShortOf 'C:\\t\\compact.txt') *> 'C:\\t\\compact.log'");
+    const finallyAt = script.indexOf('finally {');
+    const detachAt = script.indexOf("diskpart /s (ShortOf 'C:\\t\\detach.txt') *> 'C:\\t\\detach.log'");
+    assert.ok(compactAt > script.indexOf('try {'), script);
+    assert.ok(finallyAt > compactAt, script);
+    assert.ok(detachAt > finallyAt, script);
+    // Only once the detach script exists: a failure before writing it has nothing to detach.
+    assert.match(script, /if \(Test-Path -LiteralPath 'C:\\t\\detach\.txt'\) \{ diskpart/);
+  });
+
+  it('exits with the compact exit code, defaulting to failure and never reading a missing code as success', () => {
+    assert.match(script, /^\$rc = 1/);
+    assert.match(script, /if \(\$null -eq \$LASTEXITCODE\) \{ 1 \} else \{ \$LASTEXITCODE \}/);
+    assert.match(script, /catch \{\r\n\s+\$rc = 1/);
     assert.match(script, /exit \$rc\s*$/);
   });
 
-  it('appends all output to the log', () => {
-    assert.equal(script.split("*>> 'C:\\t\\log.txt'").length - 1, 2);
+  it('records why the script failed in the compact log', () => {
+    assert.ok(script.includes("Out-File -LiteralPath 'C:\\t\\compact.log' -Append -Encoding Unicode"), script);
+  });
+});
+
+describe('diskpartPathScript', () => {
+  const script = diskpartPathScript(VHDX);
+
+  it('checks the path against the system OEM code page', () => {
+    assert.ok(script.includes("'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage' -Name OEMCP"), script);
+    assert.match(script, /GetEncoding\(\$cp\)/);
+    // A round trip catches both unmappable characters and best-fit substitutions.
+    assert.match(script, /GetString\(\$enc\.GetBytes\(\$s\)\) -ceq \$s/);
+  });
+
+  it('falls back to the short 8.3 path, and gives up with a distinct exit code', () => {
+    assert.ok(script.includes(`GetFile(${psQuote(VHDX)}).ShortPath`), script);
+    assert.ok(script.includes(`exit ${PATH_NOT_REPRESENTABLE_EXIT}`), script);
+  });
+
+  it('prints the chosen path as base64 UTF-16LE, immune to the console code page', () => {
+    assert.match(script, /\[Convert\]::ToBase64String\(\[System\.Text\.Encoding\]::Unicode\.GetBytes\(\$path\)\)/);
+  });
+});
+
+describe('parseDiskpartPath', () => {
+  const b64 = (text: string) => Buffer.from(text, 'utf16le').toString('base64');
+
+  it('decodes the chosen path, non-ASCII included', () => {
+    assert.deepEqual(parseDiskpartPath(0, `${b64('C:\\USERS\\ZOË~1\\ext4.vhdx')}\r\n`), {
+      ok: true,
+      path: 'C:\\USERS\\ZOË~1\\ext4.vhdx',
+    });
+  });
+
+  it('reports a path diskpart cannot read', () => {
+    assert.deepEqual(parseDiskpartPath(PATH_NOT_REPRESENTABLE_EXIT, ''), { ok: false, reason: 'not-representable' });
+  });
+
+  it('reports anything else as a failed check, never as a usable path', () => {
+    assert.deepEqual(parseDiskpartPath(1, b64('C:\\x')), { ok: false, reason: 'check-failed' });
+    assert.deepEqual(parseDiskpartPath(null, ''), { ok: false, reason: 'check-failed' });
+    assert.deepEqual(parseDiskpartPath(0, ''), { ok: false, reason: 'check-failed' });
+    assert.deepEqual(parseDiskpartPath(0, 'not base64!'), { ok: false, reason: 'check-failed' });
+    assert.deepEqual(parseDiskpartPath(0, b64('C:\\bad"path')), { ok: false, reason: 'check-failed' });
   });
 });
 
@@ -114,29 +209,63 @@ describe('releaseProbeScript', () => {
   });
 });
 
-describe('interpretElevation', () => {
-  it('reads 0 as success', () => {
-    assert.deepEqual(interpretElevation(0, ''), { kind: 'ok' });
-  });
-
+describe('interpretLauncher', () => {
   it('reads 1223 as a declined UAC prompt', () => {
-    assert.deepEqual(interpretElevation(1223, ''), { kind: 'declined' });
+    assert.deepEqual(interpretLauncher(1223, ''), { kind: 'declined' });
   });
 
   it('reads the unavailable code as no way to elevate', () => {
-    assert.deepEqual(interpretElevation(ELEVATION_UNAVAILABLE_EXIT, ''), { kind: 'unavailable' });
+    assert.deepEqual(interpretLauncher(ELEVATION_UNAVAILABLE_EXIT, ''), { kind: 'unavailable' });
+  });
+
+  it('reads anything else, success included, as a failure: the elevated script never ran', () => {
+    for (const code of [0, 1, null]) {
+      const r = interpretLauncher(code, 'Start-Process : This command cannot be run.');
+      assert.equal(r.kind, 'failed', String(code));
+      assert.ok(r.kind === 'failed' && /cannot be run/.test(r.logTail));
+    }
+  });
+});
+
+describe('interpretDiskpart', () => {
+  it('reads 0 as success', () => {
+    assert.deepEqual(interpretDiskpart(0, 'DiskPart successfully compacted the virtual disk file.'), { kind: 'ok' });
   });
 
   it('reads anything else as a failure carrying the end of the log', () => {
     const log = 'line1\r\nDiskPart has encountered an error: The process cannot access the file.\r\n';
-    const r = interpretElevation(5, log);
-    assert.equal(r.kind, 'failed');
+    const r = interpretDiskpart(5, log);
     assert.ok(r.kind === 'failed' && r.exitCode === 5);
     assert.ok(r.kind === 'failed' && /cannot access the file/.test(r.logTail));
+    assert.equal(interpretDiskpart(null, '').kind, 'failed');
   });
+});
 
-  it('treats a launcher that never ran as a failure', () => {
-    assert.equal(interpretElevation(null, '').kind, 'failed');
+/**
+ * Windows only, and read-only: PowerShell's own parser checks each generated
+ * script without running it.
+ */
+describe('generated PowerShell', { skip: process.platform !== 'win32' }, () => {
+  it('parses without errors', () => {
+    const files = elevationFiles("C:\\Users\\Zoë O'Brien\\AppData\\Local\\Temp\\cc-x");
+    const scripts = {
+      runner: elevatedRunnerScript("C:\\Users\\Zoë O'Brien\\wsl\\ext4.vhdx", files),
+      launcher: elevationLauncherScript(files.runScript),
+      probe: releaseProbeScript(VHDX),
+      path: diskpartPathScript('C:\\Users\\漢字\\ext4.vhdx'),
+    };
+    const check = Object.entries(scripts)
+      .map(
+        ([name, text]) =>
+          `$e = $null; [void][System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodePowerShell(text)}')), [ref]$null, [ref]$e); ` +
+          `if ($e.Count) { '${name}: ' + ($e | ForEach-Object { $_.Message }) -join '; ' }`,
+      )
+      .join('\r\n');
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShell(check)], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 60_000,
+    }).toString('utf8');
+    assert.equal(out.trim(), '');
   });
 });
 

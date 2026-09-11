@@ -1,10 +1,10 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, win32 } from 'node:path';
 import { decodeConsoleOutput, POWERSHELL_PROBE_TIMEOUT_MS } from './checks.js';
 import { ENGINE_QUERY_TIMEOUT_MS, parseContainerNames } from './engine-containers.js';
-import { runProcess } from './run-process.js';
+import { runProcess, type ProcessResult } from './run-process.js';
 import {
   driveLetterOf,
   formatGb,
@@ -90,22 +90,117 @@ export function psQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+/** Every file the elevated side reads or writes, in one temporary folder. */
+export interface ElevationFiles {
+  dir: string;
+  runScript: string;
+  compactScript: string;
+  detachScript: string;
+  compactLog: string;
+  detachLog: string;
+  /** Written first by the elevated script: approval was given and it ran. */
+  started: string;
+  /** Written last, holding diskpart's exit code: it finished. */
+  done: string;
+}
+
+export function elevationFiles(dir: string): ElevationFiles {
+  const at = (name: string) => win32.join(dir, name);
+  return {
+    dir,
+    runScript: at('run.ps1'),
+    compactScript: at('compact.txt'),
+    detachScript: at('detach.txt'),
+    compactLog: at('compact.log'),
+    detachLog: at('detach.log'),
+    started: at('started'),
+    done: at('done'),
+  };
+}
+
 /**
  * The script that runs elevated.
+ *
+ * It writes the diskpart scripts itself with `Out-File -Encoding OEM`: diskpart
+ * reads a `/s` script in the OEM code page, and `diskpartPath` was checked to
+ * fit that code page before anything was stopped. The script files themselves
+ * are handed over by their short names, in case the temp folder's path does not
+ * fit it.
  *
  * diskpart stops at the first failing command of a script, so a failed compact
  * would skip the detach inside the same script. Only the `finally` guarantees it.
  * `-RedirectStandardOutput` cannot be combined with `-Verb RunAs`, so output
- * goes to a log file the unelevated side reads afterwards.
+ * goes to log files the unelevated side reads afterwards.
  */
-export function elevatedRunnerScript(paths: { compactScript: string; detachScript: string; log: string }): string {
-  const log = psQuote(paths.log);
+export function elevatedRunnerScript(diskpartPath: string, files: ElevationFiles): string {
+  const { compact, detach } = diskpartScripts(diskpartPath);
+  const lines = (script: string) => script.trim().split('\r\n').map(psQuote).join(',');
+  const q = psQuote;
   return [
     '$rc = 1',
-    `try { diskpart /s ${psQuote(paths.compactScript)} *>> ${log}; $rc = $LASTEXITCODE }`,
-    `finally { diskpart /s ${psQuote(paths.detachScript)} *>> ${log} }`,
+    'function ShortOf([string]$p) { try { (New-Object -ComObject Scripting.FileSystemObject).GetFile($p).ShortPath } catch { $p } }',
+    'try {',
+    `  Set-Content -LiteralPath ${q(files.started)} -Value 'started' -Encoding Ascii -ErrorAction Stop`,
+    `  ${lines(detach)} | Out-File -LiteralPath ${q(files.detachScript)} -Encoding OEM -ErrorAction Stop`,
+    `  ${lines(compact)} | Out-File -LiteralPath ${q(files.compactScript)} -Encoding OEM -ErrorAction Stop`,
+    '  $global:LASTEXITCODE = $null',
+    `  diskpart /s (ShortOf ${q(files.compactScript)}) *> ${q(files.compactLog)}`,
+    // A diskpart that never ran leaves no exit code; that must not read as success.
+    '  $rc = if ($null -eq $LASTEXITCODE) { 1 } else { $LASTEXITCODE }',
+    '} catch {',
+    '  $rc = 1',
+    `  "$_" | Out-File -LiteralPath ${q(files.compactLog)} -Append -Encoding Unicode`,
+    '} finally {',
+    `  if (Test-Path -LiteralPath ${q(files.detachScript)}) { diskpart /s (ShortOf ${q(files.detachScript)}) *> ${q(files.detachLog)} }`,
+    `  Set-Content -LiteralPath ${q(files.done)} -Value $rc -Encoding Ascii`,
+    '}',
     'exit $rc',
   ].join('\r\n');
+}
+
+/** Exit code of `diskpartPathScript` when neither the path nor its short name fits the OEM code page. */
+export const PATH_NOT_REPRESENTABLE_EXIT = 3;
+
+/**
+ * Unelevated, read-only, and run before anything is stopped: pick the path
+ * diskpart will be given.
+ *
+ * diskpart reads its script in the system's OEM code page, so a path with a
+ * character outside it (a user name in another script, say) would name a file
+ * that does not exist. The path is used as is when it survives a round trip
+ * through that code page, otherwise its short 8.3 name when that does (short
+ * names can be disabled per drive). The answer is printed as base64 so the
+ * console code page cannot mangle it on the way back.
+ */
+export function diskpartPathScript(vhdxPath: string): string {
+  return [
+    'try {',
+    "  $cp = [int](Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage' -Name OEMCP -ErrorAction Stop).OEMCP",
+    '  $enc = [System.Text.Encoding]::GetEncoding($cp)',
+    '  function Fits([string]$s) { $enc.GetString($enc.GetBytes($s)) -ceq $s }',
+    `  $path = ${psQuote(vhdxPath)}`,
+    '  if (-not (Fits $path)) {',
+    `    $path = (New-Object -ComObject Scripting.FileSystemObject).GetFile(${psQuote(vhdxPath)}).ShortPath`,
+    `    if (-not $path -or -not (Fits $path)) { exit ${PATH_NOT_REPRESENTABLE_EXIT} }`,
+    '  }',
+    '  [Console]::Out.Write([Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($path)))',
+    '  exit 0',
+    '} catch {',
+    '  exit 1',
+    '}',
+  ].join('\r\n');
+}
+
+export type DiskpartPath = { ok: true; path: string } | { ok: false; reason: 'not-representable' | 'check-failed' };
+
+export function parseDiskpartPath(exitCode: number | null, stdout: string): DiskpartPath {
+  if (exitCode === PATH_NOT_REPRESENTABLE_EXIT) return { ok: false, reason: 'not-representable' };
+  const encoded = stdout.trim();
+  if (exitCode !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return { ok: false, reason: 'check-failed' };
+  const path = Buffer.from(encoded, 'base64').toString('utf16le');
+  // diskpart has no escape for a double quote inside file="...".
+  if (path === '' || path.includes('"')) return { ok: false, reason: 'check-failed' };
+  return { ok: true, path };
 }
 
 /**
@@ -164,10 +259,24 @@ export function logTail(log: string, lines = 15): string {
     .join('\n');
 }
 
-export function interpretElevation(exitCode: number | null, log: string): ElevationResult {
-  if (exitCode === 0) return { kind: 'ok' };
+/** The launcher's own output, minus the CLIXML progress records PowerShell writes to a redirected stream. */
+export function stripClixml(output: string): string {
+  return output
+    .split(/\r?\n/)
+    .filter((line) => !/^(#< CLIXML|<Objs )/.test(line))
+    .join('\n');
+}
+
+/** The elevated script never started: why, from the launcher's exit code. */
+export function interpretLauncher(exitCode: number | null, output: string): ElevationResult {
   if (exitCode === ELEVATION_DECLINED_EXIT) return { kind: 'declined' };
   if (exitCode === ELEVATION_UNAVAILABLE_EXIT) return { kind: 'unavailable' };
+  return { kind: 'failed', exitCode, logTail: logTail(stripClixml(output)) };
+}
+
+/** The elevated script finished: diskpart's exit code and its log. */
+export function interpretDiskpart(exitCode: number | null, log: string): ElevationResult {
+  if (exitCode === 0) return { kind: 'ok' };
   return { kind: 'failed', exitCode, logTail: logTail(log) };
 }
 
@@ -279,6 +388,8 @@ export function handleTimeoutMessage(info: {
  */
 export interface CompactRunner {
   runningContainers(): Promise<string[] | null>;
+  /** Read-only; runs before anything is stopped. */
+  resolveDiskpartPath(vhdxPath: string): Promise<DiskpartPath>;
   fstrim(machine: string): Promise<{ ok: boolean; output: string }>;
   machineStop(machine: string): Promise<boolean>;
   wslTerminate(distro: string): Promise<boolean>;
@@ -287,7 +398,7 @@ export interface CompactRunner {
   listVmProcesses(): Promise<string[]>;
   now(): number;
   sleep(ms: number): Promise<void>;
-  elevateCompact(vhdxPath: string): Promise<ElevationResult>;
+  elevateCompact(diskpartPath: string): Promise<ElevationResult>;
   /** Must tolerate a machine that is already running. */
   machineStart(machine: string): Promise<boolean>;
   fileSize(path: string): Promise<number | null>;
@@ -333,6 +444,8 @@ export interface SizeSnapshot {
 export type CompactOutcome =
   /** `afterTrim`: the check right before stopping refused, after the trim ran. Nothing was stopped either way. */
   | { kind: 'blocked'; running: string[] | null; afterTrim: boolean }
+  /** diskpart could not be given a path it reads correctly. Nothing was stopped. */
+  | { kind: 'path-refused'; reason: Extract<DiskpartPath, { ok: false }>['reason'] }
   | { kind: 'compacted'; before: SizeSnapshot; after: SizeSnapshot; drive: string | null; restarted: boolean }
   | { kind: 'declined'; restarted: boolean }
   | { kind: 'unavailable'; restarted: boolean }
@@ -351,6 +464,13 @@ export async function compactVhdx(
   // stopping the machine under a live DevBox is not acceptable.
   const running = await settleWithin(() => runner.runningContainers(), probeMs, null);
   if (running === null || running.length > 0) return { kind: 'blocked', running, afterTrim: false };
+
+  // Before anything changes: a path diskpart would misread means nothing to compact.
+  const diskpartPath = await settleWithin(() => runner.resolveDiskpartPath(target.vhdxPath), probeMs, {
+    ok: false,
+    reason: 'check-failed',
+  } as const);
+  if (!diskpartPath.ok) return { kind: 'path-refused', reason: diskpartPath.reason };
 
   const steps = compactPlanSteps(target);
   const drive = driveLetterOf(target.vhdxPath);
@@ -377,7 +497,7 @@ export async function compactVhdx(
     return { kind: 'blocked', running: stillRunning, afterTrim: true };
   }
 
-  let result: Exclude<CompactOutcome, { kind: 'blocked' }>['kind'];
+  let result: Exclude<CompactOutcome, { kind: 'blocked' | 'path-refused' }>['kind'];
   let elevation: ElevationResult | null = null;
   let timeoutMessage = '';
   let after: SizeSnapshot = before;
@@ -415,7 +535,7 @@ export async function compactVhdx(
       });
     } else {
       log.step(steps[4]);
-      elevation = await runner.elevateCompact(target.vhdxPath);
+      elevation = await runner.elevateCompact(diskpartPath.path);
       result = elevation.kind === 'ok' ? 'compacted' : elevation.kind;
       if (elevation.kind === 'ok') after = await snapshot();
     }
@@ -479,6 +599,17 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
     };
   }
 
+  if (outcome.kind === 'path-refused') {
+    return {
+      ok: false,
+      lines: [
+        outcome.reason === 'not-representable'
+          ? "The disk's path has characters diskpart cannot read on this system, and it has no short (8.3) name to use instead, so nothing was stopped or compacted."
+          : "Could not check that diskpart can read the disk's path, so nothing was stopped or compacted.",
+      ],
+    };
+  }
+
   const lines: string[] = [];
   switch (outcome.kind) {
     case 'compacted': {
@@ -505,7 +636,11 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
       lines.push(outcome.message);
       break;
     case 'failed':
-      lines.push(`diskpart could not compact the disk (exit code ${outcome.exitCode ?? 'unknown'}).`);
+      lines.push(
+        outcome.exitCode === null
+          ? 'The disk was not compacted.'
+          : `diskpart could not compact the disk (exit code ${outcome.exitCode}).`,
+      );
       if (outcome.logTail) lines.push(outcome.logTail);
       break;
   }
@@ -526,46 +661,112 @@ function powershellArgs(script: string): string[] {
   return ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShell(script)];
 }
 
-async function elevateCompact(vhdxPath: string): Promise<ElevationResult> {
-  const dir = mkdtempSync(join(tmpdir(), 'clustercode-compact-'));
+/** File and process access for `elevateCompact`, injectable so its bookkeeping is testable anywhere. */
+export interface ElevationDeps {
+  makeTempDir(): string;
+  writeFile(path: string, data: Buffer): void;
+  /** `null` when the file does not exist or cannot be read. */
+  readFile(path: string): Buffer | null;
+  removeDir(path: string): void;
+  launch(args: string[], timeoutMs: number): Promise<ProcessResult>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+export function defaultElevationDeps(): ElevationDeps {
+  return {
+    makeTempDir: () => mkdtempSync(join(tmpdir(), 'clustercode-compact-')),
+    writeFile: (path, data) => writeFileSync(path, data),
+    readFile: (path) => {
+      try {
+        return readFileSync(path);
+      } catch {
+        return null;
+      }
+    },
+    removeDir: (path) => rmSync(path, { recursive: true, force: true }),
+    launch: (args, timeoutMs) => runProcess('powershell', args, timeoutMs),
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  };
+}
+
+const ELEVATION_POLL_MS = 2_000;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Compact through one UAC prompt. Never throws, and always settles by the deadline.
+ *
+ * The elevated script's own marker files, not the launcher, say whether it ran
+ * and how it ended: Ctrl+C reaches every process in the console, so the
+ * launcher can end while the elevated diskpart (in a console of its own) is
+ * still working. Restarting the machine under it would fail, so this waits for
+ * the marker instead, up to the same deadline.
+ */
+export async function elevateCompact(
+  diskpartPath: string,
+  deps: ElevationDeps = defaultElevationDeps(),
+  timing: { timeoutMs: number; pollMs: number } = { timeoutMs: ELEVATION_TIMEOUT_MS, pollMs: ELEVATION_POLL_MS },
+): Promise<ElevationResult> {
+  const startedAt = deps.now();
+  const minutes = Math.round(timing.timeoutMs / 60_000);
+  let dir: string;
   try {
-    const { compact, detach } = diskpartScripts(vhdxPath);
-    const paths = {
-      compactScript: join(dir, 'compact.txt'),
-      detachScript: join(dir, 'detach.txt'),
-      log: join(dir, 'diskpart.log'),
-    };
-    writeFileSync(paths.compactScript, compact, 'utf-8');
-    writeFileSync(paths.detachScript, detach, 'utf-8');
-    const runScript = join(dir, 'run.ps1');
+    dir = deps.makeTempDir();
+  } catch (error) {
+    return { kind: 'failed', exitCode: null, logTail: `Could not create a temporary folder for diskpart: ${errorMessage(error)}` };
+  }
+  try {
+    const files = elevationFiles(dir);
     // BOM: Windows PowerShell 5.1 reads a BOM-less script in the ANSI code page,
     // which would mangle a non-ASCII user name in the paths.
-    writeFileSync(runScript, `﻿${elevatedRunnerScript(paths)}`, 'utf-8');
+    deps.writeFile(files.runScript, Buffer.from(`\uFEFF${elevatedRunnerScript(diskpartPath, files)}`, 'utf8'));
 
-    // Bounded, so the machine is always started again. Giving up does not stop
-    // an elevated diskpart that is still running; the report says so.
-    const launched = await runProcess('powershell', powershellArgs(elevationLauncherScript(runScript)), ELEVATION_TIMEOUT_MS);
-    if (launched.timedOut) {
+    const launched = await deps.launch(powershellArgs(elevationLauncherScript(files.runScript)), timing.timeoutMs);
+
+    const ran = deps.readFile(files.started) !== null || deps.readFile(files.done) !== null;
+    if (!ran) {
+      if (launched.timedOut) {
+        return {
+          kind: 'failed',
+          exitCode: null,
+          logTail: `Administrator approval was not given within ${minutes} minutes.`,
+        };
+      }
+      return interpretLauncher(launched.code, launched.output);
+    }
+
+    let done = deps.readFile(files.done);
+    while (done === null && deps.now() - startedAt < timing.timeoutMs) {
+      await deps.sleep(timing.pollMs);
+      done = deps.readFile(files.done);
+    }
+    const log = decodeConsoleOutput(deps.readFile(files.compactLog) ?? Buffer.alloc(0));
+    if (done === null) {
       return {
         kind: 'failed',
         exitCode: null,
-        logTail: `diskpart did not finish within ${ELEVATION_TIMEOUT_MS / 60_000} minutes. If it is still running, the machine cannot start until it finishes.`,
+        logTail: [
+          `diskpart did not finish within ${minutes} minutes. If it is still running, the machine cannot start until it finishes.`,
+          logTail(log),
+        ]
+          .filter((part) => part !== '')
+          .join('\n'),
       };
     }
-    let logText = '';
-    try {
-      logText = decodeConsoleOutput(readFileSync(paths.log));
-    } catch {
-      // The elevated script never ran. Keep the launcher's own error, minus the
-      // CLIXML progress records PowerShell writes to a redirected stream.
-      logText = launched.output
-        .split(/\r?\n/)
-        .filter((line) => !/^(#< CLIXML|<Objs )/.test(line))
-        .join('\n');
-    }
-    return interpretElevation(launched.code, logText);
+    const code = parseInt(done.toString('latin1').trim(), 10);
+    return interpretDiskpart(Number.isNaN(code) ? null : code, log);
+  } catch (error) {
+    return { kind: 'failed', exitCode: null, logTail: errorMessage(error) };
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      deps.removeDir(dir);
+    } catch {
+      // A file the elevated side still holds; the temp folder is the OS's to clean.
+    }
   }
 }
 
@@ -601,7 +802,11 @@ export function defaultCompactRunner(): CompactRunner {
       parseTasklistNames((await runProcess('tasklist', ['/fo', 'csv', '/nh'], ENGINE_QUERY_TIMEOUT_MS)).stdout),
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    elevateCompact,
+    resolveDiskpartPath: async (vhdxPath) => {
+      const r = await runProcess('powershell', powershellArgs(diskpartPathScript(vhdxPath)), POWERSHELL_PROBE_TIMEOUT_MS);
+      return parseDiskpartPath(r.code, r.stdout);
+    },
+    elevateCompact: (diskpartPath) => elevateCompact(diskpartPath),
     machineStart: async (machine) => {
       const r = await runProcess('podman', ['machine', 'start', machine], 10 * 60_000);
       // podman exits non-zero for a machine that is already running; ask rather than trust the code.

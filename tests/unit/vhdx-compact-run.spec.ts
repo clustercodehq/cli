@@ -6,6 +6,7 @@ import {
   describeCompactOutcome,
   settleWithin,
   type CompactRunner,
+  type DiskpartPath,
   type ElevationResult,
 } from '../../src/lib/vhdx-compact.js';
 
@@ -27,6 +28,8 @@ interface FakeOptions {
   snapshotThrows?: boolean;
   /** The diagnostics gathered after a handle timeout never answer. */
   listsHang?: boolean;
+  /** What the pre-flight check says about the path diskpart will be given. */
+  diskpartPath?: DiskpartPath | 'hang';
 }
 
 const never = <T,>(): Promise<T> => new Promise<T>(() => {});
@@ -46,6 +49,11 @@ function fakeRunner(opts: FakeOptions = {}) {
       const first = opts.running === undefined ? [] : opts.running;
       if (runningChecks === 1) return first;
       return opts.runningAfterTrim === undefined ? first : opts.runningAfterTrim;
+    },
+    resolveDiskpartPath: async (path) => {
+      calls.push(`resolveDiskpartPath ${path}`);
+      if (opts.diskpartPath === 'hang') return never();
+      return opts.diskpartPath ?? { ok: true, path };
     },
     fstrim: async (machine) => (calls.push(`fstrim ${machine}`), { ok: opts.fstrimOk ?? true, output: '/: 10 GiB trimmed' }),
     machineStop: async (machine) => {
@@ -111,7 +119,7 @@ describe('compactVhdx', () => {
     const outcome = await compactVhdx(TARGET, runner, quiet);
     assert.deepEqual(outcome, { kind: 'blocked', running: ['late-devbox'], afterTrim: true });
     // Never stopped, so there is nothing to start again.
-    assert.deepEqual(calls, ['runningContainers', 'fstrim dev', 'runningContainers']);
+    assert.deepEqual(calls, ['runningContainers', `resolveDiskpartPath ${TARGET.vhdxPath}`, 'fstrim dev', 'runningContainers']);
   });
 
   it('never stops when the engine stops answering during the trim', async () => {
@@ -126,6 +134,7 @@ describe('compactVhdx', () => {
     const outcome = await compactVhdx(TARGET, runner, quiet, { timeoutMs: 180_000, intervalMs: 2_000 });
     assert.deepEqual(calls, [
       'runningContainers',
+      `resolveDiskpartPath ${TARGET.vhdxPath}`,
       'fstrim dev',
       'runningContainers',
       'machineStop dev',
@@ -142,6 +151,31 @@ describe('compactVhdx', () => {
       drive: 'D',
       restarted: true,
     });
+  });
+
+  it('hands diskpart the path the pre-flight check chose', async () => {
+    const { runner, calls } = fakeRunner({ diskpartPath: { ok: true, path: 'D:\\WSL\\ZO~1\\ext4.vhdx' } });
+    const outcome = await compactVhdx(TARGET, runner, quiet);
+    assert.equal(outcome.kind, 'compacted');
+    assert.ok(calls.includes('elevate D:\\WSL\\ZO~1\\ext4.vhdx'), JSON.stringify(calls));
+    // Everything else keeps the real path.
+    assert.ok(calls.includes(`probe ${TARGET.vhdxPath}`));
+  });
+
+  it('refuses a path diskpart cannot read before trimming or stopping anything', async () => {
+    for (const reason of ['not-representable', 'check-failed'] as const) {
+      const { runner, calls } = fakeRunner({ diskpartPath: { ok: false, reason } });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.deepEqual(outcome, { kind: 'path-refused', reason });
+      assert.deepEqual(calls, ['runningContainers', `resolveDiskpartPath ${TARGET.vhdxPath}`]);
+    }
+  });
+
+  it('refuses when the path check never answers', async () => {
+    const { runner, calls } = fakeRunner({ diskpartPath: 'hang' });
+    const outcome = await compactVhdx(TARGET, runner, quiet, { timeoutMs: 180_000, intervalMs: 2_000, probeTimeoutMs: 20 });
+    assert.deepEqual(outcome, { kind: 'path-refused', reason: 'check-failed' });
+    assert.ok(!calls.some((c) => c.startsWith('machineStop')));
   });
 
   it('restarts the machine when elevation is declined', async () => {
@@ -295,6 +329,18 @@ describe('describeCompactOutcome', () => {
     const silent = describeCompactOutcome({ kind: 'blocked', running: null, afterTrim: true }, target);
     assert.match(silent.lines.join('\n'), /Could not ask Podman/);
     assert.match(silent.lines.join('\n'), /never stopped/);
+  });
+
+  it('explains a refused path without claiming a restart', () => {
+    const unreadable = describeCompactOutcome({ kind: 'path-refused', reason: 'not-representable' }, target);
+    assert.equal(unreadable.ok, false);
+    assert.match(unreadable.lines.join('\n'), /diskpart cannot read/);
+    assert.match(unreadable.lines.join('\n'), /nothing was stopped or compacted/);
+    assert.doesNotMatch(unreadable.lines.join('\n'), /started again|did not start/);
+
+    const failed = describeCompactOutcome({ kind: 'path-refused', reason: 'check-failed' }, target);
+    assert.match(failed.lines.join('\n'), /Could not check/);
+    assert.match(failed.lines.join('\n'), /nothing was stopped or compacted/);
   });
 
   it('fails every non-success outcome, saying the machine was restarted', () => {
