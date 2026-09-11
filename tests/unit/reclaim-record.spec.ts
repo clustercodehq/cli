@@ -237,7 +237,7 @@ describe('reclaimNeedsTurningOn', () => {
     assert.equal(reclaimNeedsTurningOn({ ...base, status: 'off' }), true);
   });
 
-  // A default install on WSL 2.5.10+ resolves to 'configured' (dropcache in
+  // A default install on WSL 2.1.3+ resolves to 'configured' (dropcache in
   // effect), as does an explicit mode: neither is offered a rewrite.
   test('not offered where a mode is already in effect, or cannot be', () => {
     for (const status of ['configured', 'verified', 'inert', 'unsupported', 'n/a'] as const) {

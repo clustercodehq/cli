@@ -271,9 +271,9 @@ describe('onboard memory step on Podman over WSL', () => {
     return true;
   }
 
-  // Before 2.5.10 nothing confirms WSL's default, so a missing key reads as off
+  // Before 2.1.3 reclaim was opt-in, so a missing key reads as off
   // and the resize switches reclaim on alongside the size.
-  const PRE_DEFAULT_WSL = '2.4.13.0';
+  const PRE_DEFAULT_WSL = '2.0.14.0';
 
   it('writes the size, enables reclaim where it is off, and records the choice', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
     seedConfigs();
@@ -297,7 +297,7 @@ describe('onboard memory step on Podman over WSL', () => {
     assert.equal(config.RUNTIME_RECLAIM_VERIFIED, undefined);
   });
 
-  // WSL 2.5.10+ already reclaims (dropCache) with no key written. Rewriting it
+  // WSL 2.1.3+ already reclaims (dropCache) with no key written. Rewriting it
   // to gradual would change the user's mode for nothing.
   it("does not write a reclaim mode over WSL's own default", { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
     seedConfigs();

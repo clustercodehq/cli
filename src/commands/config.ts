@@ -64,14 +64,14 @@ export function recordManualReclaimVerdict(
     return {
       ok: false,
       message:
-        'Memory reclaim is off ([experimental] autoMemoryReclaim is disabled, or unset on WSL older than 2.5.10), or .wslconfig could not be read, so there is nothing for a verdict to describe. Nothing was recorded.',
+        'Memory reclaim is not in effect ([experimental] autoMemoryReclaim is disabled, is unset or unrecognised on WSL older than 2.1.3, or WSL is older than 2.0), or .wslconfig could not be read, so there is nothing for a verdict to describe. Nothing was recorded.',
     };
   }
   const result = value.trim().toLowerCase() as 'yes' | 'no';
   deps.remember({ result, wslVersion, mode });
   return {
     ok: true,
-    message: `Set RUNTIME_RECLAIM_VERIFIED = ${result} (WSL ${wslVersion}, autoMemoryReclaim=${mode})`,
+    message: `Set RUNTIME_RECLAIM_VERIFIED = ${result} (WSL ${wslVersion}, reclaim mode ${mode})`,
   };
 }
 

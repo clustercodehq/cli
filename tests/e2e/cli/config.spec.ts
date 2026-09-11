@@ -153,7 +153,7 @@ describe('config', () => {
     },
   );
 
-  // No key on WSL 2.5.10+ is WSL's default, dropCache — a mode in effect, so a
+  // No key on WSL 2.1.3+ is WSL's default, dropCache — a mode in effect, so a
   // verdict about it is recorded, stamped with the mode WSL actually runs.
   it(
     'stamps a default install with the mode WSL defaults to',
@@ -170,7 +170,7 @@ describe('config', () => {
       const env = { PATH: `${stubDir};${process.env.PATH ?? ''}` };
       const set = runCliWithEnv(env, 'config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'yes');
       assert.equal(set.exitCode, 0, set.stdout);
-      assert.match(set.stdout, /autoMemoryReclaim=dropcache/);
+      assert.match(set.stdout, /reclaim mode dropcache/);
       const { stdout } = runCli('config', 'list');
       assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED_MODE = dropcache/);
     },

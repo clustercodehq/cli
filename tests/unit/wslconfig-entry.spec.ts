@@ -298,7 +298,7 @@ describe('wslSupportsAutoMemoryReclaim', () => {
 
 // WSL matches `autoMemoryReclaim` case-insensitively against disabled, gradual
 // and dropCache, and leaves any other value (or none) at its default — dropCache
-// in every published source, from 2.5.10 on.
+// from 2.1.3 on (release notes), and in every tag of the published source.
 describe('effectiveReclaimMode', () => {
   const V27 = [2, 7, 13, 0];
 
@@ -318,16 +318,16 @@ describe('effectiveReclaimMode', () => {
     assert.equal(effectiveReclaimMode('disabled', null), 'off');
   });
 
-  test('absent or unrecognised is dropcache from 2.5.10 on', () => {
+  test('absent or unrecognised is dropcache from 2.1.3 on', () => {
     for (const value of [null, '', 'gradul', 'on', 'true']) {
       assert.equal(effectiveReclaimMode(value, V27), 'dropcache', String(value));
-      assert.equal(effectiveReclaimMode(value, [2, 5, 10]), 'dropcache', String(value));
+      assert.equal(effectiveReclaimMode(value, [2, 1, 3]), 'dropcache', String(value));
     }
   });
 
-  test('absent or unrecognised is off before 2.5.10, where the default cannot be confirmed', () => {
+  test('absent or unrecognised is off before 2.1.3, when reclaim was opt-in', () => {
     for (const value of [null, 'gradul']) {
-      assert.equal(effectiveReclaimMode(value, [2, 5, 9, 0]), 'off', String(value));
+      assert.equal(effectiveReclaimMode(value, [2, 1, 2, 0]), 'off', String(value));
       assert.equal(effectiveReclaimMode(value, [2, 0, 9, 0]), 'off', String(value));
     }
   });

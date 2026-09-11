@@ -55,14 +55,16 @@ export function reclaimModeOf(value: string | null): WslReclaimMode | null {
 }
 
 /**
- * The first WSL release whose published source confirms `dropCache` as the
- * default reclaim mode (`MemoryReclaimMode MemoryReclaim = DropCache` in
- * `WslCoreConfig.h`). It is also the first open-source tag, so older builds
- * cannot be checked; they may well share the default, but nothing confirms it.
+ * The first WSL release with `dropCache` as the default reclaim mode. WSL's
+ * release notes for 2.1.3 say so ("Set the default reclamation mode to
+ * dropcache"); before it the setting was opt-in, as the 2.0.0 notes describe it.
+ * The published source, which starts at tag 2.5.8, has the same default in
+ * `WslCoreConfig.h` at every tag since.
  */
-export const WSL_DROPCACHE_DEFAULT_SINCE: readonly number[] = [2, 5, 10];
+export const WSL_DROPCACHE_DEFAULT_SINCE: readonly number[] = [2, 1, 3];
 
-function versionAtLeast(version: readonly number[], floor: readonly number[]): boolean {
+/** Numeric, component by component, with missing components read as 0. */
+export function versionAtLeast(version: readonly number[], floor: readonly number[]): boolean {
   for (let i = 0; i < Math.max(version.length, floor.length); i++) {
     const a = version[i] ?? 0;
     const b = floor[i] ?? 0;
@@ -80,13 +82,13 @@ export type WslEffectiveReclaim = WslReclaimMode | 'off' | 'unknown';
  * Modelled on WSL rather than on the key, because the two differ. WSL matches
  * the value case-insensitively against `disabled`, `gradual` and `dropCache`,
  * and leaves anything else — a missing key or a typo alike — at its default,
- * which is `dropCache` on every build whose source can be read. So:
+ * which has been `dropCache` since 2.1.3. The value is the one
+ * `readWslConfigEntry` reads, which follows WSL's own parser. So:
  *
  * - `disabled` is the only value that turns reclaim off.
  * - `gradual` and `dropcache` (any case) are those modes.
- * - Absent or unrecognised is WSL's default: `dropcache` from 2.5.10 on. On
- *   2.0.x up to 2.5.10 the default cannot be confirmed, so it reads as `'off'`
- *   — the conservative answer, which only ever offers to switch reclaim on.
+ * - Absent or unrecognised is WSL's default: `dropcache` from 2.1.3 on. On
+ *   2.0.0 up to 2.1.3 reclaim was opt-in, so it reads as `'off'`.
  * - A build older than 2.0 ignores the key altogether: `'off'`.
  * - A version that cannot be read leaves the default unknowable, so absent or
  *   unrecognised is `'unknown'` — never `'off'`, which would invite a rewrite

@@ -11,8 +11,8 @@ import type { MachineProvider } from '../../src/lib/runtime-memory.js';
 
 const WSL_2 = [2, 7, 13, 0];
 const WSL_1 = [1, 2, 5];
-/** Before the first build whose source confirms `dropCache` as the default. */
-const WSL_2_4 = [2, 4, 13, 0];
+/** Before 2.1.3, which made `dropCache` the default. */
+const WSL_PRE_DEFAULT = [2, 1, 2, 0];
 const WSL_2_0 = [2, 0, 9, 0];
 const RECLAIM_ON = '[experimental]\nautoMemoryReclaim=gradual\n';
 const DISABLED = '[experimental]\nautoMemoryReclaim=disabled\n';
@@ -67,7 +67,7 @@ describe('resolveHostReclaim', () => {
   // It can be configured; it can never earn the smaller reserve.
   test('Docker on WSL reads the file but is never verified', () => {
     assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', DISABLED, WSL_2, null), 'off');
-    assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, WSL_2_4, null), 'off');
+    assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, WSL_PRE_DEFAULT, null), 'off');
     // WSL's own default is a mode in effect, and Docker's VM still cannot be measured.
     assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, WSL_2, null), 'configured');
     assert.equal(
@@ -200,7 +200,7 @@ describe('resolveHostReclaim', () => {
     );
   });
 
-  // WSL defaults to dropCache (WslCoreConfig.h, from 2.5.10 on). With the key
+  // WSL defaults to dropCache (from 2.1.3, per its release notes). With the key
   // absent reclaim is running, so reporting it off would send the user to
   // "turn on" what they already have — restarting every WSL distribution.
   describe('no mode written: WSL’s own default', () => {
@@ -216,18 +216,21 @@ describe('resolveHostReclaim', () => {
         assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, null), 'configured');
       });
 
-      // Before 2.5.10 no published source confirms the default, so the absent
-      // key keeps its conservative reading.
-      test(`${label} is off on 2.0.x and 2.4.x`, () => {
+      // Before 2.1.3 reclaim was opt-in, so the absent key is off.
+      test(`${label} is off on 2.0.x and 2.1.2`, () => {
         assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2_0, null), 'off');
-        assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2_4, null), 'off');
+        assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_PRE_DEFAULT, null), 'off');
       });
     }
 
-    test('the default begins exactly at 2.5.10', () => {
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 5, 9, 0], null), 'off');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 5, 10, 0], null), 'configured');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 6, 1], null), 'configured');
+    test('the default begins exactly at 2.1.3, compared component by component', () => {
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 2, 0], null), 'off');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 3], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 3, 0], null), 'configured');
+      // 2.1.10 is later than 2.1.3, and 2.10 later than 2.1: numbers, not strings.
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 10, 0], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 0, 30, 0], null), 'off');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 5, 9, 0], null), 'configured');
     });
 
     // The mode a verdict is stamped with is the effective one, so a default
@@ -244,11 +247,11 @@ describe('resolveHostReclaim', () => {
 
     // "If the value is dropCache or an unknown value, cached memory will be
     // reclaimed immediately" — a typo is not off.
-    test('an unrecognised value is dropcache on 2.5.10+, and off before it', () => {
+    test('an unrecognised value is dropcache on 2.1.3+, and off before it', () => {
       const typo = '[experimental]\nautoMemoryReclaim=gradul\n';
       assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2, null), 'configured');
       assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2, verdict({ mode: 'dropcache' })), 'verified');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2_4, null), 'off');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_PRE_DEFAULT, null), 'off');
     });
   });
 
