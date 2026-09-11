@@ -18,6 +18,8 @@ function reading(over: Partial<HostMemoryReading> = {}): HostMemoryReading {
     availableBytes: 12 * 1024 * MIB,
     engineRunning: true,
     engineMib: 25600,
+    engineName: 'podman',
+    provider: 'wsl',
     reclaim: 'off',
     ...over,
   };
@@ -98,6 +100,67 @@ describe('evaluateHostMemory', () => {
       reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'inert' }),
     );
     assert.match(r.detail, /reclaim is on but inert on this build/);
+  });
+
+  // The advice has to name a knob that exists for this engine: `onboard` never
+  // applies a size to Docker, so sending a Docker user there is a dead end.
+  describe('lowering advice follows the engine and backend', () => {
+    const short = { availableBytes: 2 * 1024 * MIB, engineMib: 25600 };
+
+    test('Docker on WSL is told to lower [wsl2] memory=, not to run onboard', () => {
+      const r = evaluateHostMemory(reading({ ...short, engineName: 'docker', provider: 'wsl' }));
+      assert.match(r.detail, /lower \[wsl2\] memory= to 24576MB/);
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+    });
+
+    test('Docker on Hyper-V is sent to Docker Desktop settings', () => {
+      const r = evaluateHostMemory(reading({ ...short, engineName: 'docker', provider: 'hyperv', reclaim: 'n/a' }));
+      assert.match(r.detail, /Docker Desktop settings/);
+      assert.doesNotMatch(r.detail, /clustercode onboard|\.wslconfig|\[wsl2\]/);
+    });
+
+    test('Docker on Windows with an unidentified backend is told both places', () => {
+      const r = evaluateHostMemory(reading({ ...short, engineName: 'docker', provider: 'unknown' }));
+      assert.match(r.detail, /\[wsl2\] memory=/);
+      assert.match(r.detail, /Docker Desktop settings/);
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+    });
+
+    test('Docker on macOS is sent to Docker Desktop settings', () => {
+      const r = evaluateHostMemory(
+        reading({ ...short, platform: 'darwin', engineName: 'docker', provider: undefined, reclaim: 'n/a' }),
+      );
+      assert.match(r.detail, /Docker Desktop settings/);
+      assert.doesNotMatch(r.detail, /clustercode onboard/);
+    });
+
+    test('Podman on macOS can be lowered by onboard', () => {
+      const r = evaluateHostMemory(
+        reading({ ...short, platform: 'darwin', engineName: 'podman', provider: 'applehv', reclaim: 'n/a' }),
+      );
+      assert.match(r.detail, /clustercode onboard --memory \d+/);
+    });
+  });
+
+  // Where reclaim is not a question at all, saying it is "off" is wrong, and
+  // sends the reader looking for a setting that does not exist.
+  test('says nothing about reclaim where it does not apply', () => {
+    for (const over of [
+      { platform: 'darwin' as NodeJS.Platform, provider: 'applehv' as const },
+      { platform: 'win32' as NodeJS.Platform, provider: 'hyperv' as const },
+    ]) {
+      const r = evaluateHostMemory(reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'n/a', ...over }));
+      assert.equal(r.status, 'warn');
+      assert.doesNotMatch(r.detail, /reclaim/, over.platform);
+    }
+  });
+
+  test('says reclaim needs a newer WSL when the build predates it', () => {
+    const r = evaluateHostMemory(
+      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'unsupported' }),
+    );
+    assert.match(r.detail, /memory reclaim needs WSL 2\.0 or newer/);
+    assert.doesNotMatch(r.detail, /reclaim is off/);
   });
 
   // A stopped runtime is not what is eating the memory, so telling someone to

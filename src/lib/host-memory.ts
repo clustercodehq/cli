@@ -12,8 +12,14 @@
 import { execSync } from 'node:child_process';
 import { freemem, totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
-import { probeRuntime, recommendForUse, type RuntimeProbe } from './runtime-memory.js';
+import {
+  probeRuntime,
+  recommendForUse,
+  type MachineProvider,
+  type RuntimeProbe,
+} from './runtime-memory.js';
 import type { HostReclaimStatus } from './host-reclaim.js';
+import { memoryKnob } from './memory-knob.js';
 
 const MIB = 1024 * 1024;
 
@@ -80,6 +86,10 @@ export interface HostMemoryReading {
   engineRunning: boolean;
   /** The runtime's ceiling, when it could be measured. */
   engineMib: number | null;
+  /** Which engine, so the advice names a knob that exists for it. */
+  engineName: string | null;
+  /** The VM backend, where it was probed (Windows only). */
+  provider: MachineProvider | undefined;
   reclaim: HostReclaimStatus;
 }
 
@@ -127,35 +137,65 @@ export function evaluateHostMemory(r: HostMemoryReading): CheckResult {
       status: 'warn',
       detail:
         `${shortfall}; the container runtime is holding memory the host cannot spare` +
-        ` — lower it with \`clustercode onboard --memory ${noReclaimCeiling}\``,
+        ` — ${lowerAction(r, noReclaimCeiling)}`,
     };
   }
 
+  const phrase = reclaimPhrase(r.reclaim);
   return {
     name,
     status: 'warn',
-    detail: `${shortfall}; memory reclaim is ${reclaimPhrase(r.reclaim)} — see the docs`,
+    detail: phrase === null ? shortfall : `${shortfall}; memory reclaim ${phrase} — see the docs`,
   };
 }
 
 /**
- * How to describe reclaim to someone whose host is already short of memory.
+ * How to lower this runtime to `ceilingMib`, for the engine and backend it is.
  *
- * The four cases are genuinely different diagnoses — a feature that is working
- * and simply outpaced, one nobody has checked, one measured to do nothing on
- * this build, and one that was never switched on — and they lead to different
- * next steps.
+ * Only a runtime `onboard` can actually resize is sent there. Docker's size
+ * lives in `.wslconfig` on the WSL2 backend and in Docker Desktop settings
+ * everywhere else — worded as in the `runtime-memory` check, so the two lines
+ * `doctor` prints next to each other never name different knobs.
  */
-function reclaimPhrase(reclaim: HostReclaimStatus): string {
+function lowerAction(r: HostMemoryReading, ceilingMib: number): string {
+  if (r.engineName === 'docker') {
+    const wsl = `lower [wsl2] memory= to ${ceilingMib}MB`;
+    const desktop = `lower it to ${ceilingMib}MB in Docker Desktop settings`;
+    if (r.platform !== 'win32' || r.provider === 'hyperv') return desktop;
+    if (r.provider === 'wsl') return wsl;
+    return `${wsl} (WSL2 backend), or ${desktop} (Hyper-V backend)`;
+  }
+  const knob = memoryKnob('podman', r.platform, r.provider);
+  return knob.kind === 'cli'
+    ? `lower it with \`clustercode onboard --memory ${ceilingMib}\``
+    : `lower the Podman machine's memory to ${ceilingMib}MB`;
+}
+
+/**
+ * How to describe reclaim to someone whose host is already short of memory,
+ * or null where there is no such setting to describe.
+ *
+ * The cases are genuinely different diagnoses — a feature that is working and
+ * simply outpaced, one nobody has checked, one measured to do nothing on this
+ * build, one this build cannot have, and one that was never switched on — and
+ * they lead to different next steps. `'n/a'` (macOS, Hyper-V, no VM) says
+ * nothing: calling reclaim "off" there sends the reader after a setting that
+ * does not exist.
+ */
+function reclaimPhrase(reclaim: HostReclaimStatus): string | null {
   switch (reclaim) {
     case 'enforced':
-      return 'on but not keeping up';
+      return 'is on but not keeping up';
     case 'configured':
-      return 'configured but unverified';
+      return 'is configured but unverified';
     case 'inert':
-      return 'on but inert on this build';
-    default:
-      return 'off';
+      return 'is on but inert on this build';
+    case 'unsupported':
+      return 'needs WSL 2.0 or newer';
+    case 'off':
+      return 'is off';
+    case 'n/a':
+      return null;
   }
 }
 
@@ -174,6 +214,8 @@ export function checkHostMemory(
     availableBytes: hostAvailableBytes(),
     engineRunning: runtime.status === 'pass' && probe.engineName !== null,
     engineMib: probe.engine ? Math.floor(probe.engine.memTotalBytes / MIB) : null,
+    engineName: probe.engineName,
+    provider: probe.provider,
     reclaim: probe.reclaim,
   });
 }
