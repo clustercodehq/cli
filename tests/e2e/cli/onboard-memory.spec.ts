@@ -225,7 +225,7 @@ describe('onboard memory step on Podman over WSL', () => {
   ].join('\r\n');
   const EXISTING_WSLCONFIG = ['[wsl2]', 'memory=25600MB', WSLG_COMMENT, 'guiApplications=false', ''].join('\r\n');
 
-  function createPodmanWslStubs(engineMemTotalBytes: number): void {
+  function createPodmanWslStubs(engineMemTotalBytes: number, wslVersion = '2.7.13.0'): void {
     writeFileSync(join(stubDir, 'podman.cmd'), [
       '@echo off',
       'echo %* | findstr /C:"--version" >nul 2>&1 && (echo podman version 5.2.0 & exit /b 0)',
@@ -237,7 +237,7 @@ describe('onboard memory step on Podman over WSL', () => {
     ].join('\r\n'));
     writeFileSync(join(stubDir, 'wsl.cmd'), [
       '@echo off',
-      'echo %* | findstr /C:"--version" >nul 2>&1 && (echo WSL version: 2.7.13.0 & exit /b 0)',
+      `echo %* | findstr /C:"--version" >nul 2>&1 && (echo WSL version: ${wslVersion} & exit /b 0)`,
       `echo %* | findstr /C:"--status" >nul 2>&1 && (echo ${STUB_MARKER} Default Version: 2 & exit /b 0)`,
       'echo %* | findstr /C:"--shutdown" >nul 2>&1 && (exit /b 0)',
       'exit /b 1',
@@ -271,9 +271,13 @@ describe('onboard memory step on Podman over WSL', () => {
     return true;
   }
 
-  it('writes the size, enables reclaim, and records the choice', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+  // Before 2.5.10 nothing confirms WSL's default, so a missing key reads as off
+  // and the resize switches reclaim on alongside the size.
+  const PRE_DEFAULT_WSL = '2.4.13.0';
+
+  it('writes the size, enables reclaim where it is off, and records the choice', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
     seedConfigs();
-    createPodmanWslStubs(25600 * 1024 * 1024);
+    createPodmanWslStubs(25600 * 1024 * 1024, PRE_DEFAULT_WSL);
     if (skipUnlessStubbed()) return; // never run `wsl --shutdown` for real
 
     const { stdout, exitCode } = runOnboard(['--memory', String(TARGET_MIB)]);
@@ -293,9 +297,26 @@ describe('onboard memory step on Podman over WSL', () => {
     assert.equal(config.RUNTIME_RECLAIM_VERIFIED, undefined);
   });
 
+  // WSL 2.5.10+ already reclaims (dropCache) with no key written. Rewriting it
+  // to gradual would change the user's mode for nothing.
+  it("does not write a reclaim mode over WSL's own default", { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+    seedConfigs();
+    createPodmanWslStubs(25600 * 1024 * 1024, '2.7.13.0');
+    writeFileSync(join(tempHome, '.wslconfig'), EXISTING_WSLCONFIG, 'utf-8');
+    if (skipUnlessStubbed()) return;
+
+    const { exitCode, stdout } = runOnboard(['--memory', String(TARGET_MIB)]);
+    assert.equal(exitCode, 0, stdout);
+
+    const wslconfig = readFileSync(join(tempHome, '.wslconfig'), 'utf-8');
+    assert.match(wslconfig, /memory=8192MB/);
+    assert.doesNotMatch(wslconfig, /autoMemoryReclaim/);
+    assert.doesNotMatch(stdout, /Memory reclaim is off/);
+  });
+
   it('leaves a hand-written comment block byte-identical', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
     seedConfigs();
-    createPodmanWslStubs(25600 * 1024 * 1024);
+    createPodmanWslStubs(25600 * 1024 * 1024, PRE_DEFAULT_WSL);
     writeFileSync(join(tempHome, '.wslconfig'), EXISTING_WSLCONFIG, 'utf-8');
     if (skipUnlessStubbed()) return;
 

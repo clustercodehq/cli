@@ -112,8 +112,10 @@ describe('config', () => {
 
   // A verdict that cannot be tied to a WSL build and a reclaim mode is not
   // recorded at all: off Windows there is nothing to describe, and a home with
-  // no reclaim setting has nothing for the verdict to be about.
+  // reclaim switched off has nothing for the verdict to be about. (An absent
+  // key is not off on current WSL, which reclaims by default.)
   it('refuses a reclaim verdict it cannot tie to a WSL build and reclaim mode', () => {
+    writeFileSync(join(tempHome, '.wslconfig'), '[experimental]\r\nautoMemoryReclaim=disabled\r\n');
     const set = runCli('config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'yes');
     assert.equal(set.exitCode, 1, set.stdout);
     assert.match(
@@ -148,6 +150,29 @@ describe('config', () => {
       assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED = yes/);
       assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED_WSL = \d+(\.\d+)+/);
       assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED_MODE = gradual/);
+    },
+  );
+
+  // No key on WSL 2.5.10+ is WSL's default, dropCache — a mode in effect, so a
+  // verdict about it is recorded, stamped with the mode WSL actually runs.
+  it(
+    'stamps a default install with the mode WSL defaults to',
+    { skip: process.platform !== 'win32' },
+    () => {
+      const stubDir = join(tempHome, 'stubs');
+      mkdirSync(stubDir, { recursive: true });
+      writeFileSync(join(stubDir, 'wsl.cmd'), [
+        '@echo off',
+        'echo %* | findstr /C:"--version" >nul 2>&1 && (echo WSL version: 2.7.13.0 & exit /b 0)',
+        'exit /b 1',
+      ].join('\r\n'));
+
+      const env = { PATH: `${stubDir};${process.env.PATH ?? ''}` };
+      const set = runCliWithEnv(env, 'config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'yes');
+      assert.equal(set.exitCode, 0, set.stdout);
+      assert.match(set.stdout, /autoMemoryReclaim=dropcache/);
+      const { stdout } = runCli('config', 'list');
+      assert.match(stdout, /RUNTIME_RECLAIM_VERIFIED_MODE = dropcache/);
     },
   );
 

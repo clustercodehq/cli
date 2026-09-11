@@ -28,9 +28,9 @@ export interface AppConfig {
    */
   RUNTIME_RECLAIM_VERIFIED_WSL?: string;
   /**
-   * The `[experimental] autoMemoryReclaim` mode (`gradual` or `dropcache`) the
-   * verdict was measured under. Absent or different from the current setting
-   * means the verdict is not used.
+   * The reclaim mode (`gradual` or `dropcache`) WSL had in effect when the
+   * verdict was measured — `dropcache` for a default install on current WSL.
+   * Absent or different from the mode in effect now means the verdict is not used.
    */
   RUNTIME_RECLAIM_VERIFIED_MODE?: string;
 }

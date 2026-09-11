@@ -22,11 +22,12 @@ export interface WslEntry {
  * Ask WSL to hand memory back to the host while the VM runs.
  *
  * WSL2 sizes its VM with a balloon that only ever grows: `memory=` is a
- * ceiling, and without `autoMemoryReclaim` the guest's page cache is never
+ * ceiling, and with reclaim switched off the guest's page cache is never
  * returned to Windows, so over a long-running session that ceiling becomes a
- * floor the VM will eventually reach and stay at. `gradual` is Microsoft's
- * recommended mode (it reclaims while the guest is idle); `dropcache` is the
- * aggressive alternative and is accepted when a user has set it by hand.
+ * floor the VM will eventually reach and stay at. `gradual` reclaims while the
+ * guest is idle; `dropcache` drops the guest's whole cache once it goes idle.
+ * This entry is only ever written where reclaim is off — never over a mode
+ * that is already in effect, whether set by hand or by WSL's own default.
  */
 export const WSL_RECLAIM_ENTRY: WslEntry = {
   section: 'experimental',
@@ -39,11 +40,13 @@ export type WslReclaimMode = 'gradual' | 'dropcache';
 const RECLAIM_MODES: readonly WslReclaimMode[] = ['gradual', 'dropcache'];
 
 /**
- * The reclaim mode a raw `autoMemoryReclaim` value asks for, or null when it
- * asks for none (absent, `disabled`, or anything unrecognised).
+ * The reclaim mode a stored value names, or null when it names none.
  *
- * The mode is returned rather than a boolean because the two are different
- * mechanisms: a measurement taken under one says nothing about the other.
+ * This reads a mode back as this CLI wrote it (the verdict's mode stamp). It
+ * says nothing about what WSL does with a `.wslconfig` value — for that, see
+ * `effectiveReclaimMode`. The mode is returned rather than a boolean because the
+ * two are different mechanisms: a measurement taken under one says nothing
+ * about the other.
  */
 export function reclaimModeOf(value: string | null): WslReclaimMode | null {
   if (value === null) return null;
@@ -51,8 +54,52 @@ export function reclaimModeOf(value: string | null): WslReclaimMode | null {
   return (RECLAIM_MODES as readonly string[]).includes(normalized) ? (normalized as WslReclaimMode) : null;
 }
 
-export function isReclaimEnabledValue(value: string | null): boolean {
-  return reclaimModeOf(value) !== null;
+/**
+ * The first WSL release whose published source confirms `dropCache` as the
+ * default reclaim mode (`MemoryReclaimMode MemoryReclaim = DropCache` in
+ * `WslCoreConfig.h`). It is also the first open-source tag, so older builds
+ * cannot be checked; they may well share the default, but nothing confirms it.
+ */
+export const WSL_DROPCACHE_DEFAULT_SINCE: readonly number[] = [2, 5, 10];
+
+function versionAtLeast(version: readonly number[], floor: readonly number[]): boolean {
+  for (let i = 0; i < Math.max(version.length, floor.length); i++) {
+    const a = version[i] ?? 0;
+    const b = floor[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
+/** What WSL does about reclaim, as opposed to what `.wslconfig` says. */
+export type WslEffectiveReclaim = WslReclaimMode | 'off' | 'unknown';
+
+/**
+ * What WSL actually does about reclaim: a mode, `'off'`, or `'unknown'`.
+ *
+ * Modelled on WSL rather than on the key, because the two differ. WSL matches
+ * the value case-insensitively against `disabled`, `gradual` and `dropCache`,
+ * and leaves anything else — a missing key or a typo alike — at its default,
+ * which is `dropCache` on every build whose source can be read. So:
+ *
+ * - `disabled` is the only value that turns reclaim off.
+ * - `gradual` and `dropcache` (any case) are those modes.
+ * - Absent or unrecognised is WSL's default: `dropcache` from 2.5.10 on. On
+ *   2.0.x up to 2.5.10 the default cannot be confirmed, so it reads as `'off'`
+ *   — the conservative answer, which only ever offers to switch reclaim on.
+ * - A build older than 2.0 ignores the key altogether: `'off'`.
+ * - A version that cannot be read leaves the default unknowable, so absent or
+ *   unrecognised is `'unknown'` — never `'off'`, which would invite a rewrite
+ *   of `.wslconfig` on the strength of a missing key alone.
+ */
+export function effectiveReclaimMode(value: string | null, version: number[] | null): WslEffectiveReclaim {
+  const requested = value?.trim().toLowerCase() ?? null;
+  if (version !== null && !wslSupportsAutoMemoryReclaim(version)) return 'off';
+  if (requested === 'disabled') return 'off';
+  const mode = reclaimModeOf(requested);
+  if (mode !== null) return mode;
+  if (version === null) return 'unknown';
+  return versionAtLeast(version, WSL_DROPCACHE_DEFAULT_SINCE) ? 'dropcache' : 'off';
 }
 
 /**
@@ -150,8 +197,8 @@ export function patchWslConfigEntries(existing: string | null, entries: WslEntry
  * Raw value of a key in a section, or null when it is absent.
  *
  * A commented-out line (`#` or `;`) is not a value: `;autoMemoryReclaim=gradual`
- * means the setting is OFF, and reading it as ON is the one mistake that would
- * make this CLI report a host as protected when it is not.
+ * is no setting at all, and what that means is WSL's default, not the mode the
+ * comment names.
  */
 export function readWslConfigEntry(
   existing: string | null,

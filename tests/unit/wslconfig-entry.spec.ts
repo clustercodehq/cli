@@ -6,6 +6,7 @@ import {
   readWslConfigEntry,
   parseWslVersion,
   wslSupportsAutoMemoryReclaim,
+  effectiveReclaimMode,
   wslMemoryEntry,
   WSL_RECLAIM_ENTRY,
 } from '../../src/lib/wslconfig.js';
@@ -221,5 +222,50 @@ describe('wslSupportsAutoMemoryReclaim', () => {
   test('an unreadable version is not support', () => {
     assert.equal(wslSupportsAutoMemoryReclaim(null), false);
     assert.equal(wslSupportsAutoMemoryReclaim([]), false);
+  });
+});
+
+// WSL matches `autoMemoryReclaim` case-insensitively against disabled, gradual
+// and dropCache, and leaves any other value (or none) at its default — dropCache
+// in every published source, from 2.5.10 on.
+describe('effectiveReclaimMode', () => {
+  const V27 = [2, 7, 13, 0];
+
+  test('the named modes, in any case, are those modes', () => {
+    assert.equal(effectiveReclaimMode('gradual', V27), 'gradual');
+    assert.equal(effectiveReclaimMode(' Gradual ', V27), 'gradual');
+    assert.equal(effectiveReclaimMode('dropCache', V27), 'dropcache');
+    assert.equal(effectiveReclaimMode('DROPCACHE', [2, 0, 9, 0]), 'dropcache');
+  });
+
+  test('disabled is off on every build, in any case', () => {
+    assert.equal(effectiveReclaimMode('disabled', V27), 'off');
+    assert.equal(effectiveReclaimMode('Disabled', [2, 0, 9, 0]), 'off');
+    assert.equal(effectiveReclaimMode('disabled', null), 'off');
+  });
+
+  test('absent or unrecognised is dropcache from 2.5.10 on', () => {
+    for (const value of [null, '', 'gradul', 'on', 'true']) {
+      assert.equal(effectiveReclaimMode(value, V27), 'dropcache', String(value));
+      assert.equal(effectiveReclaimMode(value, [2, 5, 10]), 'dropcache', String(value));
+    }
+  });
+
+  test('absent or unrecognised is off before 2.5.10, where the default cannot be confirmed', () => {
+    for (const value of [null, 'gradul']) {
+      assert.equal(effectiveReclaimMode(value, [2, 5, 9, 0]), 'off', String(value));
+      assert.equal(effectiveReclaimMode(value, [2, 0, 9, 0]), 'off', String(value));
+    }
+  });
+
+  test('a build older than 2.0 ignores the key', () => {
+    assert.equal(effectiveReclaimMode('gradual', [1, 2, 5]), 'off');
+    assert.equal(effectiveReclaimMode(null, [1, 2, 5]), 'off');
+  });
+
+  test('an unreadable version leaves the default unknown, never off', () => {
+    assert.equal(effectiveReclaimMode(null, null), 'unknown');
+    assert.equal(effectiveReclaimMode('gradul', null), 'unknown');
+    assert.equal(effectiveReclaimMode('gradual', null), 'gradual');
   });
 });

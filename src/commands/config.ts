@@ -64,7 +64,7 @@ export function recordManualReclaimVerdict(
     return {
       ok: false,
       message:
-        'Memory reclaim is not enabled ([experimental] autoMemoryReclaim in .wslconfig), so there is nothing for a verdict to describe. Nothing was recorded.',
+        'Memory reclaim is off ([experimental] autoMemoryReclaim is disabled, or unset on WSL older than 2.5.10), or .wslconfig could not be read, so there is nothing for a verdict to describe. Nothing was recorded.',
     };
   }
   const result = value.trim().toLowerCase() as 'yes' | 'no';

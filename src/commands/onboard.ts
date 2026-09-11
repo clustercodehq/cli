@@ -728,15 +728,11 @@ async function offerRuntimeMemory(
   // Sizing depends on whether the VM ever gives memory back, because the host
   // reserve is only real if something enforces it — and *writing* the setting
   // is not enforcing it. It has been measured accepted and inert, so only a
-  // recorded measurement ('verified') buys the smaller reserve. Eligibility
-  // still decides whether the entry gets written; it no longer decides sizing,
-  // which is what let a machine be sized on a promise it had never kept.
+  // recorded measurement ('verified') buys the smaller reserve. Whether reclaim
+  // is off still decides whether the entry gets written; it no longer decides
+  // sizing, which is what let a machine be sized on a promise it had never kept.
   const reclaimStatus = probeHostReclaim(engineName, platform, provider);
-  const reclaimEligible =
-    platform === 'win32' &&
-    provider === 'wsl' &&
-    engineName === 'podman' &&
-    reclaimStatus !== 'unsupported';
+  const reclaimOff = reclaimNeedsTurningOn({ platform, provider, engineName, status: reclaimStatus });
   const reclaim: HostReclaim = reclaimStatus === 'verified' ? 'verified' : 'none';
 
   const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated', reclaim);
@@ -901,7 +897,7 @@ async function offerRuntimeMemory(
     // never returns what it borrows starves the host at any ceiling. This is
     // the path the machines that hit that already take, so it is the one that
     // has to be able to fix them — with no new flag and no resize.
-    if (reclaimEligible && reclaimStatus === 'off') {
+    if (reclaimOff) {
       const plan = planWslReclaimApply();
       clack.log.warn(
         'Memory reclaim is off, so the runtime keeps memory the host may need until `wsl --shutdown`.',
@@ -956,7 +952,7 @@ async function offerRuntimeMemory(
     platform,
     engineName,
     target,
-    reclaimEligible,
+    reclaimEligible: reclaimOff,
     hasExplicitFlag: flagMemory !== undefined,
     // No TTY and no explicit --memory: a stored config value is not consent to
     // restart every WSL distribution on the machine unattended.
@@ -968,7 +964,7 @@ async function offerRuntimeMemory(
 
   // Same question as the reclaim-only path, at the same moment: the setting was
   // just written, and nothing yet says it does anything on this machine.
-  if (outcome === 'applied' && reclaimEligible && reclaimStatus === 'off' && !verifyRequested) {
+  if (outcome === 'applied' && reclaimOff && !verifyRequested) {
     await offerReclaimVerification({
       hostBytes,
       platform,
@@ -1082,7 +1078,9 @@ async function offerReclaimVerification(ctx: {
     platform: ctx.platform,
     engineName: ctx.engineName,
     target: verified,
-    reclaimEligible: true,
+    // Verified means reclaim is already in effect, under the mode the verdict
+    // was stamped with; rewriting it here would invalidate that verdict.
+    reclaimEligible: false,
     hasExplicitFlag: ctx.flagMemory !== undefined,
     nonInteractiveHint: `Re-run with ${pc.bold(`--memory ${verified}`)} to apply it non-interactively.`,
   });
@@ -1183,7 +1181,7 @@ export async function runReclaimVerification(
   }
   const mode = deps.reclaimMode();
   if (mode === null) {
-    return refuse('Memory reclaim is not enabled in .wslconfig, so there is nothing to measure.');
+    return refuse('Memory reclaim is off (or .wslconfig could not be read), so there is nothing to measure.');
   }
 
   const { result, detail } = await deps.measure((line) => log.info(line));
@@ -1200,6 +1198,24 @@ export async function runReclaimVerification(
   if (result === 'yes') log.success(detail);
   else log.warn(detail);
   return result;
+}
+
+/**
+ * Whether onboard should offer to write `autoMemoryReclaim` — only where
+ * reclaim is actually off.
+ *
+ * Current WSL reclaims by default, so a missing key is not a reason: writing
+ * `gradual` over a mode already in effect — WSL's default, or one set by hand —
+ * would restart every WSL distribution to change the user's setting for
+ * nothing, and orphan a verdict measured under that mode.
+ */
+export function reclaimNeedsTurningOn(ctx: {
+  platform: NodeJS.Platform;
+  provider: MachineProvider | undefined;
+  engineName: string;
+  status: HostReclaimStatus;
+}): boolean {
+  return ctx.platform === 'win32' && ctx.provider === 'wsl' && ctx.engineName === 'podman' && ctx.status === 'off';
 }
 
 /**

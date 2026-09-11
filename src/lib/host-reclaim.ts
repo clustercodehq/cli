@@ -2,12 +2,13 @@
  * Does the container runtime's VM give memory back to the host while it runs?
  *
  * On Windows the answer starts as a WSL setting, not a property of the engine:
- * WSL2 sizes its VM with a balloon that only inflates, so without
- * `[experimental] autoMemoryReclaim` everything the guest touches — its page
- * cache most of all — stays charged to Windows until `wsl --shutdown`. That
- * turns `memory=` from a ceiling the VM hovers below into a floor it climbs to,
- * and the host reserve the CLI subtracts when sizing the runtime becomes
- * notional.
+ * WSL2 sizes its VM with a balloon that only inflates, so with
+ * `[experimental] autoMemoryReclaim` switched off everything the guest touches —
+ * its page cache most of all — stays charged to Windows until `wsl --shutdown`.
+ * That turns `memory=` from a ceiling the VM hovers below into a floor it climbs
+ * to, and the host reserve the CLI subtracts when sizing the runtime becomes
+ * notional. What counts is the mode WSL puts into effect, not whether the key is
+ * written: current WSL reclaims by default (`effectiveReclaimMode`).
  *
  * But the setting is a *request*, not a result. It has been measured accepted
  * and inert — in both modes, over repeated 16-minute idle runs, on a build
@@ -28,11 +29,13 @@ import { readWslConfigUtf8 } from './runtime-memory-apply.js';
 // module, and a back-import through it would create a cycle.
 import { readAppConfig, type AppConfig } from './config-store/index.js';
 import {
+  effectiveReclaimMode,
   parseWslVersion,
   readWslConfigEntry,
   reclaimModeOf,
   wslSupportsAutoMemoryReclaim,
   WSL_RECLAIM_ENTRY,
+  type WslEffectiveReclaim,
   type WslReclaimMode,
 } from './wslconfig.js';
 
@@ -43,7 +46,7 @@ export type HostReclaimStatus =
   | 'configured'
   /** Configured and measured NOT to return memory on this build. */
   | 'inert'
-  /** It could be configured, and is not. */
+  /** Switched off: `disabled`, or no mode on a build whose default cannot be confirmed. */
   | 'off'
   /** This WSL build predates the setting. */
   | 'unsupported'
@@ -60,8 +63,9 @@ export interface ReclaimVerdict {
    */
   wslVersion: string;
   /**
-   * The `autoMemoryReclaim` mode in effect at the time. Null for a verdict
-   * recorded before the mode was stamped; such a verdict is not used either.
+   * The reclaim mode in effect at the time — WSL's effective mode, so a default
+   * install is stamped `dropcache`. Null for a verdict recorded before the mode
+   * was stamped; such a verdict is not used either.
    */
   mode: WslReclaimMode | null;
 }
@@ -115,14 +119,21 @@ export function resolveHostReclaim(
   // all, so reporting its reclaim state from that file would be a fiction.
   if (provider !== undefined && provider !== 'wsl' && provider !== 'unknown') return 'n/a';
   if (engineName !== 'podman' && engineName !== 'docker') return 'n/a';
+  // Also where an unreadable version lands (the inbox WSL has no `--version`,
+  // and predates the setting) — never 'off', so a missing key alone cannot
+  // invite a rewrite of .wslconfig.
   if (!wslSupportsAutoMemoryReclaim(wslVersion)) return 'unsupported';
 
-  const mode = reclaimModeOf(
+  const mode = effectiveReclaimMode(
     readWslConfigEntry(wslConfigText, WSL_RECLAIM_ENTRY.section, WSL_RECLAIM_ENTRY.key),
+    wslVersion,
   );
   // The setting wins over the verdict: a measurement of a feature that is no
   // longer switched on says nothing about the machine as it stands today.
-  if (mode === null) return 'off';
+  if (mode === 'off') return 'off';
+  // Unreachable while an unreadable version is 'unsupported' above; kept so a
+  // default nobody can confirm is never reported as either on or off.
+  if (mode === 'unknown') return 'unsupported';
 
   // Only a verdict about *this* VM counts. The measurement runs against a
   // Podman machine on the WSL backend; Docker's VM is never measured, and a
@@ -163,11 +174,19 @@ export function currentWslVersionStamp(): string | null {
   return formatWslVersion(parseWslVersion(wslVersionOutput())) || null;
 }
 
-/** The `autoMemoryReclaim` mode `.wslconfig` asks for right now, or null for none. */
-export function currentReclaimMode(): WslReclaimMode | null {
-  return reclaimModeOf(
-    readWslConfigEntry(readWslConfigUtf8().text, WSL_RECLAIM_ENTRY.section, WSL_RECLAIM_ENTRY.key),
+/**
+ * The reclaim mode WSL puts into effect right now, or null when it is off or
+ * cannot be told — including a `.wslconfig` that cannot be read, whose key
+ * could say anything.
+ */
+export function currentReclaimMode(version: number[] | null = parseWslVersion(wslVersionOutput())): WslReclaimMode | null {
+  const read = readWslConfigUtf8();
+  if (read.error !== undefined) return null;
+  const mode: WslEffectiveReclaim = effectiveReclaimMode(
+    readWslConfigEntry(read.text, WSL_RECLAIM_ENTRY.section, WSL_RECLAIM_ENTRY.key),
+    version,
   );
+  return mode === 'off' || mode === 'unknown' ? null : mode;
 }
 
 /**
@@ -175,9 +194,10 @@ export function currentReclaimMode(): WslReclaimMode | null {
  *
  * Reads nothing at all off Windows, and nothing for an engine that does not run
  * on WSL — the common path stays free of both a file read and a process spawn.
- * A `.wslconfig` that cannot be read as UTF-8 reports `'off'`: the setting is
- * not in effect as far as anything can tell, and the apply path refuses to
- * rewrite such a file rather than corrupting it.
+ * A `.wslconfig` that cannot be read as UTF-8 reports `'off'`: its key could
+ * say `disabled`, so reclaim cannot be counted on, and the apply path refuses
+ * to rewrite such a file (and says to set the entry by hand) rather than
+ * corrupting it.
  */
 export function probeHostReclaim(
   engineName: string,
@@ -191,12 +211,15 @@ export function probeHostReclaim(
   // 'verified': this CLI cannot measure Docker's VM, so no verdict describes it.
   if (engineName !== 'podman' && engineName !== 'docker') return 'n/a';
 
+  const version = parseWslVersion(wslVersionOutput());
+  const read = readWslConfigUtf8();
+  if (read.error !== undefined && wslSupportsAutoMemoryReclaim(version)) return 'off';
   return resolveHostReclaim(
     platform,
     engineName,
     provider,
-    readWslConfigUtf8().text,
-    parseWslVersion(wslVersionOutput()),
+    read.text,
+    version,
     readReclaimVerdict(readAppConfig()),
   );
 }

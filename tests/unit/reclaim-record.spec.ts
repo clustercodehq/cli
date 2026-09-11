@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   runReclaimVerification,
   storedSizeAboveNoReclaimCeiling,
+  reclaimNeedsTurningOn,
   type ReclaimVerificationDeps,
 } from '../../src/commands/onboard.js';
 import { recordManualReclaimVerdict, type ManualVerdictDeps } from '../../src/commands/config.js';
@@ -223,5 +224,30 @@ describe('storedSizeAboveNoReclaimCeiling', () => {
   test('is quiet where reclaim is not a question', () => {
     assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status: 'n/a' }), null);
     assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, platform: 'darwin', status: 'n/a' }), null);
+  });
+});
+
+// Turning reclaim "on" restarts every WSL distribution, so it is offered only
+// where reclaim is actually off — not where WSL's default already reclaims.
+describe('reclaimNeedsTurningOn', () => {
+  const base = { platform: 'win32' as NodeJS.Platform, provider: 'wsl' as const, engineName: 'podman' };
+
+  test('offered only for reclaim that is off', () => {
+    assert.equal(reclaimNeedsTurningOn({ ...base, status: 'off' }), true);
+  });
+
+  // A default install on WSL 2.5.10+ resolves to 'configured' (dropcache in
+  // effect), as does an explicit mode: neither is offered a rewrite.
+  test('not offered where a mode is already in effect, or cannot be', () => {
+    for (const status of ['configured', 'verified', 'inert', 'unsupported', 'n/a'] as const) {
+      assert.equal(reclaimNeedsTurningOn({ ...base, status }), false, status);
+    }
+  });
+
+  test('not offered off Windows, off WSL, or for Docker', () => {
+    assert.equal(reclaimNeedsTurningOn({ ...base, platform: 'linux', status: 'off' }), false);
+    assert.equal(reclaimNeedsTurningOn({ ...base, provider: 'hyperv', status: 'off' }), false);
+    assert.equal(reclaimNeedsTurningOn({ ...base, provider: 'unknown', status: 'off' }), false);
+    assert.equal(reclaimNeedsTurningOn({ ...base, engineName: 'docker', status: 'off' }), false);
   });
 });
