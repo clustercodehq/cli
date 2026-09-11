@@ -10,6 +10,7 @@ import {
   getClusterCodeDir,
 } from './config.js';
 import { readInstalled } from './worker-binary.js';
+import { checkVhdxBloat } from './vhdx.js';
 import { augmentPathWithKnownEngineDirs, resolveExecutable } from './env-path.js';
 import { checkRuntimeMemory } from './runtime-memory.js';
 
@@ -340,6 +341,15 @@ export function parseDfLine(line: string): { availBytes: number; mount: string }
   return { availBytes: parseInt(match[3], 10) * 1024, mount: match[4].trim() };
 }
 
+/** Free bytes on a Windows drive, by letter; null when it cannot be read. */
+export function windowsDriveFreeBytes(driveLetter: string): number | null {
+  if (!/^[A-Za-z]$/.test(driveLetter)) return null;
+  // PowerShell rather than WMIC, which is deprecated on newer Windows.
+  const output = execSilent(`powershell -NoProfile -Command "(Get-PSDrive ${driveLetter.toUpperCase()}).Free"`);
+  const freeBytes = output ? parseInt(output.trim(), 10) : NaN;
+  return isNaN(freeBytes) ? null : freeBytes;
+}
+
 export function checkDiskSpace(): CheckResult {
   const target = diskCheckTarget();
 
@@ -349,12 +359,8 @@ export function checkDiskSpace(): CheckResult {
     if (!driveLetter) {
       return { name: 'disk', status: 'warn', detail: `Could not determine free space for ${target}` };
     }
-    // PowerShell rather than WMIC, which is deprecated on newer Windows.
-    const output = execSilent(
-      `powershell -NoProfile -Command "(Get-PSDrive ${driveLetter.toUpperCase()}).Free"`,
-    );
-    const freeBytes = output ? parseInt(output.trim(), 10) : NaN;
-    if (!isNaN(freeBytes)) {
+    const freeBytes = windowsDriveFreeBytes(driveLetter);
+    if (freeBytes !== null) {
       return evaluateDisk(freeBytes, `${driveLetter.toUpperCase()}:`);
     }
   } else if (!target.includes("'")) {
@@ -417,6 +423,8 @@ export async function runAllChecks(): Promise<CheckResult[]> {
     containerRuntime,
     checkRuntimeMemory(containerRuntime),
     checkDiskSpace(),
+    // No line at all unless this is a WSL-backed Podman machine on Windows.
+    ...[checkVhdxBloat(containerRuntime)].filter((r): r is CheckResult => r !== null),
     checkMemory(),
   );
 
