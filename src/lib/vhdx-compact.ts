@@ -472,7 +472,7 @@ function run(file: string, args: string[], timeoutMs: number): Promise<SpawnResu
     const chunks: Buffer[] = [];
     let child;
     try {
-      child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, cwd: tmpdir() });
     } catch {
       resolve({ code: null, output: '' });
       return;
@@ -493,7 +493,7 @@ function run(file: string, args: string[], timeoutMs: number): Promise<SpawnResu
 
 function runSync(file: string, args: string[], timeoutMs: number): string | null {
   try {
-    return decodeConsoleOutput(execFileSync(file, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, windowsHide: true }));
+    return decodeConsoleOutput(execFileSync(file, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, windowsHide: true, cwd: tmpdir() }));
   } catch {
     return null;
   }

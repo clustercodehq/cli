@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { decodeConsoleOutput } from './checks.js';
 
 /**
@@ -10,9 +11,14 @@ export type ExecFileFn = (file: string, args: string[]) => string;
 
 const ENGINE_QUERY_TIMEOUT_MS = 30_000;
 
+/**
+ * Runs from the temp directory: `podman machine ssh` can write its known-hosts
+ * file to a literal file named `NUL` in the working directory when an MSYS ssh
+ * (e.g. Git for Windows) is first on PATH, and that file is awkward to delete.
+ */
 export const defaultExecFile: ExecFileFn = (file, args) =>
   decodeConsoleOutput(
-    execFileSync(file, args, { stdio: ['pipe', 'pipe', 'pipe'], timeout: ENGINE_QUERY_TIMEOUT_MS }),
+    execFileSync(file, args, { stdio: ['pipe', 'pipe', 'pipe'], timeout: ENGINE_QUERY_TIMEOUT_MS, cwd: tmpdir() }),
   );
 
 /** One container name per line; blank lines and surrounding whitespace dropped. */
