@@ -848,7 +848,7 @@ async function offerRuntimeMemory(
         message: 'What should happen to the runtime size?',
         options: [
           ...(canVerify
-            ? [{ value: 'verify' as const, label: 'Verify memory reclaim now (about 10 minutes; the runtime must stay idle)' }]
+            ? [{ value: 'verify' as const, label: 'Verify memory reclaim now (10 minutes or more; the runtime must stay idle)' }]
             : []),
           { value: 'lower' as const, label: `Lower the runtime to ${noReclaimCeiling}MB` },
           { value: 'keep' as const, label: `Keep ${target}MB` },
@@ -1022,7 +1022,7 @@ async function applyMemoryTarget(args: {
 }
 
 const VERIFY_PROMPT =
-  'Verify that memory reclaim works on this machine now? Takes about 10 minutes; the runtime must stay idle.';
+  'Verify that memory reclaim works on this machine now? Takes 10 minutes or more; the runtime must stay idle.';
 
 /**
  * Run the measurement and act on what it says.
@@ -1481,7 +1481,7 @@ export const onboardCommand = new Command('onboard')
   .option('--engine <name>', 'Container engine to install if none is present (podman|docker)')
   .option(
     '--verify-reclaim',
-    'Measure whether the runtime returns memory to the host (~10 min; keep the runtime idle)',
+    'Measure whether the runtime returns memory to the host (10 minutes or more; keep the runtime idle)',
   )
   .action(async (opts: { memory?: string; engine?: string; verifyReclaim?: boolean }) => {
     if (opts.engine !== undefined && opts.engine !== 'podman' && opts.engine !== 'docker') {
