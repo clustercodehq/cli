@@ -55,10 +55,10 @@ export function decodeConsoleOutput(buf: Buffer): string {
   return buf.toString('utf-8');
 }
 
-function execSilent(cmd: string): string | null {
+function execSilent(cmd: string, timeoutMs?: number): string | null {
   try {
     // No `encoding` option, so this returns a Buffer we can decode ourselves.
-    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] })).trim();
+    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs })).trim();
   } catch {
     return null;
   }
@@ -342,10 +342,19 @@ export function parseDfLine(line: string): { availBytes: number; mount: string }
 }
 
 /** Free bytes on a Windows drive, by letter; null when it cannot be read. */
-export function windowsDriveFreeBytes(driveLetter: string): number | null {
+/** Long enough for a cold PowerShell start on a busy host; a wedged provider reads as "unknown". */
+export const POWERSHELL_PROBE_TIMEOUT_MS = 15_000;
+
+export function windowsDriveFreeBytes(
+  driveLetter: string,
+  run: (cmd: string, timeoutMs: number) => string | null = execSilent,
+): number | null {
   if (!/^[A-Za-z]$/.test(driveLetter)) return null;
   // PowerShell rather than WMIC, which is deprecated on newer Windows.
-  const output = execSilent(`powershell -NoProfile -Command "(Get-PSDrive ${driveLetter.toUpperCase()}).Free"`);
+  const output = run(
+    `powershell -NoProfile -NonInteractive -Command "(Get-PSDrive ${driveLetter.toUpperCase()}).Free"`,
+    POWERSHELL_PROBE_TIMEOUT_MS,
+  );
   const freeBytes = output ? parseInt(output.trim(), 10) : NaN;
   return isNaN(freeBytes) ? null : freeBytes;
 }

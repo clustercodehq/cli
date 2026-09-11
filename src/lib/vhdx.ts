@@ -1,8 +1,13 @@
 import { statSync } from 'node:fs';
 import { win32 } from 'node:path';
 import type { CheckResult } from './checks.js';
-import { windowsDriveFreeBytes } from './checks.js';
-import { defaultExecFile, stoppedContainerCount, type ExecFileFn } from './engine-containers.js';
+import { POWERSHELL_PROBE_TIMEOUT_MS, windowsDriveFreeBytes } from './checks.js';
+import {
+  defaultExecFile,
+  ENGINE_QUERY_TIMEOUT_MS,
+  stoppedContainerCount,
+  type ExecFileFn,
+} from './engine-containers.js';
 
 /**
  * The disk of a WSL-backed Podman machine is a dynamically expanding
@@ -194,6 +199,8 @@ export type DiscoveryResult =
 export interface DiscoveryDeps {
   exec: ExecFileFn;
   fileSize: (path: string) => number | null;
+  /** Bounded; `null` when unknown. */
+  driveFree?: (letter: string) => number | null;
 }
 
 function fileSizeOrNull(path: string): number | null {
@@ -210,7 +217,7 @@ function fileSizeOrNull(path: string): number | null {
  * land in the temporal dead zone depending on which module loads first.
  */
 export function defaultDiscoveryDeps(): DiscoveryDeps {
-  return { exec: defaultExecFile, fileSize: fileSizeOrNull };
+  return { exec: defaultExecFile, fileSize: fileSizeOrNull, driveFree: (letter) => windowsDriveFreeBytes(letter) };
 }
 
 /** Find the default Podman machine's VHDX. Windows only; every step goes through `deps`. */
@@ -227,7 +234,7 @@ export function discoverPodmanVhdx(deps: DiscoveryDeps = defaultDiscoveryDeps())
   let registration: { distro: string; basePath: string } | null;
   try {
     registration = parseLxssJson(
-      deps.exec('powershell', ['-NoProfile', '-NonInteractive', '-Command', LXSS_QUERY]),
+      deps.exec('powershell', ['-NoProfile', '-NonInteractive', '-Command', LXSS_QUERY], POWERSHELL_PROBE_TIMEOUT_MS),
       wslDistroCandidates(machine.name),
     );
   } catch {
@@ -247,7 +254,7 @@ export function discoverPodmanVhdx(deps: DiscoveryDeps = defaultDiscoveryDeps())
 /** Used bytes inside the machine, or `null` when it did not answer. */
 export function measureGuestUsed(machine: string, exec: ExecFileFn = defaultExecFile): number | null {
   try {
-    return parseDfUsed(exec('podman', machineSshArgs(machine, GUEST_USAGE_SCRIPT)));
+    return parseDfUsed(exec('podman', machineSshArgs(machine, GUEST_USAGE_SCRIPT), ENGINE_QUERY_TIMEOUT_MS));
   } catch {
     return null;
   }
@@ -262,7 +269,7 @@ export function readVhdx(target: PodmanVhdx, deps: DiscoveryDeps = defaultDiscov
     vhdxBytes,
     guestUsedBytes: target.running ? measureGuestUsed(target.machine, deps.exec) : null,
     machineRunning: target.running,
-    hostFreeBytes: drive ? windowsDriveFreeBytes(drive) : null,
+    hostFreeBytes: drive ? (deps.driveFree ?? windowsDriveFreeBytes)(drive) : null,
     drive,
   };
 }

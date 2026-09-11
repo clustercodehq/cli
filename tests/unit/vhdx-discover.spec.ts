@@ -11,7 +11,10 @@ import {
   GUEST_USAGE_SCRIPT,
   machineSshArgs,
   discoverPodmanVhdx,
+  measureGuestUsed,
+  readVhdx,
 } from '../../src/lib/vhdx.js';
+import { POWERSHELL_PROBE_TIMEOUT_MS } from '../../src/lib/checks.js';
 
 describe('parseMachineList', () => {
   it('strips the default marker podman appends to the name', () => {
@@ -153,11 +156,14 @@ describe('discoverPodmanVhdx', () => {
 
   function deps(machineList: string | Error, lxssOut: string | Error = lxss, size: number | null = 1) {
     const calls: string[][] = [];
+    const timeouts: Array<number | undefined> = [];
     return {
       calls,
+      timeouts,
       deps: {
-        exec: (file: string, args: string[]) => {
+        exec: (file: string, args: string[], timeoutMs?: number) => {
           calls.push([file, ...args]);
+          timeouts.push(timeoutMs);
           const out = file === 'podman' ? machineList : lxssOut;
           if (out instanceof Error) throw out;
           return out;
@@ -197,5 +203,49 @@ describe('discoverPodmanVhdx', () => {
       ok: false,
       reason: 'no-vhdx',
     });
+  });
+
+  it('bounds the registry query like the other PowerShell probes', () => {
+    const { deps: d, calls, timeouts } = deps('podman-machine-default*|wsl|true|true\n');
+    discoverPodmanVhdx(d);
+    const registry = calls.findIndex((c) => c[0] === 'powershell');
+    assert.ok(registry >= 0);
+    assert.equal(timeouts[registry], POWERSHELL_PROBE_TIMEOUT_MS);
+  });
+});
+
+describe('readVhdx', () => {
+  const target = { machine: 'dev', distro: 'podman-dev', vhdxPath: 'D:\\wsl\\dev\\ext4.vhdx', running: true };
+
+  it('reads the size, the usage inside the machine and the drive free space through its deps', () => {
+    const execCalls: Array<[string, string[], number | undefined]> = [];
+    const drives: string[] = [];
+    const reading = readVhdx(target, {
+      exec: (file, args, timeoutMs) => (execCalls.push([file, args, timeoutMs]), '     Used\n1000\n'),
+      fileSize: () => 5000,
+      driveFree: (letter) => (drives.push(letter), 7000),
+    });
+    assert.deepEqual(reading, { vhdxBytes: 5000, guestUsedBytes: 1000, machineRunning: true, hostFreeBytes: 7000, drive: 'D' });
+    assert.deepEqual(drives, ['D']);
+    assert.equal(execCalls.length, 1);
+    assert.equal(execCalls[0][0], 'podman');
+    // The in-machine probe is bounded too: ssh into a wedged machine must not hang doctor.
+    assert.ok(typeof execCalls[0][2] === 'number' && execCalls[0][2] > 0 && execCalls[0][2] <= 30_000);
+  });
+
+  it('never asks a stopped machine, and tolerates an unknown free space', () => {
+    let execs = 0;
+    const reading = readVhdx(
+      { ...target, running: false },
+      { exec: () => (execs++, ''), fileSize: () => 5000, driveFree: () => null },
+    );
+    assert.deepEqual(reading, { vhdxBytes: 5000, guestUsedBytes: null, machineRunning: false, hostFreeBytes: null, drive: 'D' });
+    assert.equal(execs, 0);
+  });
+
+  it('measures usage with a bounded ssh probe', () => {
+    let seen: number | undefined;
+    assert.equal(measureGuestUsed('dev', (_f, _a, t) => ((seen = t), 'Used\n42\n')), 42);
+    assert.ok(typeof seen === 'number' && seen <= 30_000);
   });
 });
