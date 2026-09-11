@@ -7,6 +7,7 @@ import { withInterruptNotice } from '../lib/interrupt.js';
 import { runningContainers, stoppedContainerCount } from '../lib/engine-containers.js';
 import { releaseStdin, restoreRawMode } from '../lib/tty.js';
 import {
+  describeMachineChoice,
   describeMeasuredReading,
   discoverPodmanVhdx,
   readVhdx,
@@ -52,6 +53,8 @@ async function runCompact(options: { yes?: boolean }): Promise<number> {
     return 1;
   }
   const target = found.target;
+  // Only one machine is compacted: say which, in case another one is in use.
+  clack.log.info(describeMachineChoice(target));
 
   if (!target.running) {
     clack.log.error(
@@ -71,7 +74,8 @@ async function runCompact(options: { yes?: boolean }): Promise<number> {
   clack.log.info(
     reading.guestUsedBytes === null
       ? 'Could not measure usage inside the machine; the space returned is unknown until the compact finishes.'
-      : describeMeasuredReading({ ...reading, guestUsedBytes: reading.guestUsedBytes }),
+      : // The machine was named on the line above.
+        describeMeasuredReading({ ...reading, machine: undefined, guestUsedBytes: reading.guestUsedBytes }),
   );
 
   const running = runningContainers('podman');
@@ -152,6 +156,7 @@ machineCommand
   .command('compact')
   .description(
     "Return unused space in the Podman machine's virtual disk to Windows (WSL-backed machines only). " +
+      'Acts on the default Podman machine, or the first listed when none is set as the default. ' +
       'Stops and restarts the machine, and asks for administrator approval.',
   )
   .option('-y, --yes', 'Skip the confirmation prompt (Windows still asks for administrator approval)')

@@ -113,7 +113,8 @@ describe('doctor', () => {
     // On Windows it appears only for a WSL-backed Podman machine.
     if (disk === undefined) return;
     assert.ok(['pass', 'warn'].includes(disk.status), disk.status);
-    assert.match(disk.detail, /^Runtime disk: /);
+    // The machine is named only when there are several.
+    assert.match(disk.detail, /^Runtime disk( \(machine [^)]+\))?: /);
   });
 });
 

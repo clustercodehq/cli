@@ -49,6 +49,8 @@ describe('machine', () => {
     const { output } = runCli(['machine', 'compact', '--help']);
     assert.match(output, /--yes/);
     assert.match(output, /disk/i);
+    // It acts on one machine only; the help says which.
+    assert.match(output, /default\s+Podman\s+machine/);
   });
 
   it('exits 1 off Windows without prompting', { skip: process.platform === 'win32' }, () => {

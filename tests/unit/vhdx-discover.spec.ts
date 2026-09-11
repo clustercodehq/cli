@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseMachineList,
+  parseMachineEntries,
+  describeMachineChoice,
   wslDistroCandidates,
   parseLxssJson,
   parseDfUsed,
@@ -31,6 +33,13 @@ describe('parseMachineList', () => {
     const m = parseMachineList('alpha|wsl|false|false\nbeta|hyperv|true|false\n');
     assert.equal(m?.name, 'alpha');
     assert.equal(m?.running, false);
+  });
+
+  it('lists every machine, for saying which one was chosen', () => {
+    assert.deepEqual(
+      parseMachineEntries('first|wsl|false|false\r\nsecond*|wsl|true|true\r\nNAME VM TYPE\r\n').map((m) => m.name),
+      ['first', 'second'],
+    );
   });
 
   it('returns null for empty or unparseable output', () => {
@@ -182,8 +191,23 @@ describe('discoverPodmanVhdx', () => {
         distro: 'podman-machine-default',
         vhdxPath: `${PODMAN_BASE}\\ext4.vhdx`,
         running: true,
+        isDefault: true,
+        machineCount: 1,
       },
     });
+  });
+
+  it('records whether the machine is the default, and how many machines there are', () => {
+    const chosenDefault = discoverPodmanVhdx(deps('other|wsl|false|false\npodman-machine-default*|wsl|true|true\n').deps);
+    assert.ok(chosenDefault.ok);
+    assert.equal(chosenDefault.target.isDefault, true);
+    assert.equal(chosenDefault.target.machineCount, 2);
+
+    const firstListed = discoverPodmanVhdx(deps('podman-machine-default|wsl|true|false\nother|wsl|false|false\n').deps);
+    assert.ok(firstListed.ok);
+    assert.equal(firstListed.target.machine, 'podman-machine-default');
+    assert.equal(firstListed.target.isDefault, false);
+    assert.equal(firstListed.target.machineCount, 2);
   });
 
   it('reports no machine when podman is missing or lists none', () => {
@@ -233,6 +257,12 @@ describe('readVhdx', () => {
     assert.ok(typeof execCalls[0][2] === 'number' && execCalls[0][2] > 0 && execCalls[0][2] <= 30_000);
   });
 
+  it('names the machine in the reading only when there are several', () => {
+    const d = { exec: () => 'Used\n1\n', fileSize: () => 5, driveFree: () => 1 };
+    assert.equal(readVhdx({ ...target, machineCount: 1 }, d)?.machine, undefined);
+    assert.equal(readVhdx({ ...target, machineCount: 2 }, d)?.machine, 'dev');
+  });
+
   it('never asks a stopped machine, and tolerates an unknown free space', () => {
     let execs = 0;
     const reading = readVhdx(
@@ -247,5 +277,28 @@ describe('readVhdx', () => {
     let seen: number | undefined;
     assert.equal(measureGuestUsed('dev', (_f, _a, t) => ((seen = t), 'Used\n42\n')), 42);
     assert.ok(typeof seen === 'number' && seen <= 30_000);
+  });
+});
+
+describe('describeMachineChoice', () => {
+  const base = { distro: 'podman-dev', vhdxPath: 'D:/x/ext4.vhdx', running: true };
+
+  it('names the only machine plainly', () => {
+    assert.equal(describeMachineChoice({ ...base, machine: 'dev', isDefault: true, machineCount: 1 }), 'Podman machine: dev');
+    assert.equal(describeMachineChoice({ ...base, machine: 'dev' }), 'Podman machine: dev');
+  });
+
+  it('says it is the default when there are several', () => {
+    assert.equal(
+      describeMachineChoice({ ...base, machine: 'dev', isDefault: true, machineCount: 3 }),
+      'Podman machine: dev (the default of 3 machines)',
+    );
+  });
+
+  it('says it is the first listed when none is the default', () => {
+    assert.equal(
+      describeMachineChoice({ ...base, machine: 'dev', isDefault: false, machineCount: 2 }),
+      'Podman machine: dev (the first of 2 machines; none is set as the default)',
+    );
   });
 });

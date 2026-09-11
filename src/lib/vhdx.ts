@@ -52,8 +52,8 @@ export interface MachineEntry {
   isDefault: boolean;
 }
 
-/** Parse `podman machine list --format MACHINE_LIST_FORMAT`; default machine wins, else the first. */
-export function parseMachineList(raw: string): MachineEntry | null {
+/** Every machine in `podman machine list --format MACHINE_LIST_FORMAT`, in listed order. */
+export function parseMachineEntries(raw: string): MachineEntry[] {
   const entries: MachineEntry[] = [];
   for (const line of raw.split(/\r?\n/)) {
     const parts = line.trim().split('|');
@@ -66,7 +66,16 @@ export function parseMachineList(raw: string): MachineEntry | null {
       isDefault: parts[3].trim().toLowerCase() === 'true',
     });
   }
+  return entries;
+}
+
+function chooseMachine(entries: MachineEntry[]): MachineEntry | null {
   return entries.find((e) => e.isDefault) ?? entries[0] ?? null;
+}
+
+/** Parse `podman machine list --format MACHINE_LIST_FORMAT`; default machine wins, else the first. */
+export function parseMachineList(raw: string): MachineEntry | null {
+  return chooseMachine(parseMachineEntries(raw));
 }
 
 /** WSL distro names a Podman machine may be registered under. */
@@ -130,6 +139,8 @@ export interface VhdxReading {
   /** Drive letter holding the VHDX, without the colon. */
   drive: string | null;
   stoppedContainers?: number | null;
+  /** The machine measured; set only when there are several, so the line says which. */
+  machine?: string;
 }
 
 /** Is this much dead space worth the user's attention on this drive? */
@@ -144,6 +155,10 @@ export const COMPACT_COMMAND = 'clustercode machine compact';
 
 export const STOPPED_CONTAINERS_NOTE = 'stopped containers also hold space; stopped DevBoxes can be cleaned up in the console';
 
+function diskLabel(reading: VhdxReading): string {
+  return reading.machine ? `Runtime disk (machine ${reading.machine})` : 'Runtime disk';
+}
+
 /** Sizes only, no advice: `Runtime disk: X on host, Y used inside — ~Z reclaimable (C: F free)`. */
 export function describeMeasuredReading(reading: VhdxReading & { guestUsedBytes: number }): string {
   const reclaimable = reclaimableBytes(reading.vhdxBytes, reading.guestUsedBytes);
@@ -151,7 +166,7 @@ export function describeMeasuredReading(reading: VhdxReading & { guestUsedBytes:
     reading.hostFreeBytes !== null && reading.drive !== null
       ? ` (${reading.drive}: ${formatGb(reading.hostFreeBytes)} free)`
       : '';
-  return `Runtime disk: ${formatGb(reading.vhdxBytes)} on host, ${formatGb(reading.guestUsedBytes)} used inside — ~${formatGb(reclaimable)} reclaimable${free}`;
+  return `${diskLabel(reading)}: ${formatGb(reading.vhdxBytes)} on host, ${formatGb(reading.guestUsedBytes)} used inside — ~${formatGb(reclaimable)} reclaimable${free}`;
 }
 
 /**
@@ -162,7 +177,7 @@ export function describeMeasuredReading(reading: VhdxReading & { guestUsedBytes:
  */
 export function evaluateVhdxBloat(reading: VhdxReading): CheckResult {
   const name = 'runtime-disk';
-  const onHost = `Runtime disk: ${formatGb(reading.vhdxBytes)} on host`;
+  const onHost = `${diskLabel(reading)}: ${formatGb(reading.vhdxBytes)} on host`;
 
   if (reading.guestUsedBytes === null) {
     return {
@@ -190,6 +205,20 @@ export interface PodmanVhdx {
   distro: string;
   vhdxPath: string;
   running: boolean;
+  /** Whether Podman has it set as the default machine (otherwise it is the first listed). */
+  isDefault?: boolean;
+  /** How many Podman machines exist. */
+  machineCount?: number;
+}
+
+/** Which machine is being acted on, and why that one: `Podman machine: dev (the default of 3 machines)`. */
+export function describeMachineChoice(target: PodmanVhdx): string {
+  const head = `Podman machine: ${target.machine}`;
+  const count = target.machineCount ?? 1;
+  if (count <= 1) return head;
+  return target.isDefault
+    ? `${head} (the default of ${count} machines)`
+    : `${head} (the first of ${count} machines; none is set as the default)`;
 }
 
 export type DiscoveryResult =
@@ -222,12 +251,13 @@ export function defaultDiscoveryDeps(): DiscoveryDeps {
 
 /** Find the default Podman machine's VHDX. Windows only; every step goes through `deps`. */
 export function discoverPodmanVhdx(deps: DiscoveryDeps = defaultDiscoveryDeps()): DiscoveryResult {
-  let machine: MachineEntry | null;
+  let entries: MachineEntry[];
   try {
-    machine = parseMachineList(deps.exec('podman', ['machine', 'list', '--format', MACHINE_LIST_FORMAT]));
+    entries = parseMachineEntries(deps.exec('podman', ['machine', 'list', '--format', MACHINE_LIST_FORMAT]));
   } catch {
-    machine = null;
+    entries = [];
   }
+  const machine = chooseMachine(entries);
   if (!machine) return { ok: false, reason: 'no-machine' };
   if (machine.vmType !== 'wsl') return { ok: false, reason: 'not-wsl' };
 
@@ -247,7 +277,14 @@ export function discoverPodmanVhdx(deps: DiscoveryDeps = defaultDiscoveryDeps())
 
   return {
     ok: true,
-    target: { machine: machine.name, distro: registration.distro, vhdxPath, running: machine.running },
+    target: {
+      machine: machine.name,
+      distro: registration.distro,
+      vhdxPath,
+      running: machine.running,
+      isDefault: machine.isDefault,
+      machineCount: entries.length,
+    },
   };
 }
 
@@ -271,6 +308,7 @@ export function readVhdx(target: PodmanVhdx, deps: DiscoveryDeps = defaultDiscov
     machineRunning: target.running,
     hostFreeBytes: drive ? (deps.driveFree ?? windowsDriveFreeBytes)(drive) : null,
     drive,
+    ...((target.machineCount ?? 1) > 1 ? { machine: target.machine } : {}),
   };
 }
 

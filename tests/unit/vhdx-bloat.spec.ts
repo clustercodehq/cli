@@ -136,3 +136,27 @@ describe('evaluateVhdxBloat', () => {
     }
   });
 });
+
+describe('evaluateVhdxBloat with several machines', () => {
+  it('names the machine it measured when there is more than one', () => {
+    const r = evaluateVhdxBloat({
+      vhdxBytes: 70 * 1024 ** 3,
+      guestUsedBytes: 40 * 1024 ** 3,
+      machineRunning: true,
+      hostFreeBytes: 30 * 1024 ** 3,
+      drive: 'C',
+      machine: 'dev',
+    });
+    assert.match(r.detail, /^Runtime disk \(machine dev\): 70\.0 GB on host/);
+
+    const stopped = evaluateVhdxBloat({
+      vhdxBytes: 70 * 1024 ** 3,
+      guestUsedBytes: null,
+      machineRunning: false,
+      hostFreeBytes: null,
+      drive: 'C',
+      machine: 'dev',
+    });
+    assert.match(stopped.detail, /^Runtime disk \(machine dev\): 70\.0 GB on host/);
+  });
+});
