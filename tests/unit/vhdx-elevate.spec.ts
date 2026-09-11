@@ -117,6 +117,15 @@ describe('elevateCompact', () => {
     assert.ok(r.kind === 'failed' && /cannot access the file/.test(r.logTail));
   });
 
+  it('reads a diskpart error in the log as a failure even when diskpart exited 0', async () => {
+    const { deps } = fakeDeps({
+      leaves: ran('0', 'Microsoft DiskPart version 10.0\r\nDiskPart has encountered an error: The system cannot find the file specified.'),
+    });
+    const r = await elevateCompact(DISKPART_PATH, deps, TIMING);
+    assert.ok(r.kind === 'failed' && r.exitCode === 0, JSON.stringify(r));
+    assert.ok(r.kind === 'failed' && /cannot find the file/.test(r.logTail));
+  });
+
   it('maps a declined or unavailable prompt when the elevated side never started', async () => {
     const declined = fakeDeps({ launched: { code: ELEVATION_DECLINED_EXIT } });
     assert.deepEqual(await elevateCompact(DISKPART_PATH, declined.deps, TIMING), { kind: 'declined' });

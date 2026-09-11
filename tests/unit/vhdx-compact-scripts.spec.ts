@@ -232,6 +232,20 @@ describe('interpretDiskpart', () => {
     assert.deepEqual(interpretDiskpart(0, 'DiskPart successfully compacted the virtual disk file.'), { kind: 'ok' });
   });
 
+  it('reads an exit code of 0 as a failure when the log shows a diskpart error', () => {
+    // diskpart does not reliably turn a failed scripted command into a non-zero exit code.
+    const logs = [
+      'DiskPart has encountered an error: The process cannot access the file because it is being used by another process.',
+      'Virtual Disk Service error:\r\nThe virtual disk is already attached.',
+      'The system cannot find the file specified.',
+    ];
+    for (const log of logs) {
+      const r = interpretDiskpart(0, `Microsoft DiskPart version 10.0\r\n\r\n${log}\r\n`);
+      assert.ok(r.kind === 'failed' && r.exitCode === 0, log);
+      assert.ok(r.kind === 'failed' && r.logTail.includes(log.split('\r\n').at(-1)!), log);
+    }
+  });
+
   it('reads anything else as a failure carrying the end of the log', () => {
     const log = 'line1\r\nDiskPart has encountered an error: The process cannot access the file.\r\n';
     const r = interpretDiskpart(5, log);

@@ -274,9 +274,19 @@ export function interpretLauncher(exitCode: number | null, output: string): Elev
   return { kind: 'failed', exitCode, logTail: logTail(stripClixml(output)) };
 }
 
+/**
+ * What diskpart prints when a scripted command fails. Its exit code does not
+ * reliably reflect such a failure, so the log is checked too.
+ */
+export const DISKPART_ERROR_MARKERS: readonly RegExp[] = [
+  /DiskPart has encountered an error/i,
+  /Virtual Disk Service error/i,
+  /The system cannot find/i,
+];
+
 /** The elevated script finished: diskpart's exit code and its log. */
 export function interpretDiskpart(exitCode: number | null, log: string): ElevationResult {
-  if (exitCode === 0) return { kind: 'ok' };
+  if (exitCode === 0 && !DISKPART_ERROR_MARKERS.some((marker) => marker.test(log))) return { kind: 'ok' };
   return { kind: 'failed', exitCode, logTail: logTail(log) };
 }
 
@@ -614,11 +624,15 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
   switch (outcome.kind) {
     case 'compacted': {
       const { before, after } = outcome;
-      const returned =
-        before.vhdxBytes !== null && after.vhdxBytes !== null
-          ? ` (${formatGb(Math.max(0, before.vhdxBytes - after.vhdxBytes))} returned to Windows)`
-          : '';
-      lines.push(`Disk: ${sizeOrUnknown(before.vhdxBytes)} → ${sizeOrUnknown(after.vhdxBytes)}${returned}`);
+      if (before.vhdxBytes !== null && after.vhdxBytes !== null && after.vhdxBytes >= before.vhdxBytes) {
+        lines.push(`Compacted, but no space was returned: the disk is still ${formatGb(after.vhdxBytes)}.`);
+      } else {
+        const returned =
+          before.vhdxBytes !== null && after.vhdxBytes !== null
+            ? ` (${formatGb(before.vhdxBytes - after.vhdxBytes)} returned to Windows)`
+            : '';
+        lines.push(`Disk: ${sizeOrUnknown(before.vhdxBytes)} → ${sizeOrUnknown(after.vhdxBytes)}${returned}`);
+      }
       if (outcome.drive) {
         lines.push(`${outcome.drive}: free: ${sizeOrUnknown(before.freeBytes)} → ${sizeOrUnknown(after.freeBytes)}`);
       }
@@ -639,7 +653,9 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
       lines.push(
         outcome.exitCode === null
           ? 'The disk was not compacted.'
-          : `diskpart could not compact the disk (exit code ${outcome.exitCode}).`,
+          : outcome.exitCode === 0
+            ? 'diskpart reported an error, so the disk was not compacted.'
+            : `diskpart could not compact the disk (exit code ${outcome.exitCode}).`,
       );
       if (outcome.logTail) lines.push(outcome.logTail);
       break;

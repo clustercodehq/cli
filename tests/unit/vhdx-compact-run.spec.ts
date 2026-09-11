@@ -304,6 +304,46 @@ describe('describeCompactOutcome', () => {
     ]);
   });
 
+  it('says so when the compact returned no space, without failing', () => {
+    const d = describeCompactOutcome(
+      {
+        kind: 'compacted',
+        before: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
+        after: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
+        drive: 'D',
+        restarted: true,
+      },
+      target,
+    );
+    assert.equal(d.ok, true);
+    assert.deepEqual(d.lines, [
+      'Compacted, but no space was returned: the disk is still 70.0 GB.',
+      'D: free: 32.0 GB → 32.0 GB',
+      'The machine was started again.',
+    ]);
+  });
+
+  it('reports unknown sizes without guessing what was returned', () => {
+    const d = describeCompactOutcome(
+      { kind: 'compacted', before: { vhdxBytes: 70 * GB, freeBytes: null }, after: { vhdxBytes: null, freeBytes: null }, drive: 'D', restarted: true },
+      target,
+    );
+    assert.equal(d.ok, true);
+    assert.deepEqual(d.lines, ['Disk: 70.0 GB → unknown', 'D: free: unknown → unknown', 'The machine was started again.']);
+  });
+
+  it('describes a diskpart error behind an exit code of 0, and a compact that did not complete', () => {
+    const zero = describeCompactOutcome({ kind: 'failed', exitCode: 0, logTail: 'Virtual Disk Service error', restarted: true }, target);
+    assert.equal(zero.ok, false);
+    assert.deepEqual(zero.lines, ['diskpart reported an error, so the disk was not compacted.', 'Virtual Disk Service error', 'The machine was started again.']);
+
+    const coded = describeCompactOutcome({ kind: 'failed', exitCode: 5, logTail: '', restarted: true }, target);
+    assert.equal(coded.lines[0], 'diskpart could not compact the disk (exit code 5).');
+
+    const none = describeCompactOutcome({ kind: 'failed', exitCode: null, logTail: 'did not finish', restarted: false }, target);
+    assert.equal(none.lines[0], 'The disk was not compacted.');
+  });
+
   it('names running containers when blocked, capped to a few', () => {
     const d = describeCompactOutcome(
       { kind: 'blocked', running: ['a', 'b', 'c', 'd', 'e', 'f', 'g'], afterTrim: false },
