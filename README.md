@@ -66,9 +66,16 @@ On Windows with a WSL-backed Podman machine, `doctor` also reports how much
 unused space the machine's virtual disk holds:
 
 ```
-✓ Runtime disk: 31.7 GB on host, 29.0 GB used inside — ~2.7 GB reclaimable (C: 68.6 GB free)
+✓ Runtime disk: 31.7 GB on host, 30.2 GB used inside — ~1.5 GB reclaimable (C: 68.6 GB free)
 ⚠ Runtime disk: 70.8 GB on host, 43.0 GB used inside — ~27.8 GB reclaimable (C: 32.0 GB free); run `clustercode machine compact`
 ```
+
+"Used inside" counts the machine's files plus the space its ext4 filesystem
+keeps for itself (the journal and the inode-table entries of files in use),
+which stays in the disk after a compact. When that cannot be read, it counts
+the files alone. The estimate is approximate: partly used blocks of the virtual
+disk are not returned either, so a freshly compacted disk can still show a GB
+or two.
 
 It measures the default Podman machine, or the first one listed when none is
 set as the default. When there are several machines, the line names the one it

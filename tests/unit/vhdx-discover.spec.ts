@@ -7,6 +7,9 @@ import {
   wslDistroCandidates,
   parseLxssJson,
   parseDfUsed,
+  parseExt4Overhead,
+  describeMeasuredReading,
+  parseGuestUsage,
   vhdxPathFor,
   driveLetterOf,
   MACHINE_LIST_FORMAT,
@@ -127,6 +130,85 @@ describe('parseDfUsed', () => {
   });
 });
 
+/** A 1024-byte ext4 superblock as `od -An -v -t u1` prints it, with the given fields set. */
+function superblock(fields: { u16?: Record<number, number>; u32?: Record<number, number>; u8?: Record<number, number> }): string {
+  const b = new Array<number>(1024).fill(0);
+  for (const [o, v] of Object.entries(fields.u8 ?? {})) b[Number(o)] = v;
+  for (const [o, v] of Object.entries(fields.u16 ?? {})) {
+    b[Number(o)] = v & 0xff;
+    b[Number(o) + 1] = (v >>> 8) & 0xff;
+  }
+  for (const [o, v] of Object.entries(fields.u32 ?? {})) {
+    for (let i = 0; i < 4; i++) b[Number(o) + i] = Math.floor(v / 256 ** i) % 256;
+  }
+  const rows: string[] = [];
+  for (let i = 0; i < 1024; i += 16) rows.push(' ' + b.slice(i, i + 16).map((n) => String(n).padStart(3)).join(' '));
+  return rows.join('\n') + '\n';
+}
+
+const GIB = 1024 ** 3;
+
+/** The values read from a 1 TiB WSL machine disk: 1 GiB journal, 602,878 inodes in use, 256-byte inodes. */
+const HOST_SUPERBLOCK = {
+  u32: { 0x00: 67_108_864, 0x10: 67_108_864 - 602_878, 0x4c: 1, 0x5c: 0x103c, 0xe0: 8, 0x148: 0, 0x14c: GIB },
+  u16: { 0x38: 0xef53, 0x58: 256 },
+  u8: { 0xfd: 1 },
+};
+
+describe('parseExt4Overhead', () => {
+  it('counts the journal and the inode-table space of inodes in use', () => {
+    assert.equal(parseExt4Overhead(superblock(HOST_SUPERBLOCK)), GIB + 602_878 * 256);
+  });
+
+  it('counts only inodes in use, so lazily initialised inode tables never inflate it', () => {
+    const fewer = { ...HOST_SUPERBLOCK, u32: { ...HOST_SUPERBLOCK.u32, 0x10: 67_108_864 - 10 } };
+    assert.equal(parseExt4Overhead(superblock(fewer)), GIB + 10 * 256);
+  });
+
+  it('counts no journal when there is none, or when it lives on another device', () => {
+    const noJournal = { ...HOST_SUPERBLOCK, u32: { ...HOST_SUPERBLOCK.u32, 0x5c: 0x1038 } };
+    assert.equal(parseExt4Overhead(superblock(noJournal)), 602_878 * 256);
+    const external = { ...HOST_SUPERBLOCK, u32: { ...HOST_SUPERBLOCK.u32, 0xe0: 0 } };
+    assert.equal(parseExt4Overhead(superblock(external)), 602_878 * 256);
+  });
+
+  it('is unreadable when the journal size is not recorded in the superblock', () => {
+    assert.equal(parseExt4Overhead(superblock({ ...HOST_SUPERBLOCK, u8: { 0xfd: 0 } })), null);
+  });
+
+  it('is unreadable for anything but a whole ext4 superblock', () => {
+    assert.equal(parseExt4Overhead(''), null);
+    // xfs, btrfs, or no sudo: no ext4 magic, or nothing at all.
+    assert.equal(parseExt4Overhead(superblock({ ...HOST_SUPERBLOCK, u16: { 0x38: 0x5846, 0x58: 256 } })), null);
+    assert.equal(parseExt4Overhead(superblock(HOST_SUPERBLOCK).split('\n').slice(0, 10).join('\n')), null);
+    assert.equal(parseExt4Overhead('sudo: a password is required'), null);
+  });
+});
+
+describe('parseGuestUsage', () => {
+  const df = '         Used\n31201665024\n';
+
+  it('adds the filesystem overhead to df\'s used bytes', () => {
+    assert.equal(
+      parseGuestUsage(`${df}clustercode-superblock\n${superblock(HOST_SUPERBLOCK)}`),
+      31_201_665_024 + GIB + 602_878 * 256,
+    );
+    assert.equal(
+      parseGuestUsage(`${df}clustercode-superblock\r\n${superblock(HOST_SUPERBLOCK).replace(/\n/g, '\r\n')}`),
+      31_201_665_024 + GIB + 602_878 * 256,
+    );
+  });
+
+  it('keeps df\'s used bytes unchanged when the overhead cannot be read', () => {
+    assert.equal(parseGuestUsage(`${df}clustercode-superblock\n`), 31_201_665_024);
+    assert.equal(parseGuestUsage(df), 31_201_665_024);
+  });
+
+  it('is null without a df reading, whatever the superblock says', () => {
+    assert.equal(parseGuestUsage(`clustercode-superblock\n${superblock(HOST_SUPERBLOCK)}`), null);
+  });
+});
+
 describe('vhdxPathFor / driveLetterOf', () => {
   it('joins with Windows separators on any OS', () => {
     assert.equal(vhdxPathFor('D:\\wsl\\dev'), 'D:\\wsl\\dev\\ext4.vhdx');
@@ -152,8 +234,12 @@ describe('machineSshArgs', () => {
     assert.equal(args.slice(3).join(' '), GUEST_USAGE_SCRIPT);
   });
 
-  it('measures usage with df in bytes on the root filesystem', () => {
-    assert.equal(GUEST_USAGE_SCRIPT, 'df -B1 --output=used /');
+  it('measures usage with df in bytes, then reads the ext4 superblock read-only without prompting', () => {
+    assert.equal(
+      GUEST_USAGE_SCRIPT,
+      'df -B1 --output=used /; echo clustercode-superblock; ' +
+        'src=$(findmnt -no SOURCE /) && test -b ${src:-/nonexistent} && sudo -n od -An -v -t u1 -j 1024 -N 1024 $src 2>/dev/null; true',
+    );
   });
 });
 
@@ -271,6 +357,23 @@ describe('readVhdx', () => {
     );
     assert.deepEqual(reading, { vhdxBytes: 5000, guestUsedBytes: null, machineRunning: false, hostFreeBytes: null, drive: 'D' });
     assert.equal(execs, 0);
+  });
+
+  it('estimates reclaimable space net of filesystem overhead, and never below zero', () => {
+    const deps = (hostBytes: number) => ({
+      exec: () => `Used\n${29 * GIB}\nclustercode-superblock\n${superblock(HOST_SUPERBLOCK)}`,
+      fileSize: () => hostBytes,
+      driveFree: () => 100 * GIB,
+    });
+    const after = readVhdx(target, deps(31.7 * GIB));
+    assert.ok(after && after.guestUsedBytes !== null);
+    assert.equal(after.guestUsedBytes, 29 * GIB + GIB + 602_878 * 256);
+    assert.match(describeMeasuredReading({ ...after, guestUsedBytes: after.guestUsedBytes }), /used inside — ~1\.6 GB reclaimable/);
+
+    // The overhead estimate can exceed what the disk holds: clamp, never negative.
+    const tight = readVhdx(target, deps(29.5 * GIB));
+    assert.ok(tight && tight.guestUsedBytes !== null);
+    assert.match(describeMeasuredReading({ ...tight, guestUsedBytes: tight.guestUsedBytes }), /~0\.0 GB reclaimable/);
   });
 
   it('measures usage with a bounded ssh probe', () => {

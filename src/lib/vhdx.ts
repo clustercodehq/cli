@@ -31,8 +31,17 @@ export function formatGb(bytes: number): string {
 
 export const MACHINE_LIST_FORMAT = '{{.Name}}|{{.VMType}}|{{.Running}}|{{.Default}}';
 
-/** In-machine command that prints the root filesystem's used bytes. */
-export const GUEST_USAGE_SCRIPT = 'df -B1 --output=used /';
+const SUPERBLOCK_MARK = 'clustercode-superblock';
+
+/**
+ * In-machine command, as ONE string: the root filesystem's used bytes, then its
+ * raw ext4 superblock, read-only through `sudo -n` so it never prompts. The
+ * superblock part is skipped quietly when it cannot be read, and the command
+ * always exits 0 so that never costs the df reading.
+ */
+export const GUEST_USAGE_SCRIPT =
+  `df -B1 --output=used /; echo ${SUPERBLOCK_MARK}; ` +
+  'src=$(findmnt -no SOURCE /) && test -b ${src:-/nonexistent} && sudo -n od -An -v -t u1 -j 1024 -N 1024 $src 2>/dev/null; true';
 
 /**
  * Argv for running a command inside the machine.
@@ -115,6 +124,58 @@ export function parseDfUsed(raw: string): number | null {
     if (/^\d+$/.test(lines[i])) return Number(lines[i]);
   }
   return null;
+}
+
+const EXT4_MAGIC = 0xef53;
+const EXT4_COMPAT_HAS_JOURNAL = 0x4;
+/** `s_jnl_backup_type`: the journal inode's size is copied into the superblock. */
+const EXT3_JNL_BACKUP_BLOCKS = 1;
+
+/**
+ * Bytes an ext4 filesystem occupies on its disk beyond what `df` calls used.
+ *
+ * ext4's default `bsddf` leaves its own metadata out of "used", but the journal
+ * and the inode-table entries of files in use are written, so they stay in the
+ * virtual disk and no compact returns them. Unused inode tables are left out:
+ * ext4 initialises them lazily, so most were never written.
+ *
+ * `raw` is the 1024-byte superblock as `od -An -v -t u1` prints it. `null` when
+ * it is not a whole ext4 superblock (xfs, btrfs, sudo refused) or the journal
+ * size is not recorded in it.
+ */
+export function parseExt4Overhead(raw: string): number | null {
+  const tokens = raw.trim().split(/\s+/);
+  if (tokens.length !== 1024 || !tokens.every((t) => /^\d{1,3}$/.test(t))) return null;
+  const b = tokens.map(Number);
+  if (b.some((v) => v > 255)) return null;
+  const u16 = (o: number): number => b[o] + b[o + 1] * 0x100;
+  const u32 = (o: number): number => u16(o) + u16(o + 2) * 0x10000;
+
+  if (u16(0x38) !== EXT4_MAGIC) return null;
+
+  let journal = 0;
+  // An internal journal (inode number set); an external one is on another device.
+  if ((u32(0x5c) & EXT4_COMPAT_HAS_JOURNAL) !== 0 && u32(0xe0) !== 0) {
+    if (b[0xfd] !== EXT3_JNL_BACKUP_BLOCKS) return null;
+    // s_jnl_blocks[15] and [16]: the journal inode's i_size_high and i_size.
+    journal = u32(0x148) * 2 ** 32 + u32(0x14c);
+  }
+
+  const inodeSize = u32(0x4c) === 0 ? 128 : u16(0x58);
+  const inodesInUse = Math.max(0, u32(0x00) - u32(0x10));
+  return journal + inodesInUse * inodeSize;
+}
+
+/**
+ * Read `GUEST_USAGE_SCRIPT`'s answer: df's used bytes plus the filesystem
+ * overhead, or df's figure alone when the overhead cannot be read. `null`
+ * without a df reading.
+ */
+export function parseGuestUsage(raw: string): number | null {
+  const [dfPart, superblockPart = ''] = raw.split(new RegExp(`^${SUPERBLOCK_MARK}\\r?$`, 'm'));
+  const used = parseDfUsed(dfPart);
+  if (used === null) return null;
+  return used + (parseExt4Overhead(superblockPart) ?? 0);
 }
 
 export function vhdxPathFor(basePath: string): string {
@@ -288,10 +349,10 @@ export function discoverPodmanVhdx(deps: DiscoveryDeps = defaultDiscoveryDeps())
   };
 }
 
-/** Used bytes inside the machine, or `null` when it did not answer. */
+/** Bytes the machine's filesystem occupies (used plus its own overhead), or `null` when it did not answer. */
 export function measureGuestUsed(machine: string, exec: ExecFileFn = defaultExecFile): number | null {
   try {
-    return parseDfUsed(exec('podman', machineSshArgs(machine, GUEST_USAGE_SCRIPT), ENGINE_QUERY_TIMEOUT_MS));
+    return parseGuestUsage(exec('podman', machineSshArgs(machine, GUEST_USAGE_SCRIPT), ENGINE_QUERY_TIMEOUT_MS));
   } catch {
     return null;
   }
