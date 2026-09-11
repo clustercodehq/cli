@@ -20,11 +20,12 @@ import {
   devboxFitTable,
   formatFitTable,
 } from '../lib/runtime-memory.js';
-import { planMemoryApply, applyWslMemory, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
-import { readCredentials, readAppConfig, validateRuntimeMemoryMb } from '../lib/config.js';
+import { planResourceApply, applyWslSetting, runApplySteps, wslConfigPath } from '../lib/runtime-memory-apply.js';
+import { readCredentials, readAppConfig, validateRuntimeMemoryMb, validateRuntimeCpus } from '../lib/config.js';
 import { locateContainerEngine } from '../lib/env-path.js';
-import { memoryKnob, type MemoryKnob } from '../lib/memory-knob.js';
-import type { MachineProvider } from '../lib/runtime-memory.js';
+import { resourceKnob, type ResourceKnob, type RuntimeResource } from '../lib/resource-knob.js';
+import type { EngineCapacity, MachineProvider } from '../lib/runtime-memory.js';
+import { checkRuntimeCpu, hostCoreCount, recommendRuntimeCpus } from '../lib/runtime-cpu.js';
 import {
   installInstructions,
   dockerStartPlan,
@@ -281,7 +282,7 @@ async function startContainerRuntime(engineName: string, flagMemory?: string): P
 }
 
 /** The knob's destination plus whatever else the user has to do afterwards. */
-function knobDestination(knob: MemoryKnob): string {
+function knobDestination(knob: ResourceKnob): string {
   return knob.followUp ? `${knob.where}, ${knob.followUp}` : knob.where;
 }
 
@@ -326,7 +327,7 @@ async function chooseEngine(flagEngine?: EngineName): Promise<EngineName | null>
     engine = picked as EngineName;
   }
 
-  const knob = memoryKnob(engine, process.platform);
+  const knob = resourceKnob('memory', engine, process.platform);
   if (knob.kind === 'external') {
     clack.log.warn(
       `${engineLabel(engine)}: ClusterCode cannot set the container runtime memory for you — ` +
@@ -599,20 +600,22 @@ export function resolveRequestedMemoryMib(
 }
 
 /**
- * Say what the runtime has and where its size is set, for the engines this CLI
- * cannot resize.
+ * Say what the runtime has and where its size is set, for the engines and
+ * resources this CLI cannot change.
  *
  * Returning silently here is what made Docker feel unsupported rather than
  * merely un-configurable: the wizard skipped the whole memory step without a
  * word, so a Docker user had no way to learn that the number exists, that it
- * caps their DevBox count, or that a knob for it lives one file away.
+ * caps their DevBox count, or that a knob for it lives one file away. CPU
+ * shares this function rather than copying it so that gap cannot reopen one
+ * resource at a time.
  */
-function reportUnconfigurableMemory(
+function reportUnconfigurable(
+  resource: RuntimeResource,
   engineName: string,
   platform: NodeJS.Platform,
   provider: MachineProvider,
-  hostBytes: number,
-  dedicatedRecommendation: number,
+  describeCurrent: () => string[],
   reason: string,
   explicitRequest: boolean,
 ): void {
@@ -620,48 +623,66 @@ function reportUnconfigurableMemory(
   // The PROBED provider, not a re-derived default. Re-deriving it here reopens
   // the dead end this function exists to close: a Windows Docker install on the
   // Hyper-V backend would be sent to .wslconfig, which cannot size it.
-  const knob = memoryKnob(engineName, platform, provider);
+  const knob = resourceKnob(resource, engineName, platform, provider);
+  const heading = resource === 'memory' ? 'Container runtime memory' : 'Container runtime CPU';
   // 'none' means no knob exists anywhere (native Linux). There is nothing to go
   // do, so on a normal run this would be noise — but someone who typed
   // `--memory 8192` asked a direct question and deserves a direct answer rather
   // than silence followed by an unexplained "not applied".
   if (knob.kind === 'none') {
     if (explicitRequest) {
-      clack.log.step('Container runtime memory');
+      clack.log.step(heading);
       clack.log.info(`Nothing to apply: ${knob.reason}.`);
     }
     return;
   }
 
-  const current = probeEngineCapacity(engineName);
-  clack.log.step('Container runtime memory');
-  if (current) {
-    const currentMib = Math.floor(current.memTotalBytes / 1024 / 1024);
-    clack.log.info(
-      `Currently ${(currentMib / 1024).toFixed(1)} GiB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)} GiB ` +
-        `— fits ~${estimateDevboxes(currentMib)} default (4 GiB) DevBoxes`,
-    );
-    // Only when the extra memory actually buys a DevBox. Below one whole 4 GiB
-    // slot the recommendation reads as "you are short" while changing nothing,
-    // which is the same empty nudge suppressed in the doctor check.
-    if (estimateDevboxes(dedicatedRecommendation) > estimateDevboxes(currentMib)) {
-      clack.log.info(
-        `A dedicated worker could use up to ${(dedicatedRecommendation / 1024).toFixed(1)} GiB ` +
-          `(~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes).`,
-      );
-    }
-  }
+  clack.log.step(heading);
+  for (const line of describeCurrent()) clack.log.info(line);
   // One warning, not two: the caller used to print `probe.reason` as well, so
   // `--memory` on Docker said the same thing twice in different words.
+  const noun = resource === 'memory' ? 'memory' : 'CPU';
   clack.log.warn(
     knob.kind === 'external'
-      ? `${engineName === 'docker' ? 'Docker' : 'Podman'} memory is not configurable from this CLI — ${knobDestination(knob)}.`
-      : `Cannot set runtime memory: ${reason || knob.reason}`,
+      ? `${engineName === 'docker' ? 'Docker' : 'Podman'} ${noun} is not configurable from this CLI — ${knobDestination(knob)}.`
+      : `Cannot set runtime ${noun}: ${reason || knob.reason}`,
   );
 }
 
 /**
- * Whether an explicit `--memory` that could not be applied should fail the run.
+ * The current-state lines for the memory step, as `reportUnconfigurable` wants
+ * them. Probing lazily matters: on the 'none' path it is never called, so a
+ * native-Linux run does not spawn `podman info` to print nothing.
+ */
+function describeCurrentMemory(
+  engineName: string,
+  hostBytes: number,
+  dedicatedRecommendation: number,
+): () => string[] {
+  return () => {
+    const current = probeEngineCapacity(engineName);
+    if (!current) return [];
+    const currentMib = Math.floor(current.memTotalBytes / 1024 / 1024);
+    const lines = [
+      `Currently ${(currentMib / 1024).toFixed(1)} GiB of ${(hostBytes / 1024 / 1024 / 1024).toFixed(1)} GiB ` +
+        `— fits ~${estimateDevboxes(currentMib)} default (4 GiB) DevBoxes`,
+    ];
+    // Only when the extra memory actually buys a DevBox. Below one whole 4 GiB
+    // slot the recommendation reads as "you are short" while changing nothing,
+    // which is the same empty nudge suppressed in the doctor check.
+    if (estimateDevboxes(dedicatedRecommendation) > estimateDevboxes(currentMib)) {
+      lines.push(
+        `A dedicated worker could use up to ${(dedicatedRecommendation / 1024).toFixed(1)} GiB ` +
+          `(~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes).`,
+      );
+    }
+    return lines;
+  };
+}
+
+/**
+ * Whether an explicit `--memory` / `--cpus` that could not be applied should
+ * fail the run.
  *
  * Everywhere a knob exists, it should: a CI run that asked for a size, got
  * none, and exited 0 is indistinguishable from one that worked. Native Linux is
@@ -670,7 +691,7 @@ function reportUnconfigurableMemory(
  * would break a fleet script running one `onboard --memory N` across a mixed
  * estate, on precisely the machines that need it least.
  */
-function unappliedMemoryIsFailure(knob: MemoryKnob): boolean {
+function unappliedRequestIsFailure(knob: ResourceKnob): boolean {
   return knob.kind !== 'none';
 }
 
@@ -701,21 +722,21 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     return false;
   }
 
-  const probe = planMemoryApply(provider, platform, engineName, requested ?? dedicatedRecommendation);
+  const probe = planResourceApply('memory', provider, platform, engineName, requested ?? dedicatedRecommendation);
   if (probe.kind === 'unsupported') {
-    reportUnconfigurableMemory(
+    reportUnconfigurable(
+      'memory',
       engineName,
       platform,
       provider,
-      hostBytes,
-      dedicatedRecommendation,
+      describeCurrentMemory(engineName, hostBytes, dedicatedRecommendation),
       probe.reason ?? '',
       flagMemory !== undefined,
     );
     const knob = engineName === 'podman' || engineName === 'docker'
-      ? memoryKnob(engineName, platform, provider)
+      ? resourceKnob('memory', engineName, platform, provider)
       : null;
-    return flagMemory === undefined || !knob || !unappliedMemoryIsFailure(knob);
+    return flagMemory === undefined || !knob || !unappliedRequestIsFailure(knob);
   }
 
   const current = probeEngineCapacity(engineName);
@@ -802,7 +823,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
     return true;
   }
 
-  const plan = planMemoryApply(provider, process.platform, engineName, target);
+  const plan = planResourceApply('memory', provider, process.platform, engineName, target);
   clack.log.info(['Will run:', ...plan.steps.map((s) => `  ${pc.dim(s)}`)].join('\n'));
   if (plan.warning) clack.log.warn(plan.warning);
 
@@ -826,7 +847,7 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   }
 
   if (plan.kind === 'wslconfig') {
-    const written = applyWslMemory(target);
+    const written = applyWslSetting('memory', target);
     if (!written.ok) {
       clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
       // An apply that was ATTEMPTED and failed is a stronger failure than one
@@ -853,6 +874,217 @@ async function offerRuntimeMemory(flagMemory: string | undefined): Promise<boole
   return true;
 }
 
+/**
+ * Pick the requested core count: explicit flag, then stored config, then
+ * nothing (which means "ask"). Mirrors `resolveRequestedMemoryMib`, including
+ * its refusal to guess: an invalid value resolves to null rather than being
+ * silently rounded into range.
+ */
+export function resolveRequestedCpus(
+  flag: string | undefined,
+  configured: string | undefined,
+  hostCores: number,
+): number | null {
+  for (const candidate of [flag, configured]) {
+    if (candidate === undefined) continue;
+    if (validateRuntimeCpus(candidate, hostCores) === null) return Number(candidate.trim());
+    return null;
+  }
+  return null;
+}
+
+/**
+ * The current-state lines for the CPU step. Takes an already-probed capacity
+ * when the caller has one, so the interactive path does not spawn a second
+ * `podman info` to print the number it just read.
+ */
+function describeCurrentCpu(
+  engineName: string,
+  hostCores: number,
+  probed?: EngineCapacity | null,
+): () => string[] {
+  return () => {
+    const current = probed !== undefined ? probed : probeEngineCapacity(engineName);
+    if (!current) return [];
+    const word = hostCores === 1 ? 'core' : 'cores';
+    return hostCores > 0
+      ? [`Currently ${current.cpus} of ${hostCores} host ${word}`]
+      : [`Currently ${current.cpus} cores`];
+  };
+}
+
+/**
+ * Offer to change how many cores the container runtime can use.
+ *
+ * Deliberately thinner than the memory step. Memory needs a dedicated/shared
+ * choice because the right answer depends on what else the machine is for;
+ * cores are time-sliced, so the honest ceiling is always the whole host and the
+ * only real question is whether to accept it. That leaves two presets where
+ * memory has four.
+ */
+async function offerRuntimeCpu(flagCpus: string | undefined): Promise<boolean> {
+  const runtime = checkContainerRuntime();
+  const engineName = runtime.engine?.name;
+  if (!engineName) return true;
+
+  const hostCores = hostCoreCount();
+  const platform = process.platform;
+  const provider = detectMachineProvider(engineName);
+  const requested = resolveRequestedCpus(flagCpus, readAppConfig().RUNTIME_CPUS, hostCores);
+  const recommendation = recommendRuntimeCpus(hostCores);
+
+  // An explicit --cpus that fails validation is an error, not a silent
+  // fall-through to the prompt — same reasoning as --memory: a CI run that
+  // typos it would otherwise exit 0 having changed nothing.
+  if (flagCpus !== undefined && requested === null) {
+    clack.log.error(validateRuntimeCpus(flagCpus, hostCores) ?? 'Invalid --cpus value');
+    return false;
+  }
+
+  const probe = planResourceApply('cpus', provider, platform, engineName, requested ?? recommendation);
+  if (probe.kind === 'unsupported') {
+    reportUnconfigurable(
+      'cpus',
+      engineName,
+      platform,
+      provider,
+      describeCurrentCpu(engineName, hostCores),
+      probe.reason ?? '',
+      flagCpus !== undefined,
+    );
+    const knob = engineName === 'podman' || engineName === 'docker'
+      ? resourceKnob('cpus', engineName, platform, provider)
+      : null;
+    return flagCpus === undefined || !knob || !unappliedRequestIsFailure(knob);
+  }
+
+  const current = probeEngineCapacity(engineName);
+  const currentCores = current ? current.cpus : null;
+
+  clack.log.step('Container runtime CPU');
+  for (const line of describeCurrentCpu(engineName, hostCores, current)()) clack.log.info(line);
+
+  let target = requested;
+  if (target === null) {
+    if (!process.stdin.isTTY) return true;
+    if (recommendation === 0) return true;
+    // Nothing to offer when the runtime already has the machine. Prompting here
+    // would ask the user to choose between the value they have and the same
+    // value, then restart WSL to apply it. One core of slack for the same
+    // reason the doctor check allows it: a hypervisor presenting n-1 is
+    // correctly provisioned, not something to fix.
+    if (currentCores !== null && hostCores - currentCores <= 1) {
+      clack.log.info('The runtime already has this machine’s cores — nothing to change.');
+      return true;
+    }
+
+    const choice = await clack.select({
+      message: 'How many cores should the container runtime use?',
+      options: [
+        {
+          value: 'all' as const,
+          label: `All ${recommendation} cores (recommended — cores are shared, not reserved)`,
+        },
+        { value: 'custom' as const, label: 'Custom count' },
+        { value: 'keep' as const, label: 'Keep current' },
+      ],
+    });
+    if (clack.isCancel(choice) || choice === 'keep') return true;
+
+    if (choice === 'all') {
+      target = recommendation;
+    } else {
+      const answer = await clack.text({
+        message: 'How many cores should the container runtime use?',
+        initialValue: String(recommendation),
+        // The default parameter is required: clack types the callback as
+        // `(value: string | undefined)` and wants `undefined` for "valid".
+        validate: (v = '') => validateRuntimeCpus(v, hostCores) ?? undefined,
+      });
+      if (clack.isCancel(answer)) return true;
+      target = Number(String(answer).trim());
+    }
+  }
+
+  // Exact comparison is right here, unlike memory: a guest kernel reserves some
+  // of the RAM it is given, so an allocation never reads back exactly and the
+  // memory path has to compare with tolerance. A core is not consumed that way
+  // — `podman info` reporting 8 after we asked for 8 is the expected result.
+  if (currentCores !== null && currentCores === target) {
+    clack.log.info('Already set to that many cores — nothing to change.');
+    return true;
+  }
+
+  const plan = planResourceApply('cpus', provider, platform, engineName, target);
+  clack.log.info(['Will run:', ...plan.steps.map((step) => `  ${pc.dim(step)}`)].join('\n'));
+  if (plan.warning) clack.log.warn(plan.warning);
+
+  // Both apply paths tear down the container runtime. If a worker is serving
+  // DevBoxes right now, this kills them — say so before asking, not after.
+  if (execSilent('podman ps --format "{{.Names}}"')) {
+    clack.log.warn('Containers are running — applying this will stop them.');
+  }
+
+  if (process.stdin.isTTY) {
+    const ok = await clack.confirm({ message: 'Apply this change?' });
+    if (clack.isCancel(ok) || !ok) return true;
+  } else if (!flagCpus) {
+    // No TTY and no explicit --cpus: a stored config value is not consent to
+    // restart every WSL distribution on the machine unattended.
+    clack.log.warn(
+      `Runtime CPU differs from ${target} cores, but there is no terminal to confirm the change. ` +
+        `Re-run with ${pc.bold(`--cpus ${target}`)} to apply it non-interactively.`,
+    );
+    return true;
+  }
+
+  if (plan.kind === 'wslconfig') {
+    const written = applyWslSetting('processors', target);
+    if (!written.ok) {
+      clack.log.error(`Could not write ${wslConfigPath()}: ${written.error}`);
+      // An apply that was ATTEMPTED and failed is a stronger failure than one
+      // the CLI declined to attempt.
+      return false;
+    }
+    clack.log.success(`Updated ${wslConfigPath()}`);
+  }
+
+  const ran = runApplySteps(plan.steps);
+  if (!ran.ok) {
+    clack.log.error(`Failed at: ${ran.failed}`);
+    return false;
+  }
+
+  // Re-probe rather than reporting the requested number: a malformed .wslconfig
+  // is silently ignored by WSL, so "we asked for 8 cores" is not evidence of 8.
+  const after = checkRuntimeCpu(checkContainerRuntime());
+  if (after.status === 'pass') clack.log.success(after.detail);
+  else clack.log.warn(after.detail);
+  clack.log.info('Restart the worker for the new capacity to be advertised.');
+  return true;
+}
+
+/**
+ * Run both resource steps and name whichever ones did not take.
+ *
+ * They are reported together because they fail the same way and for the same
+ * reasons, and because a run that applied CPU but not memory must not close
+ * with a message that mentions only one of them. Both always run: an
+ * unapplicable `--memory` is not a reason to skip a perfectly applicable
+ * `--cpus`.
+ */
+async function offerRuntimeResources(opts: OnboardOptions): Promise<string[]> {
+  const unapplied: string[] = [];
+  if (!(await offerRuntimeMemory(opts.memory))) unapplied.push('memory');
+  if (!(await offerRuntimeCpu(opts.cpus))) unapplied.push('CPU');
+  return unapplied;
+}
+
+/** "the requested runtime memory" / "the requested runtime memory and CPU". */
+function unappliedPhrase(unapplied: string[]): string {
+  return `the requested runtime ${unapplied.join(' and ')}`;
+}
+
 export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
   try {
     await runOnboardInner(opts);
@@ -875,17 +1107,17 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     // Explicitly clear the exit code: doctor sets process.exitCode = 1 before
     // delegating here, and a "everything looks good" outcome must not exit 1.
     process.exitCode = 0;
-    // The memory step can fail on its own - an explicit --memory this CLI could
+    // A resource step can fail on its own - an explicit --memory or --cpus this CLI could
     // not apply - and closing with "everything looks good" over a non-zero exit
     // is the kind of contradiction a CI log gets read for. The step reports its
     // own outcome rather than writing process.exitCode, because the OTHER call
     // site below re-runs the checks afterwards and would overwrite it.
-    const memoryOk = await offerRuntimeMemory(opts.memory);
-    if (!memoryOk) process.exitCode = 1;
+    const unapplied = await offerRuntimeResources(opts);
+    if (unapplied.length > 0) process.exitCode = 1;
     clack.outro(
-      memoryOk
+      unapplied.length === 0
         ? pc.green('Everything looks good! No issues to fix.')
-        : pc.yellow('Checks passed, but the requested runtime memory was not applied.'),
+        : pc.yellow(`Checks passed, but ${unappliedPhrase(unapplied)} was not applied.`),
     );
     return;
   }
@@ -958,7 +1190,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     );
   }
 
-  const memoryOk = await offerRuntimeMemory(opts.memory);
+  const unapplied = await offerRuntimeResources(opts);
 
   // Pre-warm the worker binary so the first `clustercode worker` starts instantly.
   const { readInstalled, ensureWorkerBinary } = await import('../lib/worker-binary.js');
@@ -995,14 +1227,14 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
 
   const remainingFailures = finalResults.filter((r) => r.status === 'fail');
   if (remainingFailures.length === 0) {
-    // Fixing the checks does not retroactively apply a --memory this CLI could
-    // not apply. Reporting "all issues resolved" and exiting 0 here is how the
-    // memory failure used to vanish on the path where the wizard did work.
-    process.exitCode = memoryOk ? 0 : 1;
+    // Fixing the checks does not retroactively apply a --memory or --cpus this
+    // CLI could not apply. Reporting "all issues resolved" and exiting 0 here is
+    // how the memory failure used to vanish on the path where the wizard worked.
+    process.exitCode = unapplied.length === 0 ? 0 : 1;
     clack.outro(
-      memoryOk
+      unapplied.length === 0
         ? pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.')
-        : pc.yellow('Issues resolved, but the requested runtime memory was not applied.'),
+        : pc.yellow(`Issues resolved, but ${unappliedPhrase(unapplied)} was not applied.`),
     );
     return;
   }
@@ -1019,6 +1251,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
 
 export interface OnboardOptions {
   memory?: string;
+  cpus?: string;
   /** Which engine to install when none is present. Ignored when one already is. */
   engine?: EngineName;
 }
@@ -1026,12 +1259,13 @@ export interface OnboardOptions {
 export const onboardCommand = new Command('onboard')
   .description('Interactive setup wizard — fix all health check issues')
   .option('--memory <mb>', 'Memory (MB) to allocate to the container runtime')
+  .option('--cpus <n>', 'Logical cores to allocate to the container runtime')
   .option('--engine <name>', 'Container engine to install if none is present (podman|docker)')
-  .action(async (opts: { memory?: string; engine?: string }) => {
+  .action(async (opts: { memory?: string; cpus?: string; engine?: string }) => {
     if (opts.engine !== undefined && opts.engine !== 'podman' && opts.engine !== 'docker') {
       console.error(`Unknown engine "${opts.engine}". Use podman or docker.`);
       process.exitCode = 1;
       return;
     }
-    await runOnboard({ memory: opts.memory, engine: opts.engine as EngineName | undefined });
+    await runOnboard({ memory: opts.memory, cpus: opts.cpus, engine: opts.engine as EngineName | undefined });
   });

@@ -13,6 +13,7 @@ import {
 } from './config-store/index.js';
 import type { Credentials, WorkerConfig, AppConfig } from './config-store/index.js';
 import { MIN_RUNTIME_MEMORY_MIB, maxSafeRuntimeMib } from './runtime-memory.js';
+import { MIN_RUNTIME_CPUS } from './runtime-cpu.js';
 
 // Re-export reads and types so existing CLI imports keep working
 export {
@@ -31,6 +32,7 @@ export type { Credentials, WorkerConfig, AppConfig };
 const ALLOWED_CONFIG_KEYS: ReadonlySet<keyof AppConfig> = new Set([
   'WORKER_NAME',
   'RUNTIME_MEMORY_MB',
+  'RUNTIME_CPUS',
 ]);
 
 export function isAllowedConfigKey(key: string): key is keyof AppConfig {
@@ -82,6 +84,34 @@ export function validateRuntimeMemoryMb(
     if (mb > maxSafeMb) {
       return `Runtime memory cannot exceed ${maxSafeMb} MB on this machine (the host needs the rest)`;
     }
+  }
+  return null;
+}
+
+/**
+ * Validate a `RUNTIME_CPUS` value.
+ *
+ * Deliberately asymmetric with the memory validator, which refuses anything
+ * that would starve the host. Cores are time-sliced, so an over-allocated
+ * runtime is slower and never OOM-killed, and the host's scheduler keeps the
+ * desktop responsive regardless — there is no equivalent danger to guard
+ * against, and reserving cores from the runtime would only make the count the
+ * worker advertises less true than it could be.
+ *
+ * The host count is still a ceiling: allocating cores that do not exist is not
+ * oversubscription, it is a number the hypervisor will refuse or silently clamp.
+ */
+export function validateRuntimeCpus(value: string, hostCores: number): string | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return 'Runtime CPUs must be a whole number of cores (for example: 8)';
+  }
+  const cores = Number(trimmed);
+  if (cores < MIN_RUNTIME_CPUS) {
+    return `Runtime CPUs must be at least ${MIN_RUNTIME_CPUS}`;
+  }
+  if (hostCores > 0 && cores > hostCores) {
+    return `Runtime CPUs cannot exceed this machine's ${hostCores} cores`;
   }
   return null;
 }

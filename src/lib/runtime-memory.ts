@@ -7,8 +7,9 @@
  * exported so they can be unit-tested without a container runtime installed.
  */
 
-import { memoryKnob } from './memory-knob.js';
+import { resourceKnob } from './resource-knob.js';
 import type { EngineName } from './engine-install.js';
+import type { WslConfigKey } from './resource-knob.js';
 
 export type MachineProvider = 'wsl' | 'hyperv' | 'applehv' | 'qemu' | 'unknown';
 
@@ -221,18 +222,28 @@ export function formatFitTable(rows: FitRow[]): string {
 }
 
 /**
- * Set `[wsl2] memory=` in a .wslconfig, preserving everything else.
+ * Set a `[wsl2]` key in a .wslconfig, preserving everything else.
  *
  * This rewrites a *global*, user-owned file that other tools also read, so it
  * patches rather than regenerates: comments, blank lines, unrelated keys and
- * unrelated sections all survive verbatim.
+ * unrelated sections all survive verbatim. That includes the OTHER key this
+ * CLI writes — setting `processors` must leave a user's `memory` untouched,
+ * and vice versa.
  */
-export function patchWslConfig(existing: string | null, memoryMib: number): string {
-  if (!Number.isFinite(memoryMib) || memoryMib <= 0) {
-    throw new Error('WSL memory must be a positive number of MiB');
+export function patchWslConfig(
+  existing: string | null,
+  key: WslConfigKey,
+  value: number,
+): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`WSL ${key} must be a positive number`);
   }
-  // WSL treats an unsuffixed size as BYTES, so the suffix is mandatory.
-  const entry = `memory=${memoryMib}MB`;
+  if (key === 'processors' && !Number.isInteger(value)) {
+    throw new Error('WSL processors must be a whole number of cores');
+  }
+  // WSL treats an unsuffixed SIZE as bytes, so `memory` needs its suffix.
+  // `processors` is a count, not a size, and must NOT carry one.
+  const entry = key === 'memory' ? `memory=${value}MB` : `${key}=${value}`;
 
   if (!existing || existing.trim() === '') return `[wsl2]\n${entry}\n`;
 
@@ -245,7 +256,9 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
   // never take effect while we report success.
   const isSectionHeader = (line: string) => /^\s*\[[^\]]*\]\s*([;#].*)?$/.test(line);
   const isWsl2Header = (line: string) => /^\s*\[\s*wsl2\s*\]\s*([;#].*)?$/i.test(line);
-  const isMemoryKey = (line: string) => /^\s*memory\s*=/i.test(line);
+  // Escapes are doubled because this is a template literal: a single \s would
+  // collapse to a literal 's' before RegExp ever saw it.
+  const isTargetKey = (line: string) => new RegExp(`^\\s*${key}\\s*=`, 'i').test(line);
 
   const headerIdx = lines.findIndex(isWsl2Header);
 
@@ -264,12 +277,12 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
     }
   }
 
-  const memoryIdx = lines.findIndex(
-    (line, i) => i > headerIdx && i < endIdx && isMemoryKey(line),
+  const keyIdx = lines.findIndex(
+    (line, i) => i > headerIdx && i < endIdx && isTargetKey(line),
   );
 
-  if (memoryIdx !== -1) {
-    lines[memoryIdx] = entry;
+  if (keyIdx !== -1) {
+    lines[keyIdx] = entry;
   } else {
     lines.splice(headerIdx + 1, 0, entry);
   }
@@ -282,7 +295,7 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
 import { execSync } from 'node:child_process';
 import { totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
-import { decodeConsoleOutput, socketDeniedPhrase } from './checks.js';
+import { decodeConsoleOutput, unavailableReason } from './checks.js';
 // Imported from the underlying store, not from './config.js': config.ts
 // imports MIN_RUNTIME_MEMORY_MIB from this module, and importing config.ts
 // back here would create a cycle.
@@ -331,8 +344,8 @@ function isDeliberateChoice(engineMib: number, configuredMib: number | undefined
 /**
  * Where a nudge or warning should point the user.
  *
- * Delegates to `memoryKnob()` rather than re-deriving it, so this check and
- * `planMemoryApply` cannot disagree: anything the CLI cannot apply gets the
+ * Delegates to `resourceKnob()` rather than re-deriving it, so this check and
+ * `planResourceApply` cannot disagree: anything the CLI cannot apply gets the
  * knob's own destination, and only the cases it *can* apply are told to run
  * `clustercode onboard`.
  */
@@ -342,7 +355,7 @@ function knobAction(
   provider: MachineProvider | undefined,
 ): string {
   const engine: EngineName = engineName === 'docker' ? 'docker' : 'podman';
-  return memoryKnob(engine, platform, provider).where;
+  return resourceKnob('memory', engine, platform, provider).where;
 }
 
 /**
@@ -514,18 +527,10 @@ export function checkRuntimeMemory(runtime: CheckResult): CheckResult {
   }
 
   if (runtime.status !== 'pass') {
-    // "Start it" is the right advice for a stopped engine and the wrong advice
-    // for one that is running and merely unreachable — that user starts what is
-    // already started, gets the same error, and repeats. The container-runtime
-    // check has already told them the real fix, so point at it rather than
-    // contradicting it one line below.
-    const denied = runtime.detail.includes(socketDeniedPhrase());
     return {
       name: 'runtime-memory',
       status: 'warn',
-      detail: denied
-        ? `Runtime memory unknown — ${engineName} is not reachable by this user (see above)`
-        : 'Runtime memory unknown — start the container runtime and re-run to measure it',
+      detail: `Runtime memory unknown — ${unavailableReason(runtime, engineName)}`,
     };
   }
 

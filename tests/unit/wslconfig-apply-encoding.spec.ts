@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyWslMemory, wslConfigPath } from '../../src/lib/runtime-memory-apply.js';
+import { applyWslSetting, wslConfigPath } from '../../src/lib/runtime-memory-apply.js';
 
 /**
  * These tests redirect HOME/USERPROFILE to a throwaway temp directory so
- * `applyWslMemory` never touches the real .wslconfig on the machine running
+ * `applyWslSetting` never touches the real .wslconfig on the machine running
  * the suite.
  */
 function withTempHome<T>(fn: (dir: string) => T): T {
@@ -27,7 +27,7 @@ function withTempHome<T>(fn: (dir: string) => T): T {
   }
 }
 
-describe('applyWslMemory encoding guard', () => {
+describe('applyWslSetting encoding guard', () => {
   test('refuses a UTF-16LE .wslconfig and leaves the file untouched', () => {
     withTempHome(() => {
       const path = wslConfigPath();
@@ -37,7 +37,7 @@ describe('applyWslMemory encoding guard', () => {
       const original = Buffer.concat([bom, body]);
       writeFileSync(path, original);
 
-      const result = applyWslMemory(8192);
+      const result = applyWslSetting('memory', 8192);
 
       assert.equal(result.ok, false);
       assert.ok(result.error);
@@ -54,7 +54,7 @@ describe('applyWslMemory encoding guard', () => {
       const original = Buffer.from([0x5b, 0x77, 0x73, 0x6c, 0x32, 0x5d, 0x0a, 0xe9, 0x0a]);
       writeFileSync(path, original);
 
-      const result = applyWslMemory(8192);
+      const result = applyWslSetting('memory', 8192);
 
       assert.equal(result.ok, false);
       assert.ok(result.error);
@@ -73,7 +73,7 @@ describe('applyWslMemory encoding guard', () => {
       const original = Buffer.from(text, 'utf16le');
       writeFileSync(path, original);
 
-      const result = applyWslMemory(8192);
+      const result = applyWslSetting('memory', 8192);
 
       assert.equal(result.ok, false);
       assert.ok(result.error);
@@ -96,7 +96,7 @@ describe('applyWslMemory encoding guard', () => {
       }
       writeFileSync(path, original);
 
-      const result = applyWslMemory(8192);
+      const result = applyWslSetting('memory', 8192);
 
       assert.equal(result.ok, false);
       assert.ok(result.error);
@@ -111,7 +111,7 @@ describe('applyWslMemory encoding guard', () => {
       const original = '[wsl2]\nmemory=4096MB\n# a comment with unicode: café\n';
       writeFileSync(path, original, 'utf-8');
 
-      const result = applyWslMemory(8192);
+      const result = applyWslSetting('memory', 8192);
 
       assert.equal(result.ok, true);
       const after = readFileSync(path, 'utf-8');

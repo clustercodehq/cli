@@ -53,8 +53,8 @@ engine with `--podman` or `--docker`.
 ### `clustercode doctor`
 
 Check system health: auth status, worker registration, orchestrator
-connectivity, container runtime, container-runtime memory allocation, disk,
-and host memory. Add `--json` for machine-readable output.
+connectivity, container runtime, container-runtime memory and CPU allocation,
+disk, and host memory. Add `--json` for machine-readable output.
 
 Exits non-zero when any check fails, so it works as a scripted gate:
 
@@ -70,20 +70,21 @@ platform-aware setup for macOS, Linux, and Windows. Any issue left unresolved is
 listed at the end with the exact command that fixes it, and the wizard exits
 non-zero.
 
-The wizard also offers to size the memory given to the container runtime —
-this runs even when everything else is already healthy, since an
+The wizard also offers to size the memory and CPU given to the container
+runtime — these run even when everything else is already healthy, since an
 under-provisioned runtime otherwise fails silently by capping how much work
-the worker can take on. Pass `--memory <mb>` to set it non-interactively (also
-honoured when a fresh container-runtime machine is created):
+the worker can take on. Pass `--memory <mb>` and `--cpus <n>` to set them
+non-interactively (memory is also honoured when a fresh container-runtime
+machine is created):
 
 ```bash
-clustercode onboard --memory 8192
+clustercode onboard --memory 8192 --cpus 8
 ```
 
-On Windows, this is governed by `.wslconfig`; applying a change restarts every
+On Windows, both are governed by `.wslconfig`; applying a change restarts every
 WSL distribution on the machine. On native Linux there is nothing to apply —
-containers run directly on the host, so nothing caps them below your RAM and
-`--memory` reports that instead of changing anything.
+containers run directly on the host, so nothing caps them below your RAM or
+your CPU cores, and the flags report that instead of changing anything.
 
 On Windows, a container engine installed by the wizard is not on the PATH that
 the current terminal inherited, so the CLI re-resolves it from the default
@@ -99,25 +100,25 @@ When no engine is installed, the wizard asks which one to set up. Pass
 clustercode onboard --engine docker
 ```
 
-The two are not equivalent, and the difference is memory:
+The two are not equivalent, and the difference is what the CLI can resize:
 
 | | Podman | Docker |
 |---|---|---|
-| `doctor` reports memory and DevBox capacity | yes | yes |
+| `doctor` reports memory, CPU and DevBox capacity | yes | yes |
 | Same sizing math, warnings and nudges | yes | yes |
-| `onboard --memory` can apply a change | yes, on Windows and macOS | **no** |
+| `onboard --memory` / `--cpus` can apply a change | yes, on Windows and macOS | **no** |
 | Automatic install | Windows, macOS, Debian/Ubuntu, Fedora, RHEL-likes | same, minus RHEL-likes |
 | Usable without further steps | yes | Linux needs a re-login |
 
-Podman is recommended for the memory reason alone. Choosing Docker is fully
+Podman is recommended for that reason alone. Choosing Docker is fully
 supported: the wizard installs it (winget on Windows, the `docker-desktop` cask
 on macOS, your distribution's package on Debian/Ubuntu and Fedora) and says up
 front where its memory knob actually lives — `[wsl2] memory=` in `.wslconfig`
 on Windows, since Docker Desktop's own slider is disabled under the WSL2
 backend, and Docker Desktop > Settings > Resources on macOS.
 
-On native Linux neither engine has a memory knob: containers run as host
-processes, so nothing caps them below your RAM. What Docker needs there and
+On native Linux neither engine has a memory or CPU knob: containers run as
+host processes, so nothing caps them below your RAM or your cores. What Docker needs there and
 Podman does not is group membership — the install runs
 `sudo usermod -aG docker` for the invoking user (the account behind `sudo`, not
 `root`), and group changes only apply at login, so the
@@ -161,6 +162,31 @@ Windows DevBoxes need ~2 GiB more than their size.
 
 Budget one size up for DevBoxes that run a graphical session.
 
+#### CPU
+
+The worker advertises the container runtime's core count, not the machine's.
+Where the runtime is a VM those can differ — a Podman machine given a fraction
+of the host, Docker Desktop's Hyper-V backend, a `[wsl2] processors=` set once
+and forgotten — and the gap is invisible: nothing says half the machine is
+unreachable. `doctor` reports both numbers so it isn't:
+
+```
+  ✓ Runtime CPU: 8 of 8 host cores available to the runtime
+  ⚠ Runtime CPU: 7 of 14 host cores — DevBoxes cannot use the rest; ...
+```
+
+The recommendation is simply **all of them**, with no reserve held back for the
+host. This is the one place CPU does not mirror memory, and the reason is that
+cores behave differently: they are time-sliced, so an over-subscribed runtime
+runs its work more slowly and nothing is ever killed for it, while your own
+scheduler keeps the desktop responsive regardless. Under-reporting cores does
+have a cost — it is the number your worker is sized from.
+
+A default WSL2 install already grants every core, so on most Windows machines
+this check passes and there is nothing to change. It compares the two
+measurements rather than assuming which platforms are fine, so a machine that
+drifts is reported rather than excused.
+
 ### `clustercode config`
 
 Manage CLI configuration stored in `~/.clustercode/config.json`.
@@ -175,6 +201,7 @@ clustercode config list
 |---|---|
 | `WORKER_NAME` | Display name for this worker. |
 | `RUNTIME_MEMORY_MB` | Memory, in MiB (1024-based — `8192` is 8 GiB; the `MB` in the name is historical), to give the container runtime. Takes effect when a new container-runtime machine is created and whenever `clustercode onboard` runs. |
+| `RUNTIME_CPUS` | Logical cores to give the container runtime. Capped at the machine's own core count. Takes effect whenever `clustercode onboard` runs. |
 
 ### `clustercode status`
 
