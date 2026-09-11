@@ -66,8 +66,24 @@ describe('doctor', () => {
     assert.ok(names.includes('orchestrator'));
     assert.ok(names.includes('container-runtime'));
     assert.ok(names.includes('runtime-memory'));
+    assert.ok(names.includes('host-memory'));
     assert.ok(names.includes('disk'));
     assert.ok(names.includes('memory'));
+  });
+
+  // The host's own available memory is the continuous verification that the
+  // reserve the CLI subtracts when sizing the runtime is actually being
+  // honoured. It reports on every platform, and it never gates anything: a host
+  // under memory pressure is a machine still doing its job.
+  it('reports host-memory everywhere and never fails on it', () => {
+    const { stdout } = runCli('doctor', '--json');
+    const jsonStart = stdout.match(/^\s*\{/m);
+    assert.ok(jsonStart !== null);
+    const result = JSON.parse(stdout.slice(jsonStart.index!));
+    const hostMemory = result.checks.find((c: { name: string }) => c.name === 'host-memory');
+    assert.ok(hostMemory, `no host-memory check in ${JSON.stringify(result.checks)}`);
+    assert.ok(['pass', 'warn'].includes(hostMemory.status), hostMemory.status);
+    assert.match(hostMemory.detail, /^Host memory: /);
   });
 
   it('labels the disk and memory checks distinguishably', () => {

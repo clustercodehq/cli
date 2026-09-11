@@ -13,6 +13,8 @@ import {
 } from './config-store/index.js';
 import type { Credentials, WorkerConfig, AppConfig } from './config-store/index.js';
 import { MIN_RUNTIME_MEMORY_MIB, maxSafeRuntimeMib } from './runtime-memory.js';
+import type { ReclaimVerdict } from './host-reclaim.js';
+import type { WslReclaimMode } from './wslconfig.js';
 
 // Re-export reads and types so existing CLI imports keep working
 export {
@@ -31,6 +33,7 @@ export type { Credentials, WorkerConfig, AppConfig };
 const ALLOWED_CONFIG_KEYS: ReadonlySet<keyof AppConfig> = new Set([
   'WORKER_NAME',
   'RUNTIME_MEMORY_MB',
+  'RUNTIME_RECLAIM_VERIFIED',
 ]);
 
 export function isAllowedConfigKey(key: string): key is keyof AppConfig {
@@ -167,6 +170,52 @@ export function writeWorkerConfig(config: WorkerConfig): void {
 
 export function writeAppConfig(config: AppConfig): void {
   writeJson(getConfigPath(), config);
+}
+
+/**
+ * Record a runtime memory size the user actually chose.
+ *
+ * Without this, an applied `--memory` left no trace: the next `doctor` run had
+ * no way to tell a deliberate choice from an install default and re-litigated
+ * it every time, and a re-run of `onboard` had no stored value to offer back.
+ * Merges into the existing config rather than replacing it, so it cannot drop
+ * WORKER_NAME.
+ */
+export function rememberRuntimeMemory(memoryMib: number): void {
+  writeAppConfig({ ...readAppConfig(), RUNTIME_MEMORY_MB: String(memoryMib) });
+}
+
+/**
+ * Accept a hand-recorded reclaim verdict.
+ *
+ * Deliberately narrow: this is a record of a measurement, so anything other
+ * than the two outcomes a measurement can have is a typo, not a preference.
+ */
+export function validateReclaimVerified(value: string): string | null {
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed !== 'yes' && trimmed !== 'no') {
+    return 'Reclaim verification must be yes or no (or run clustercode onboard --verify-reclaim to measure it)';
+  }
+  return null;
+}
+
+/**
+ * Record a reclaim measurement together with the WSL build and reclaim mode it
+ * was taken against.
+ *
+ * The stamps are not decoration: the behaviour being measured is a property of
+ * the WSL build and of the mode, so a verdict that outlived either would keep
+ * sizing the runtime on a measurement of different software. Callers refuse to
+ * record rather than pass a placeholder. Merged in, so recording a verdict
+ * cannot drop the remembered memory size.
+ */
+export function rememberReclaimVerdict(verdict: ReclaimVerdict & { mode: WslReclaimMode }): void {
+  writeAppConfig({
+    ...readAppConfig(),
+    RUNTIME_RECLAIM_VERIFIED: verdict.result,
+    RUNTIME_RECLAIM_VERIFIED_WSL: verdict.wslVersion,
+    RUNTIME_RECLAIM_VERIFIED_MODE: verdict.mode,
+  });
 }
 
 export function getOrchestratorUrl(): string {
