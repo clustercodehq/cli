@@ -586,7 +586,7 @@ export function parseDockerBackend(kernelVersion: string | null): MachineProvide
   return 'unknown';
 }
 
-/** Ceiling on the Docker backend probe, which `doctor` runs on every invocation. */
+/** Ceiling on the backend probes, which `doctor` runs on every invocation. */
 const BACKEND_PROBE_TIMEOUT_MS = 5000;
 
 /** `podman machine list` works while the machine is stopped; `inspect` has no VMType field. */
@@ -599,7 +599,9 @@ export function detectMachineProvider(engineName: string): MachineProvider {
     return parseDockerBackend(execSilent('docker info --format "{{.KernelVersion}}"', BACKEND_PROBE_TIMEOUT_MS));
   }
   if (engineName !== 'podman') return 'unknown';
-  return parseMachineProvider(execSilent('podman machine list --format "{{.VMType}}"'));
+  // Bounded like the Docker probe above, and for the same reason: a wedged
+  // WSL service or machine must not hang `doctor`. Unanswered is 'unknown'.
+  return parseMachineProvider(execSilent('podman machine list --format "{{.VMType}}"', BACKEND_PROBE_TIMEOUT_MS));
 }
 
 /**
