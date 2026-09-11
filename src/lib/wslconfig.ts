@@ -73,6 +73,26 @@ export function versionAtLeast(version: readonly number[], floor: readonly numbe
   return true;
 }
 
+/**
+ * The first WSL release on which `dropcache` mode can be measured.
+ *
+ * Up to it, WSL's reclaim loop samples the guest every 30 seconds and drops the
+ * cache only after 20 idle samples in a row — about 10 idle minutes — and then
+ * only once until the guest is busy again. A run of this CLI's measurement
+ * cannot tell that from a mode that does nothing: the drop may simply not have
+ * come round yet, or may already have been spent on this idle period. WSL
+ * PR #41096 ("Improve WSL2 guest memory reclaim") replaced that loop with one
+ * that decides idleness over 2 minutes; its first tag is 2.9.5, but the first
+ * published release to carry it is 2.9.8, so builds in between are treated as
+ * the old loop. `gradual` is not affected: it needs 3 idle minutes on either.
+ */
+export const WSL_DROPCACHE_MEASURABLE_SINCE: readonly number[] = [2, 9, 8];
+
+/** Whether a measurement of `mode` on `version` can mean what it records. */
+export function reclaimMeasurable(mode: WslReclaimMode, version: readonly number[]): boolean {
+  return mode !== 'dropcache' || versionAtLeast(version, WSL_DROPCACHE_MEASURABLE_SINCE);
+}
+
 /** What WSL does about reclaim, as opposed to what `.wslconfig` says. */
 export type WslEffectiveReclaim = WslReclaimMode | 'off' | 'unknown';
 
@@ -407,6 +427,11 @@ export function parseWslVersion(raw: string | null): number[] | null {
   const match = raw?.match(/WSL.*?:\s*(\d+(?:\.\d+)+)/i);
   if (!match) return null;
   return match[1].split('.').map((part) => Number(part));
+}
+
+/** A verdict's version stamp (`'2.7.13.0'`) as the numbers it was formatted from. */
+export function versionFromStamp(stamp: string): number[] {
+  return stamp.split('.').map((part) => Number(part));
 }
 
 /** `autoMemoryReclaim` shipped in WSL 2.0.0; earlier builds ignore the key. */

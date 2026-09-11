@@ -188,6 +188,8 @@ function reclaimPhrase(reclaim: HostReclaimStatus): string | null {
       return 'is on but not keeping up';
     case 'configured':
       return 'is configured but unverified';
+    case 'unmeasurable':
+      return 'is configured but cannot be verified on this WSL version';
     case 'inert':
       return 'is on but inert on this build';
     case 'unsupported':

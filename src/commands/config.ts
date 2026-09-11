@@ -14,7 +14,7 @@ import {
   resetAllConfig,
 } from '../lib/config.js';
 import { currentReclaimMode, currentWslVersionStamp, type ReclaimVerdict } from '../lib/host-reclaim.js';
-import type { WslReclaimMode } from '../lib/wslconfig.js';
+import { reclaimMeasurable, versionFromStamp, type WslReclaimMode } from '../lib/wslconfig.js';
 
 export interface ManualVerdictDeps {
   platform: NodeJS.Platform;
@@ -68,6 +68,14 @@ export function recordManualReclaimVerdict(
     };
   }
   const result = value.trim().toLowerCase() as 'yes' | 'no';
+  // The same 'no' the measurement refuses to record, and `doctor` would not use.
+  if (result === 'no' && !reclaimMeasurable(mode, versionFromStamp(wslVersion))) {
+    return {
+      ok: false,
+      message:
+        'On this WSL version (older than 2.9.8), dropcache mode drops the cache only after about 10 idle minutes, and only once per idle period, so a "no" cannot be told apart from a drop that had not come round yet. Nothing was recorded.',
+    };
+  }
   deps.remember({ result, wslVersion, mode });
   return {
     ok: true,

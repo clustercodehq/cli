@@ -95,6 +95,13 @@ describe('evaluateHostMemory', () => {
     assert.match(r.detail, /reclaim is configured but unverified/);
   });
 
+  test('says reclaim cannot be verified where this WSL version cannot be measured', () => {
+    const r = evaluateHostMemory(
+      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'unmeasurable' }),
+    );
+    assert.match(r.detail, /reclaim is configured but cannot be verified on this WSL version/);
+  });
+
   test('says reclaim is inert when it was measured to do nothing on this build', () => {
     const r = evaluateHostMemory(
       reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'inert' }),

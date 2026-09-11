@@ -14,6 +14,9 @@ const WSL_1 = [1, 2, 5];
 /** Before 2.1.3, which made `dropCache` the default. */
 const WSL_PRE_DEFAULT = [2, 1, 2, 0];
 const WSL_2_0 = [2, 0, 9, 0];
+/** The first published WSL release whose dropcache reclaim this CLI can measure. */
+const WSL_2_9_8 = [2, 9, 8, 0];
+const DROPCACHE = '[experimental]\nautoMemoryReclaim=dropcache\n';
 const RECLAIM_ON = '[experimental]\nautoMemoryReclaim=gradual\n';
 const DISABLED = '[experimental]\nautoMemoryReclaim=disabled\n';
 
@@ -91,8 +94,7 @@ describe('resolveHostReclaim', () => {
   });
 
   test('dropcache is configured, not proven — it is the same kind of request', () => {
-    const text = '[experimental]\nautoMemoryReclaim=dropcache\n';
-    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, null), 'configured');
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2_9_8, null), 'configured');
   });
 
   test('is case-insensitive about the value', () => {
@@ -114,10 +116,14 @@ describe('resolveHostReclaim', () => {
   // `gradual` and `dropcache` are different mechanisms; a measurement of one
   // says nothing about the other.
   test('a verdict measured under a different mode re-opens the question', () => {
-    const dropcache = '[experimental]\nautoMemoryReclaim=dropcache\n';
-    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', dropcache, WSL_2, verdict()), 'configured');
+    const at = { wslVersion: '2.9.8.0' };
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2_9_8, verdict(at)), 'configured');
     assert.equal(
-      resolveHostReclaim('win32', 'podman', 'wsl', dropcache, WSL_2, verdict({ result: 'no' })),
+      resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2_9_8, verdict({ ...at, result: 'no' })),
+      'configured',
+    );
+    assert.equal(
+      resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_2_9_8, verdict({ ...at, mode: 'dropcache' })),
       'configured',
     );
   });
@@ -212,8 +218,9 @@ describe('resolveHostReclaim', () => {
     ];
 
     for (const [label, text] of noKey) {
-      test(`${label} is dropcache on 2.7.x: configured, not off`, () => {
-        assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, null), 'configured');
+      test(`${label} is dropcache on 2.7.x and 2.9.8: never off`, () => {
+        assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, null), 'unmeasurable');
+        assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2_9_8, null), 'configured');
       });
 
       // Before 2.1.3 reclaim was opt-in, so the absent key is off.
@@ -223,35 +230,100 @@ describe('resolveHostReclaim', () => {
       });
     }
 
+    // Docker, whose dropcache is 'configured' on every build, so the boundary is
+    // the only thing that moves the answer.
     test('the default begins exactly at 2.1.3, compared component by component', () => {
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 2, 0], null), 'off');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 3], null), 'configured');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 3, 0], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, [2, 1, 2, 0], null), 'off');
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, [2, 1, 3], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, [2, 1, 3, 0], null), 'configured');
       // 2.1.10 is later than 2.1.3, and 2.10 later than 2.1: numbers, not strings.
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 1, 10, 0], null), 'configured');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 0, 30, 0], null), 'off');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, [2, 5, 9, 0], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, [2, 1, 10, 0], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, [2, 0, 30, 0], null), 'off');
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, [2, 5, 9, 0], null), 'configured');
     });
 
     // The mode a verdict is stamped with is the effective one, so a default
     // install measured as dropcache is verified — and a gradual verdict is not
     // carried over to it.
     test('a dropcache verdict applies to a default install; a gradual one does not', () => {
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2, verdict({ mode: 'dropcache' })), 'verified');
+      const at = { wslVersion: '2.9.8.0' };
       assert.equal(
-        resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2, verdict({ mode: 'dropcache', result: 'no' })),
+        resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2_9_8, verdict({ ...at, mode: 'dropcache' })),
+        'verified',
+      );
+      assert.equal(
+        resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2_9_8, verdict({ ...at, mode: 'dropcache', result: 'no' })),
         'inert',
       );
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2, verdict({ mode: 'gradual' })), 'configured');
+      assert.equal(
+        resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2_9_8, verdict({ ...at, mode: 'gradual' })),
+        'configured',
+      );
     });
 
     // "If the value is dropCache or an unknown value, cached memory will be
     // reclaimed immediately" — a typo is not off.
     test('an unrecognised value is dropcache on 2.1.3+, and off before it', () => {
       const typo = '[experimental]\nautoMemoryReclaim=gradul\n';
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2, null), 'configured');
-      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2, verdict({ mode: 'dropcache' })), 'verified');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2_9_8, null), 'configured');
+      assert.equal(
+        resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_2_9_8, verdict({ wslVersion: '2.9.8.0', mode: 'dropcache' })),
+        'verified',
+      );
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', typo, WSL_2, null), 'configured');
       assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', typo, WSL_PRE_DEFAULT, null), 'off');
+    });
+  });
+
+  // Before 2.9.8 WSL drops the cache in dropcache mode only after about 10 idle
+  // minutes, once per idle period, so a measurement cannot tell "not yet" from
+  // "never", and a 'no' that earlier builds of this CLI recorded may be exactly that.
+  describe('dropcache before WSL 2.9.8', () => {
+    const stamp = (version: number[]) => ({ wslVersion: version.join('.'), mode: 'dropcache' as const });
+
+    test('is unmeasurable, not configured, up to the first release with the new reclaim loop', () => {
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, [2, 9, 7, 0], null), 'unmeasurable');
+      // Tag 2.9.5 carries the new loop but was never released: still refused.
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, [2, 9, 5, 0], null), 'unmeasurable');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, [2, 1, 3, 0], null), 'unmeasurable');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, [2, 9, 8], null), 'configured');
+      // 2.10 is later than 2.9: numbers, not strings.
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, [2, 10, 0, 0], null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, [3, 0, 0], null), 'configured');
+    });
+
+    test('a recorded no stamped dropcache on such a build is no longer trusted', () => {
+      const no = verdict({ ...stamp(WSL_2), result: 'no' });
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2, no), 'unmeasurable');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, WSL_2, no), 'unmeasurable');
+      // From 2.9.8 the same verdict is evidence again.
+      const noNew = verdict({ ...stamp(WSL_2_9_8), result: 'no' });
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2_9_8, noNew), 'inert');
+    });
+
+    // A drop that was seen to return memory is evidence whatever the loop.
+    test('a recorded yes stamped dropcache still verifies', () => {
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2, verdict(stamp(WSL_2))), 'verified');
+    });
+
+    test('a mismatched verdict stays unmeasurable', () => {
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2, verdict()), 'unmeasurable');
+      assert.equal(
+        resolveHostReclaim('win32', 'podman', 'wsl', DROPCACHE, WSL_2, verdict({ ...stamp(WSL_2), wslVersion: '2.7.12.0' })),
+        'unmeasurable',
+      );
+    });
+
+    test('gradual on the same build is unaffected', () => {
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_2, null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_2, verdict({ result: 'no' })), 'inert');
+    });
+
+    // Docker is never measured, and Podman on an unidentified backend may not
+    // be a WSL VM: both stay 'configured', as before.
+    test('only a Podman machine on WSL is told apart', () => {
+      assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', DROPCACHE, WSL_2, null), 'configured');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'unknown', DROPCACHE, WSL_2, null), 'configured');
     });
   });
 

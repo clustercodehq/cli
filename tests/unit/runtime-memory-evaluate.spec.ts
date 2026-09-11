@@ -435,6 +435,21 @@ describe('memory reclaim', () => {
     }
   });
 
+  // dropcache before WSL 2.9.8: the measurement would only refuse, so it is
+  // never offered, and the size is the only lever named.
+  test('unmeasurable is never offered --verify-reclaim', () => {
+    const above = wsl({ reclaim: 'unmeasurable', engine: { memTotalBytes: 25600 * MIB, cpus: 8 } });
+    assert.equal(above.status, 'warn');
+    assert.match(above.detail, /cannot be verified on this WSL version/);
+    assert.match(above.detail, /--memory 24576/);
+    assert.doesNotMatch(above.detail, /verify-reclaim/);
+
+    const within = wsl({ reclaim: 'unmeasurable', engine: { memTotalBytes: 16384 * MIB, cpus: 8 } });
+    assert.equal(within.status, 'pass');
+    assert.match(within.detail, /not verifiable on this WSL version/);
+    assert.doesNotMatch(within.detail, /verify-reclaim/);
+  });
+
   // Measured and doing nothing. No amount of configuration will change that, so
   // the only remaining lever is the size itself.
   test('inert above the ceiling says so and names the size to fall back to', () => {

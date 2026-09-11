@@ -364,4 +364,41 @@ describe('onboard memory step on Podman over WSL', () => {
     assert.match(stdout, /--verify-reclaim/);
     assert.match(stdout, /Already about that size/);
   });
+
+  // WSL's default dropcache on 2.7.13 cannot be measured, so the measurement is
+  // neither offered nor run — and a "no" an earlier build of this CLI recorded
+  // against it no longer reads as inert.
+  it('neither offers nor runs a measurement of dropcache before WSL 2.9.8', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+    const hostMib = Math.floor(totalmem() / 1024 / 1024);
+    const storedMib = hostMib - 6144;
+    seedConfigs();
+    writeFileSync(
+      join(tempHome, '.clustercode', 'config.json'),
+      JSON.stringify({
+        RUNTIME_MEMORY_MB: String(storedMib),
+        RUNTIME_RECLAIM_VERIFIED: 'no',
+        RUNTIME_RECLAIM_VERIFIED_WSL: '2.7.13.0',
+        RUNTIME_RECLAIM_VERIFIED_MODE: 'dropcache',
+      }),
+    );
+    createPodmanWslStubs(storedMib * 1024 * 1024, '2.7.13.0');
+    writeFileSync(join(tempHome, '.wslconfig'), ['[wsl2]', `memory=${storedMib}MB`, ''].join('\r\n'), 'utf-8');
+    if (skipUnlessStubbed()) return;
+
+    const offered = runOnboard([]);
+    assert.equal(offered.exitCode, 0, offered.stdout);
+    assert.match(offered.stdout, new RegExp(`${storedMib}MB is above the \\d+MB ceiling`));
+    assert.match(offered.stdout, /Lower the runtime with/);
+    assert.doesNotMatch(offered.stdout, /--verify-reclaim/);
+
+    const refused = runOnboard(['--verify-reclaim']);
+    assert.equal(refused.exitCode, 0, refused.stdout);
+    assert.match(refused.stdout, /Verifying memory reclaim/);
+    assert.match(refused.stdout, /once per idle period/);
+    assert.match(refused.stdout, /Nothing was measured or recorded/);
+    assert.doesNotMatch(refused.stdout, /Loading .* into the VM's cache/);
+    const config = JSON.parse(readFileSync(join(tempHome, '.clustercode', 'config.json'), 'utf-8'));
+    assert.equal(config.RUNTIME_RECLAIM_VERIFIED, 'no');
+    assert.equal(config.RUNTIME_RECLAIM_VERIFIED_WSL, '2.7.13.0');
+  });
 });

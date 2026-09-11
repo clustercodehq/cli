@@ -40,10 +40,17 @@ import {
 } from '../lib/host-reclaim.js';
 import {
   reclaimVerificationRefusal,
+  DROPCACHE_UNMEASURABLE_REFUSAL,
   verifyReclaim,
   type ReclaimVerdictResult,
 } from '../lib/reclaim-verify.js';
-import { WSL_RECLAIM_ENTRY, wslMemoryEntry, type WslReclaimMode } from '../lib/wslconfig.js';
+import {
+  WSL_RECLAIM_ENTRY,
+  reclaimMeasurable,
+  versionFromStamp,
+  wslMemoryEntry,
+  type WslReclaimMode,
+} from '../lib/wslconfig.js';
 import {
   readCredentials,
   readAppConfig,
@@ -1132,11 +1139,11 @@ function defaultReclaimVerificationDeps(): ReclaimVerificationDeps {
  *
  * Refuses up front whenever the answer could not mean what the stored verdict
  * claims: off Windows, for anything but Podman on the WSL backend, with reclaim
- * not switched on, after the memory step failed, or when the WSL build cannot
- * be read to stamp the result with. An inconclusive run records nothing, and
- * neither does one during which the WSL build or reclaim mode changed: the
- * point of the stored verdict is that it is evidence, and "we could not tell"
- * is not evidence of either answer.
+ * not switched on or in a mode this WSL build cannot have measured, after the
+ * memory step failed, or when the WSL build cannot be read to stamp the result
+ * with. An inconclusive run records nothing, and neither does one during which
+ * the WSL build or reclaim mode changed: the point of the stored verdict is that
+ * it is evidence, and "we could not tell" is not evidence of either answer.
  */
 export async function runReclaimVerification(
   opts: { memoryStepOk?: boolean } = {},
@@ -1169,6 +1176,9 @@ export async function runReclaimVerification(
   if (mode === null) {
     return refuse('Memory reclaim is off (or .wslconfig could not be read), so there is nothing to measure.');
   }
+  // The probe already refuses this; checked again against the values the
+  // verdict would be stamped with, in case the setting changed in between.
+  if (!reclaimMeasurable(mode, versionFromStamp(wslVersion))) return refuse(DROPCACHE_UNMEASURABLE_REFUSAL);
 
   const { result, detail } = await deps.measure((line) => log.info(line));
   if (result === 'inconclusive') {
@@ -1203,6 +1213,8 @@ export function runtimeCeilingNote(platform: NodeJS.Platform, reclaimStatus: Hos
       return 'This is a ceiling, not a reservation — memory is used while DevBoxes run and returned to Windows while the runtime is idle.';
     case 'configured':
       return 'Memory reclaim is configured but has not been verified on this machine — this number is sized as if it does not work; run `clustercode onboard --verify-reclaim` to check.';
+    case 'unmeasurable':
+      return 'Memory reclaim is in dropcache mode, which cannot be verified on this WSL version — this number is sized as if it does not work.';
     case 'inert':
       return 'Memory reclaim does not return memory on this Windows build, so treat this number as fully used.';
     case 'n/a':

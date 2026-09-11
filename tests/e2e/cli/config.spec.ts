@@ -176,6 +176,30 @@ describe('config', () => {
     },
   );
 
+  // Before WSL 2.9.8 dropcache drops only after about 10 idle minutes, once per
+  // idle period: a "no" cannot be told from a drop that had not come round yet.
+  it(
+    'refuses a no for dropcache on WSL older than 2.9.8',
+    { skip: process.platform !== 'win32' },
+    () => {
+      const stubDir = join(tempHome, 'stubs');
+      mkdirSync(stubDir, { recursive: true });
+      writeFileSync(join(stubDir, 'wsl.cmd'), [
+        '@echo off',
+        'echo %* | findstr /C:"--version" >nul 2>&1 && (echo WSL version: 2.7.13.0 & exit /b 0)',
+        'exit /b 1',
+      ].join('\r\n'));
+
+      const env = { PATH: `${stubDir};${process.env.PATH ?? ''}` };
+      const set = runCliWithEnv(env, 'config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'no');
+      assert.equal(set.exitCode, 1, set.stdout);
+      assert.match(set.stdout, /older than 2\.9\.8/);
+      assert.match(set.stdout, /Nothing was recorded/);
+      const { stdout } = runCli('config', 'list');
+      assert.doesNotMatch(stdout, /RUNTIME_RECLAIM_VERIFIED/);
+    },
+  );
+
   it('rejects a reclaim verdict that is not an outcome a measurement can have', () => {
     const { stdout, exitCode } = runCli('config', 'set', 'RUNTIME_RECLAIM_VERIFIED', 'maybe');
     assert.equal(exitCode, 1);

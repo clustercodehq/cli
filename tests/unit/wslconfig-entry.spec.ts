@@ -7,6 +7,8 @@ import {
   parseWslVersion,
   wslSupportsAutoMemoryReclaim,
   effectiveReclaimMode,
+  reclaimMeasurable,
+  versionFromStamp,
   wslMemoryEntry,
   WSL_RECLAIM_ENTRY,
 } from '../../src/lib/wslconfig.js';
@@ -341,5 +343,29 @@ describe('effectiveReclaimMode', () => {
     assert.equal(effectiveReclaimMode(null, null), 'unknown');
     assert.equal(effectiveReclaimMode('gradul', null), 'unknown');
     assert.equal(effectiveReclaimMode('gradual', null), 'gradual');
+  });
+});
+
+describe('reclaimMeasurable', () => {
+  // WSL PR #41096 replaced the 10-idle-minute, once-per-idle-period dropcache
+  // loop; 2.9.8 is the first published release with it.
+  test('dropcache is measurable from 2.9.8 on, compared component by component', () => {
+    assert.equal(reclaimMeasurable('dropcache', [2, 9, 7, 0]), false);
+    assert.equal(reclaimMeasurable('dropcache', [2, 9, 5, 0]), false);
+    assert.equal(reclaimMeasurable('dropcache', [2, 7, 13, 0]), false);
+    assert.equal(reclaimMeasurable('dropcache', [2, 9, 8]), true);
+    assert.equal(reclaimMeasurable('dropcache', [2, 9, 8, 0]), true);
+    assert.equal(reclaimMeasurable('dropcache', [2, 10, 0, 0]), true);
+    assert.equal(reclaimMeasurable('dropcache', [3, 0]), true);
+  });
+
+  test('gradual is measurable on any build that has it', () => {
+    assert.equal(reclaimMeasurable('gradual', [2, 0, 9, 0]), true);
+    assert.equal(reclaimMeasurable('gradual', [2, 7, 13, 0]), true);
+  });
+
+  test('a version stamp reads back as the numbers it was written from', () => {
+    assert.deepEqual(versionFromStamp('2.9.8.0'), [2, 9, 8, 0]);
+    assert.deepEqual(versionFromStamp('2.10.1'), [2, 10, 1]);
   });
 });

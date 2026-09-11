@@ -32,6 +32,7 @@ import {
   effectiveReclaimMode,
   parseWslVersion,
   readWslConfigEntry,
+  reclaimMeasurable,
   reclaimModeOf,
   wslSupportsAutoMemoryReclaim,
   WSL_RECLAIM_ENTRY,
@@ -44,6 +45,12 @@ export type HostReclaimStatus =
   | 'verified'
   /** Configured, never measured (or measured against something else). Sized as if it does not work. */
   | 'configured'
+  /**
+   * Configured in `dropcache` mode on a WSL build whose reclaim loop this CLI
+   * cannot measure (`WSL_DROPCACHE_MEASURABLE_SINCE`). Sized as if it does not
+   * work, like `'configured'`, but never offered a measurement.
+   */
+  | 'unmeasurable'
   /** Configured and measured NOT to return memory on this build. */
   | 'inert'
   /** Switched off: `disabled`, or no mode on a build whose default cannot be confirmed. */
@@ -102,9 +109,10 @@ export function readReclaimVerdict(config: AppConfig): ReclaimVerdict | null {
  *
  * Every path that is not an exact match — a different build, a different mode,
  * a stamp this CLI would not write, an engine or backend nobody measured —
- * resolves to `'configured'`. That asymmetry is deliberate: a false `'verified'`
- * sizes the runtime into memory the host needs, while a false `'configured'`
- * only costs a more conservative number.
+ * resolves to `'configured'` (or `'unmeasurable'`, which is sized the same).
+ * That asymmetry is deliberate: a false `'verified'` sizes the runtime into
+ * memory the host needs, while a false `'configured'` only costs a more
+ * conservative number.
  */
 export function resolveHostReclaim(
   platform: NodeJS.Platform,
@@ -139,15 +147,21 @@ export function resolveHostReclaim(
   // Podman machine on the WSL backend; Docker's VM is never measured, and a
   // backend that could not be identified may not be a WSL VM at all.
   if (engineName !== 'podman' || provider !== 'wsl') return 'configured';
-  if (verdict === null) return 'configured';
+  // `wslVersion` is non-null here: a null one returned 'unsupported' above.
+  const unverified: HostReclaimStatus = reclaimMeasurable(mode, wslVersion ?? []) ? 'configured' : 'unmeasurable';
+  if (verdict === null) return unverified;
   // A verdict measured against a different WSL, or under a different mode,
   // re-opens the question rather than settling it: this behaviour is a property
   // of the build and the mechanism, not of the host.
   if (!VERSION_STAMP.test(verdict.wslVersion) || verdict.wslVersion !== formatWslVersion(wslVersion)) {
-    return 'configured';
+    return unverified;
   }
-  if (verdict.mode !== mode) return 'configured';
-  return verdict.result === 'yes' ? 'verified' : 'inert';
+  if (verdict.mode !== mode) return unverified;
+  if (verdict.result === 'yes') return 'verified';
+  // A 'no' about dropcache on a build that drops only after 10 idle minutes,
+  // once per idle period, may only have missed the drop — earlier builds of
+  // this CLI recorded exactly that. It is not evidence, so it is not used.
+  return unverified === 'unmeasurable' ? 'unmeasurable' : 'inert';
 }
 
 /** Ceiling on the `wsl --version` probe, which `doctor` runs on every invocation. */

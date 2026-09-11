@@ -9,6 +9,7 @@ import {
 } from '../../src/commands/onboard.js';
 import { recordManualReclaimVerdict, type ManualVerdictDeps } from '../../src/commands/config.js';
 import type { ReclaimVerdict } from '../../src/lib/host-reclaim.js';
+import { DROPCACHE_UNMEASURABLE_REFUSAL } from '../../src/lib/reclaim-verify.js';
 
 /**
  * Recording a verdict is the one step that can unlock the smaller host reserve,
@@ -88,6 +89,7 @@ describe('runReclaimVerification', () => {
   const refusals: [string, ReturnType<ReclaimVerificationDeps['probe']>][] = [
     ['reclaim off', { engineName: 'podman', provider: 'wsl', status: 'off' }],
     ['WSL too old', { engineName: 'podman', provider: 'wsl', status: 'unsupported' }],
+    ['dropcache before WSL 2.9.8', { engineName: 'podman', provider: 'wsl', status: 'unmeasurable' }],
     ['Docker', { engineName: 'docker', provider: 'wsl', status: 'configured' }],
     ['Hyper-V', { engineName: 'podman', provider: 'hyperv', status: 'n/a' }],
     ['unknown backend', { engineName: 'podman', provider: 'unknown', status: 'configured' }],
@@ -129,6 +131,32 @@ describe('runReclaimVerification', () => {
     const switched = recorder({ reclaimMode: () => (modeCalls++ === 0 ? 'gradual' : 'dropcache') });
     assert.equal(await runReclaimVerification({}, switched.deps), 'inconclusive');
     assert.deepEqual(switched.remembered, []);
+  });
+
+  // The status says so up front; this is the same answer from the values the
+  // verdict would be stamped with.
+  test('dropcache on a WSL build older than 2.9.8 refuses before measuring, and says why', async () => {
+    for (const version of ['2.7.13.0', '2.9.7.0']) {
+      const r = recorder({ wslVersionStamp: () => version, reclaimMode: () => 'dropcache' });
+      assert.equal(await runReclaimVerification({}, r.deps), 'refused', version);
+      assert.equal(r.measured, 0);
+      assert.deepEqual(r.remembered, []);
+      assert.ok(r.lines.includes(DROPCACHE_UNMEASURABLE_REFUSAL), r.lines.join('\n'));
+    }
+  });
+
+  test('dropcache from WSL 2.9.8 on is measured and recorded', async () => {
+    for (const version of ['2.9.8.0', '2.10.0.0']) {
+      const r = recorder({ wslVersionStamp: () => version, reclaimMode: () => 'dropcache' }, { result: 'no', detail: 'inert' });
+      assert.equal(await runReclaimVerification({}, r.deps), 'no', version);
+      assert.deepEqual(r.remembered, [{ result: 'no', wslVersion: version, mode: 'dropcache' }]);
+    }
+  });
+
+  test('gradual on an older WSL build is still measured', async () => {
+    const r = recorder({ wslVersionStamp: () => '2.7.13.0', reclaimMode: () => 'gradual' });
+    assert.equal(await runReclaimVerification({}, r.deps), 'yes');
+    assert.equal(r.measured, 1);
   });
 
   test('no reclaim mode in .wslconfig refuses', async () => {
@@ -192,6 +220,27 @@ describe('recordManualReclaimVerdict', () => {
     assert.deepEqual(d.remembered, []);
   });
 
+  // The 'no' the measurement refuses to record, and the probe would not trust.
+  test('a no for dropcache on WSL older than 2.9.8 is refused', () => {
+    const d = deps({ reclaimMode: () => 'dropcache' });
+    const outcome = recordManualReclaimVerdict('no', d);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.message, /older than 2\.9\.8/);
+    assert.match(outcome.message, /Nothing was recorded/);
+    assert.deepEqual(d.remembered, []);
+  });
+
+  test('a yes for dropcache on an older WSL, and a no from 2.9.8 on, are recorded', () => {
+    const yes = deps({ reclaimMode: () => 'dropcache' });
+    assert.equal(recordManualReclaimVerdict('yes', yes).ok, true);
+    assert.deepEqual(yes.remembered, [{ result: 'yes', wslVersion: '2.7.13.0', mode: 'dropcache' }]);
+
+    const no = deps({ reclaimMode: () => 'dropcache', wslVersionStamp: () => '2.9.8.0' });
+    const outcome = recordManualReclaimVerdict('no', no);
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.message, 'Set RUNTIME_RECLAIM_VERIFIED = no (WSL 2.9.8.0, reclaim mode dropcache)');
+  });
+
   test('reclaim not configured refuses — there is nothing for the verdict to describe', () => {
     const d = deps({ reclaimMode: () => null });
     const outcome = recordManualReclaimVerdict('yes', d);
@@ -209,7 +258,7 @@ describe('storedSizeAboveNoReclaimCeiling', () => {
   // A size chosen while reclaim was verified outlives the verdict that justified
   // it: a WSL update re-opens the question, but the stored number stays.
   test('names the ceiling when a stored size is above it and reclaim is not verified', () => {
-    for (const status of ['configured', 'inert', 'off', 'unsupported'] as const) {
+    for (const status of ['configured', 'unmeasurable', 'inert', 'off', 'unsupported'] as const) {
       assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status }), 24576, status);
     }
   });
@@ -240,7 +289,7 @@ describe('reclaimNeedsTurningOn', () => {
   // A default install on WSL 2.1.3+ resolves to 'configured' (dropcache in
   // effect), as does an explicit mode: neither is offered a rewrite.
   test('not offered where a mode is already in effect, or cannot be', () => {
-    for (const status of ['configured', 'verified', 'inert', 'unsupported', 'n/a'] as const) {
+    for (const status of ['configured', 'unmeasurable', 'verified', 'inert', 'unsupported', 'n/a'] as const) {
       assert.equal(reclaimNeedsTurningOn({ ...base, status }), false, status);
     }
   });
@@ -273,6 +322,14 @@ describe('runtimeCeilingNote', () => {
     assert.match(runtimeCeilingNote('win32', 'configured') ?? '', /--verify-reclaim/);
     assert.match(runtimeCeilingNote('win32', 'verified') ?? '', /returned to Windows/);
     assert.match(runtimeCeilingNote('win32', 'inert') ?? '', /does not return memory/);
+  });
+
+  // The measurement would only refuse, so the note must not send anyone to it.
+  test('unmeasurable says it cannot be verified, and does not offer the measurement', () => {
+    const note = runtimeCeilingNote('win32', 'unmeasurable') ?? '';
+    assert.match(note, /cannot be verified on this WSL version/);
+    assert.match(note, /sized as if it does not work/);
+    assert.doesNotMatch(note, /verify-reclaim/);
   });
 
   test('macOS has its own note, and Linux none', () => {

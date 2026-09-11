@@ -450,6 +450,18 @@ function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): { text
     };
   }
 
+  // dropcache on a WSL build whose reclaim loop cannot be measured: never
+  // verified, so sized as if it does not work, and never sent to a measurement
+  // that would only refuse.
+  if (reclaim === 'unmeasurable') {
+    return oversized
+      ? {
+          warn: true,
+          text: ` — memory reclaim is configured but cannot be verified on this WSL version, so size as if it does not work; ${lower}`,
+        }
+      : { warn: false, text: ' (memory reclaim configured but not verifiable on this WSL version)' };
+  }
+
   // Measured, and it does nothing here. No amount of configuration will change
   // that, so the only remaining lever is the size itself.
   if (reclaim === 'inert') {

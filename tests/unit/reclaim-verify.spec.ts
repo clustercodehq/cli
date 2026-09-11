@@ -370,6 +370,16 @@ describe('reclaimVerificationRefusal', () => {
     assert.match(reclaimVerificationRefusal({ ...ok, status: 'unsupported' }) ?? '', /WSL 2\.0/);
   });
 
+  // No advice to switch modes: that would measure a setting the user did not choose.
+  test('refuses dropcache on a WSL build whose reclaim loop cannot be measured', () => {
+    const refusal = reclaimVerificationRefusal({ ...ok, status: 'unmeasurable' }) ?? '';
+    assert.match(refusal, /about 10 idle minutes/);
+    assert.match(refusal, /once per idle period/);
+    assert.match(refusal, /Nothing was measured or recorded/);
+    assert.match(refusal, /sized as if reclaim does not work/);
+    assert.doesNotMatch(refusal, /gradual|clustercode onboard/);
+  });
+
   test('n/a is refused', () => {
     assert.notEqual(reclaimVerificationRefusal({ ...ok, status: 'n/a' }), null);
   });

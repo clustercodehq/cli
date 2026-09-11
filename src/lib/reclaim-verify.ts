@@ -300,6 +300,16 @@ export function planFill(
 }
 
 /**
+ * Why `dropcache` is not measured before WSL 2.9.8 (`WSL_DROPCACHE_MEASURABLE_SINCE`).
+ * Deliberately no advice to switch modes: that is the user's setting, and
+ * rewriting it to make it measurable would measure something else.
+ */
+export const DROPCACHE_UNMEASURABLE_REFUSAL =
+  'Memory reclaim is in dropcache mode, and on this WSL version (older than 2.9.8) WSL drops the cache only after ' +
+  'about 10 idle minutes, and only once per idle period, so this CLI cannot measure it reliably. Nothing was ' +
+  'measured or recorded, and the runtime stays sized as if reclaim does not work.';
+
+/**
  * Who may be measured at all.
  *
  * The procedure watches a Podman machine on the WSL backend, so that is the
@@ -327,6 +337,8 @@ export function reclaimVerificationRefusal(ctx: {
     case 'inert':
     case 'verified':
       return null;
+    case 'unmeasurable':
+      return DROPCACHE_UNMEASURABLE_REFUSAL;
     case 'off':
       return 'Memory reclaim is off, so there is nothing to measure. Run `clustercode onboard` to turn it on first.';
     case 'unsupported':
