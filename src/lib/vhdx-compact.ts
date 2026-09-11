@@ -3,7 +3,7 @@ import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 import { decodeConsoleOutput, POWERSHELL_PROBE_TIMEOUT_MS } from './checks.js';
-import { ENGINE_QUERY_TIMEOUT_MS, parseContainerNames } from './engine-containers.js';
+import { ENGINE_QUERY_TIMEOUT_MS, machineRunningContainers, type ContainerCheck } from './engine-containers.js';
 import { runProcess, type ProcessResult } from './run-process.js';
 import {
   driveLetterOf,
@@ -400,7 +400,11 @@ export function handleTimeoutMessage(info: {
  * (`PROBE_TIMEOUT_MS`) around the reads.
  */
 export interface CompactRunner {
-  runningContainers(): Promise<string[] | null>;
+  /**
+   * What is running inside `machine` itself, rootless and rootful — not whatever
+   * connection `podman ps` on the host would ask.
+   */
+  runningContainers(machine: string): Promise<ContainerCheck>;
   /** Read-only; runs before anything is stopped. */
   resolveDiskpartPath(vhdxPath: string): Promise<DiskpartPath>;
   fstrim(machine: string): Promise<{ ok: boolean; output: string }>;
@@ -456,7 +460,11 @@ export interface SizeSnapshot {
 
 export type CompactOutcome =
   /** `afterTrim`: the check right before stopping refused, after the trim ran. Nothing was stopped either way. */
-  | { kind: 'blocked'; running: string[] | null; afterTrim: boolean }
+  | ({ kind: 'blocked'; afterTrim: boolean } & (
+      | { running: string[] }
+      /** Could not confirm that nothing is running. */
+      | { running: null; reason: Extract<ContainerCheck, { ok: false }>['reason'] }
+    ))
   /** diskpart could not be given a path it reads correctly. Nothing was stopped. */
   | { kind: 'path-refused'; reason: Extract<DiskpartPath, { ok: false }>['reason'] }
   | {
@@ -473,6 +481,21 @@ export type CompactOutcome =
   | { kind: 'handle-timeout'; message: string; restarted: boolean }
   | { kind: 'failed'; exitCode: number | null; logTail: string; restarted: boolean };
 
+/** The block to report, or `null` when it is confirmed that nothing is running. Fails closed. */
+async function checkRunning(
+  runner: CompactRunner,
+  machine: string,
+  probeMs: number,
+  afterTrim: boolean,
+): Promise<Extract<CompactOutcome, { kind: 'blocked' }> | null> {
+  const check = await settleWithin<ContainerCheck, ContainerCheck>(() => runner.runningContainers(machine), probeMs, {
+    ok: false,
+    reason: 'no-answer',
+  });
+  if (!check.ok) return { kind: 'blocked', running: null, reason: check.reason, afterTrim };
+  return check.running.length > 0 ? { kind: 'blocked', running: check.running, afterTrim } : null;
+}
+
 export async function compactVhdx(
   target: PodmanVhdx,
   runner: CompactRunner,
@@ -483,8 +506,8 @@ export async function compactVhdx(
 
   // Checked again here, not only before consent: time passes at a prompt, and
   // stopping the machine under a live DevBox is not acceptable.
-  const running = await settleWithin(() => runner.runningContainers(), probeMs, null);
-  if (running === null || running.length > 0) return { kind: 'blocked', running, afterTrim: false };
+  const running = await checkRunning(runner, target.machine, probeMs, false);
+  if (running) return running;
 
   // Before anything changes: a path diskpart would misread means nothing to compact.
   const diskpartPath = await settleWithin(() => runner.resolveDiskpartPath(target.vhdxPath), probeMs, {
@@ -513,10 +536,8 @@ export async function compactVhdx(
 
   // And once more right before stopping: the trim can take minutes, and a
   // DevBox started meanwhile would be stopped with the machine.
-  const stillRunning = await settleWithin(() => runner.runningContainers(), probeMs, null);
-  if (stillRunning === null || stillRunning.length > 0) {
-    return { kind: 'blocked', running: stillRunning, afterTrim: true };
-  }
+  const stillRunning = await checkRunning(runner, target.machine, probeMs, true);
+  if (stillRunning) return stillRunning;
 
   let result: Exclude<CompactOutcome, { kind: 'blocked' | 'path-refused' }>['kind'];
   let elevation: ElevationResult | null = null;
@@ -625,20 +646,32 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
     const neverStopped = outcome.afterTrim
       ? ['Free space was trimmed, but the machine was never stopped, so nothing needs restarting.']
       : [];
+    const m = target.machine;
+    const rerun = 'then re-run `clustercode machine compact`.';
     if (outcome.running === null) {
-      return refused([
-        'Could not ask Podman which containers are running, so nothing was stopped. ' +
-          `Make sure the machine is running (podman machine start ${target.machine}), then re-run \`clustercode machine compact\`.`,
-        ...neverStopped,
-      ]);
+      const unconfirmed = 'Could not confirm that no containers are running: ';
+      const why = {
+        'no-answer':
+          `the Podman machine ${m} did not answer, so nothing was stopped. ` +
+          `Make sure it is running (podman machine start ${m}), ${rerun}`,
+        'rootless-failed':
+          `\`podman ps\` failed inside the Podman machine ${m}, so nothing was stopped. ` +
+          `Check that \`podman machine ssh ${m} podman ps\` works, ${rerun}`,
+        'rootful-failed':
+          `listing root's containers with \`sudo -n podman ps\` failed inside the Podman machine ${m} ` +
+          '(sudo must work there without a password), so nothing was stopped. ' +
+          `Check that \`podman machine ssh ${m} sudo -n podman ps\` works, ${rerun}`,
+      }[outcome.reason];
+      return refused([unconfirmed + why, ...neverStopped]);
     }
     const shown = outcome.running.slice(0, MAX_NAMED_CONTAINERS).join(', ');
     const more = outcome.running.length - MAX_NAMED_CONTAINERS;
     const names = more > 0 ? `${shown} and ${more} more` : shown;
-    const head = outcome.afterTrim ? 'Containers started while free space was being trimmed' : 'Containers are running';
+    const head = outcome.afterTrim
+      ? `Containers started in the Podman machine ${m} while free space was being trimmed`
+      : `Containers are running in the Podman machine ${m}`;
     return refused([
-      `${head}: ${names}. Compacting stops the machine, which would stop them too. ` +
-        'Stop them, then re-run `clustercode machine compact`.',
+      `${head}: ${names}. Compacting stops the machine, which would stop them too. ` + `Stop them, ${rerun}`,
       ...neverStopped,
     ]);
   }
@@ -852,10 +885,7 @@ export function defaultCompactRunner(): CompactRunner {
     throw new Error('Compacting the machine disk is only supported on Windows');
   }
   return {
-    runningContainers: async () => {
-      const r = await runProcess('podman', ['ps', '--format', '{{.Names}}'], ENGINE_QUERY_TIMEOUT_MS);
-      return r.code === 0 ? parseContainerNames(r.stdout) : null;
-    },
+    runningContainers: (machine) => machineRunningContainers(machine),
     fstrim: async (machine) => {
       const r = await runProcess('podman', machineSshArgs(machine, FSTRIM_SCRIPT), 15 * 60_000);
       return { ok: r.code === 0, output: r.output.trim() };

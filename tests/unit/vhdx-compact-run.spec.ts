@@ -9,14 +9,21 @@ import {
   type DiskpartPath,
   type ElevationResult,
 } from '../../src/lib/vhdx-compact.js';
+import { machineRunningContainers, type ContainerCheck } from '../../src/lib/engine-containers.js';
 
 const GB = 1024 * 1024 * 1024;
 const TARGET = { machine: 'dev', distro: 'podman-dev', vhdxPath: 'D:\\wsl\\dev\\ext4.vhdx', running: true };
 
 interface FakeOptions {
-  running?: string[] | null;
+  /** `null`: the machine did not answer. */
+  running?: string[] | null | ContainerCheck;
   /** What the check right before stopping sees; defaults to `running`. */
-  runningAfterTrim?: string[] | null;
+  runningAfterTrim?: string[] | null | ContainerCheck;
+  /**
+   * The raw answers from inside the machine, one per check, read by the real
+   * interpreter. Overrides `running` and `runningAfterTrim`.
+   */
+  inMachine?: string[];
   fstrimOk?: boolean;
   releasedAfterProbes?: number;
   elevation?: ElevationResult;
@@ -43,12 +50,17 @@ function fakeRunner(opts: FakeOptions = {}) {
   let compacted = false;
   let runningChecks = 0;
   const runner: CompactRunner = {
-    runningContainers: async () => {
-      calls.push('runningContainers');
+    runningContainers: async (machine) => {
+      calls.push(`runningContainers ${machine}`);
       runningChecks++;
+      if (opts.inMachine) {
+        const stdout = opts.inMachine[Math.min(runningChecks, opts.inMachine.length) - 1];
+        return machineRunningContainers(machine, async () => ({ code: 0, stdout, output: stdout, timedOut: false }));
+      }
       const first = opts.running === undefined ? [] : opts.running;
-      if (runningChecks === 1) return first;
-      return opts.runningAfterTrim === undefined ? first : opts.runningAfterTrim;
+      const answer = runningChecks === 1 || opts.runningAfterTrim === undefined ? first : opts.runningAfterTrim;
+      if (answer === null) return { ok: false, reason: 'no-answer' };
+      return Array.isArray(answer) ? { ok: true, running: answer } : answer;
     },
     resolveDiskpartPath: async (path) => {
       calls.push(`resolveDiskpartPath ${path}`);
@@ -104,14 +116,14 @@ describe('compactVhdx', () => {
     const { runner, calls } = fakeRunner({ running: ['devbox-1'] });
     const outcome = await compactVhdx(TARGET, runner, quiet);
     assert.deepEqual(outcome, { kind: 'blocked', running: ['devbox-1'], afterTrim: false });
-    assert.deepEqual(calls, ['runningContainers']);
+    assert.deepEqual(calls, ['runningContainers dev']);
   });
 
   it('refuses when the engine cannot say what is running', async () => {
     const { runner, calls } = fakeRunner({ running: null });
     const outcome = await compactVhdx(TARGET, runner, quiet);
-    assert.deepEqual(outcome, { kind: 'blocked', running: null, afterTrim: false });
-    assert.deepEqual(calls, ['runningContainers']);
+    assert.deepEqual(outcome, { kind: 'blocked', running: null, reason: 'no-answer', afterTrim: false });
+    assert.deepEqual(calls, ['runningContainers dev']);
   });
 
   it('checks again right before stopping, and never stops for a container that started during the trim', async () => {
@@ -119,24 +131,82 @@ describe('compactVhdx', () => {
     const outcome = await compactVhdx(TARGET, runner, quiet);
     assert.deepEqual(outcome, { kind: 'blocked', running: ['late-devbox'], afterTrim: true });
     // Never stopped, so there is nothing to start again.
-    assert.deepEqual(calls, ['runningContainers', `resolveDiskpartPath ${TARGET.vhdxPath}`, 'fstrim dev', 'runningContainers']);
+    assert.deepEqual(calls, ['runningContainers dev', `resolveDiskpartPath ${TARGET.vhdxPath}`, 'fstrim dev', 'runningContainers dev']);
   });
 
   it('never stops when the engine stops answering during the trim', async () => {
     const { runner, calls } = fakeRunner({ running: [], runningAfterTrim: null });
     const outcome = await compactVhdx(TARGET, runner, quiet);
-    assert.deepEqual(outcome, { kind: 'blocked', running: null, afterTrim: true });
+    assert.deepEqual(outcome, { kind: 'blocked', running: null, reason: 'no-answer', afterTrim: true });
     assert.ok(!calls.some((c) => c.startsWith('machineStop') || c.startsWith('machineStart')));
+  });
+
+  describe('asks inside the machine being compacted, rootless and rootful', () => {
+    const answer = (rootless: string, rootful: string, rootfulExit = 0): string =>
+      [
+        'clustercode-containers:rootless',
+        rootless,
+        'clustercode-containers:exit=0',
+        'clustercode-containers:rootful',
+        rootful,
+        `clustercode-containers:exit=${rootfulExit}`,
+        '',
+      ].join('\n');
+    const EMPTY = answer('', '');
+    const stoppedOrStarted = (calls: string[]) => calls.some((c) => c.startsWith('machineStop') || c.startsWith('machineStart'));
+
+    it('refuses when a rootless container is running', async () => {
+      const { runner, calls } = fakeRunner({ inMachine: [answer('3f2a1b4c5d6e', '')] });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.deepEqual(outcome, { kind: 'blocked', running: ['3f2a1b4c5d6e'], afterTrim: false });
+      assert.deepEqual(calls, ['runningContainers dev']);
+    });
+
+    it('refuses when only a rootful container is running', async () => {
+      const { runner, calls } = fakeRunner({ inMachine: [answer('', '9a8b7c6d5e4f')] });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.deepEqual(outcome, { kind: 'blocked', running: ['9a8b7c6d5e4f (rootful)'], afterTrim: false });
+      assert.deepEqual(calls, ['runningContainers dev']);
+    });
+
+    it('refuses when sudo fails, since rootful containers cannot be ruled out', async () => {
+      const { runner, calls } = fakeRunner({ inMachine: [answer('', '', 1)] });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.deepEqual(outcome, { kind: 'blocked', running: null, reason: 'rootful-failed', afterTrim: false });
+      assert.deepEqual(calls, ['runningContainers dev']);
+    });
+
+    it('proceeds when both lists are empty', async () => {
+      const { runner, calls } = fakeRunner({ inMachine: [EMPTY] });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.equal(outcome.kind, 'compacted');
+      assert.ok(calls.includes('machineStop dev'));
+    });
+
+    it('uses the same check after the trim: a rootful container started meanwhile blocks', async () => {
+      const { runner, calls } = fakeRunner({ inMachine: [EMPTY, answer('', 'late')] });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.deepEqual(outcome, { kind: 'blocked', running: ['late (rootful)'], afterTrim: true });
+      assert.deepEqual(calls, ['runningContainers dev', `resolveDiskpartPath ${TARGET.vhdxPath}`, 'fstrim dev', 'runningContainers dev']);
+      assert.ok(!stoppedOrStarted(calls));
+    });
+
+    it('uses the same check after the trim: sudo failing then blocks too', async () => {
+      const { runner, calls } = fakeRunner({ inMachine: [EMPTY, answer('', '', 1)] });
+      const outcome = await compactVhdx(TARGET, runner, quiet);
+      assert.deepEqual(outcome, { kind: 'blocked', running: null, reason: 'rootful-failed', afterTrim: true });
+      assert.ok(!stoppedOrStarted(calls));
+    });
   });
 
   it('runs fstrim, stop, terminate, wait, elevate, start — in that order', async () => {
     const { runner, calls } = fakeRunner({ releasedAfterProbes: 2 });
     const outcome = await compactVhdx(TARGET, runner, quiet, { timeoutMs: 180_000, intervalMs: 2_000 });
     assert.deepEqual(calls, [
-      'runningContainers',
+      'runningContainers dev',
       `resolveDiskpartPath ${TARGET.vhdxPath}`,
       'fstrim dev',
-      'runningContainers',
+      'runningContainers dev',
       'machineStop dev',
       'wslTerminate podman-dev',
       `probe ${TARGET.vhdxPath}`,
@@ -168,7 +238,7 @@ describe('compactVhdx', () => {
       const { runner, calls } = fakeRunner({ diskpartPath: { ok: false, reason } });
       const outcome = await compactVhdx(TARGET, runner, quiet);
       assert.deepEqual(outcome, { kind: 'path-refused', reason });
-      assert.deepEqual(calls, ['runningContainers', `resolveDiskpartPath ${TARGET.vhdxPath}`]);
+      assert.deepEqual(calls, ['runningContainers dev', `resolveDiskpartPath ${TARGET.vhdxPath}`]);
     }
   });
 
@@ -381,9 +451,34 @@ describe('describeCompactOutcome', () => {
   });
 
   it('explains a block when the engine could not be asked', () => {
-    const d = describeCompactOutcome({ kind: 'blocked', running: null, afterTrim: false }, target);
-    assert.match(d.lines[0], /Could not ask Podman/);
+    const d = describeCompactOutcome({ kind: 'blocked', running: null, reason: 'no-answer', afterTrim: false }, target);
+    assert.deepEqual(d.lines, [
+      'Could not confirm that no containers are running: the Podman machine dev did not answer, so nothing was stopped. ' +
+        'Make sure it is running (podman machine start dev), then re-run `clustercode machine compact`.',
+    ]);
     assert.equal(d.outro, 'Nothing was changed.');
+  });
+
+  it('explains a block when a podman ps inside the machine failed', () => {
+    const rootless = describeCompactOutcome({ kind: 'blocked', running: null, reason: 'rootless-failed', afterTrim: false }, target);
+    assert.deepEqual(rootless.lines, [
+      'Could not confirm that no containers are running: `podman ps` failed inside the Podman machine dev, so nothing was stopped. ' +
+        'Check that `podman machine ssh dev podman ps` works, then re-run `clustercode machine compact`.',
+    ]);
+    const rootful = describeCompactOutcome({ kind: 'blocked', running: null, reason: 'rootful-failed', afterTrim: false }, target);
+    assert.deepEqual(rootful.lines, [
+      "Could not confirm that no containers are running: listing root's containers with `sudo -n podman ps` failed inside the Podman machine dev " +
+        '(sudo must work there without a password), so nothing was stopped. ' +
+        'Check that `podman machine ssh dev sudo -n podman ps` works, then re-run `clustercode machine compact`.',
+    ]);
+  });
+
+  it('names the machine the containers are running in', () => {
+    const d = describeCompactOutcome({ kind: 'blocked', running: ['abc', 'def (rootful)'], afterTrim: false }, target);
+    assert.deepEqual(d.lines, [
+      'Containers are running in the Podman machine dev: abc, def (rootful). Compacting stops the machine, which would stop them too. ' +
+        'Stop them, then re-run `clustercode machine compact`.',
+    ]);
   });
 
   it('says the machine was never stopped when the block came after the trim', () => {
@@ -394,8 +489,8 @@ describe('describeCompactOutcome', () => {
     assert.match(late.lines.join('\n'), /nothing needs restarting/i);
     assert.doesNotMatch(late.lines.join('\n'), /started again/);
 
-    const silent = describeCompactOutcome({ kind: 'blocked', running: null, afterTrim: true }, target);
-    assert.match(silent.lines.join('\n'), /Could not ask Podman/);
+    const silent = describeCompactOutcome({ kind: 'blocked', running: null, reason: 'rootful-failed', afterTrim: true }, target);
+    assert.match(silent.lines.join('\n'), /Could not confirm that no containers are running/);
     assert.match(silent.lines.join('\n'), /never stopped/);
   });
 

@@ -235,9 +235,13 @@ error messages are only recognised in English: on a Windows display language
 other than English, check that output to tell a failed compact from a disk that
 was already compact.
 
-It refuses to run while any container is running, or when it cannot ask Podman
-what is running; it checks again right before stopping the machine, after the
-trim. Stopped containers also hold space inside the machine, which compacting
+It refuses to run while any container is running in that machine, or when it
+cannot confirm that none is. It asks inside the machine itself, both as the
+machine's user (`podman ps`) and as root (`sudo -n podman ps`), rather than
+through the active Podman connection, which may point at another machine or
+miss rootful containers; if either list fails, including when `sudo` would ask
+for a password, it refuses before stopping anything. It checks again right
+before stopping the machine, after the trim. Stopped containers also hold space inside the machine, which compacting
 does not return; stopped DevBoxes can be cleaned up in the console.
 
 `diskpart` reads the disk's path in the system's OEM code page. If the path has

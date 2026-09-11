@@ -4,7 +4,7 @@ import pc from 'picocolors';
 import { augmentPathWithKnownEngineDirs } from '../lib/env-path.js';
 import { confirmPlan } from '../lib/consent.js';
 import { withInterruptNotice } from '../lib/interrupt.js';
-import { runningContainers, stoppedContainerCount } from '../lib/engine-containers.js';
+import { machineRunningContainers, stoppedContainersInMachine } from '../lib/engine-containers.js';
 import { releaseStdin, restoreRawMode } from '../lib/tty.js';
 import {
   describeMachineChoice,
@@ -78,15 +78,20 @@ async function runCompact(options: { yes?: boolean }): Promise<number> {
         describeMeasuredReading({ ...reading, machine: undefined, guestUsedBytes: reading.guestUsedBytes }),
   );
 
-  const running = runningContainers('podman');
-  if (running === null || running.length > 0) {
-    const { lines } = describeCompactOutcome({ kind: 'blocked', running, afterTrim: false }, target);
+  // Asked inside the machine itself, as its user and as root: the host's active
+  // connection may be another machine, and never sees rootful containers.
+  const check = await machineRunningContainers(target.machine);
+  if (!check.ok || check.running.length > 0) {
+    const blocked = check.ok
+      ? ({ kind: 'blocked', running: check.running, afterTrim: false } as const)
+      : ({ kind: 'blocked', running: null, reason: check.reason, afterTrim: false } as const);
+    const { lines } = describeCompactOutcome(blocked, target);
     clack.log.error(lines.join('\n'));
     clack.outro('Nothing was changed.');
     return 1;
   }
 
-  const stopped = stoppedContainerCount('podman');
+  const stopped = stoppedContainersInMachine(target.machine);
   if (stopped) {
     clack.log.info(
       `${stopped} stopped ${stopped === 1 ? 'container also holds' : 'containers also hold'} space inside the machine, ` +

@@ -5,7 +5,7 @@ import { POWERSHELL_PROBE_TIMEOUT_MS, windowsDriveFreeBytes } from './checks.js'
 import {
   defaultExecFile,
   ENGINE_QUERY_TIMEOUT_MS,
-  stoppedContainerCount,
+  stoppedContainersInMachine,
   type ExecFileFn,
 } from './engine-containers.js';
 
@@ -331,7 +331,7 @@ export function checkVhdxBloat(runtime: CheckResult): CheckResult | null {
   const result = evaluateVhdxBloat(reading);
   // Only worth a process spawn when the line is already a warning.
   if (result.status === 'warn' && reading.guestUsedBytes !== null) {
-    return evaluateVhdxBloat({ ...reading, stoppedContainers: stoppedContainerCount('podman') });
+    return evaluateVhdxBloat({ ...reading, stoppedContainers: stoppedContainersInMachine(found.target.machine) });
   }
   return result;
 }
