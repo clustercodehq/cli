@@ -137,7 +137,17 @@ export function isBloatSignificant(reclaimable: number, hostFreeBytes: number | 
 
 export const COMPACT_COMMAND = 'clustercode machine compact';
 
-export const STOPPED_CONTAINERS_NOTE = 'stopped containers also hold space; clean them up in the console';
+export const STOPPED_CONTAINERS_NOTE = 'stopped containers also hold space; stopped DevBoxes can be cleaned up in the console';
+
+/** Sizes only, no advice: `Runtime disk: X on host, Y used inside — ~Z reclaimable (C: F free)`. */
+export function describeMeasuredReading(reading: VhdxReading & { guestUsedBytes: number }): string {
+  const reclaimable = reclaimableBytes(reading.vhdxBytes, reading.guestUsedBytes);
+  const free =
+    reading.hostFreeBytes !== null && reading.drive !== null
+      ? ` (${reading.drive}: ${formatGb(reading.hostFreeBytes)} free)`
+      : '';
+  return `Runtime disk: ${formatGb(reading.vhdxBytes)} on host, ${formatGb(reading.guestUsedBytes)} used inside — ~${formatGb(reclaimable)} reclaimable${free}`;
+}
 
 /**
  * Grade a reading. Never fails: a bloated disk is a machine still doing its job.
@@ -159,12 +169,8 @@ export function evaluateVhdxBloat(reading: VhdxReading): CheckResult {
     };
   }
 
+  const base = describeMeasuredReading({ ...reading, guestUsedBytes: reading.guestUsedBytes });
   const reclaimable = reclaimableBytes(reading.vhdxBytes, reading.guestUsedBytes);
-  const free =
-    reading.hostFreeBytes !== null && reading.drive !== null
-      ? ` (${reading.drive}: ${formatGb(reading.hostFreeBytes)} free)`
-      : '';
-  const base = `${onHost}, ${formatGb(reading.guestUsedBytes)} used inside — ~${formatGb(reclaimable)} reclaimable${free}`;
 
   if (!isBloatSignificant(reclaimable, reading.hostFreeBytes)) {
     return { name, status: 'pass', detail: base };
