@@ -34,12 +34,25 @@ export const WSL_RECLAIM_ENTRY: WslEntry = {
   value: 'gradual',
 };
 
-/** Values of `autoMemoryReclaim` that actually return memory to the host. */
-const RECLAIM_MODES = ['gradual', 'dropcache'];
+/** Values of `autoMemoryReclaim` that ask WSL to return memory to the host. */
+export type WslReclaimMode = 'gradual' | 'dropcache';
+const RECLAIM_MODES: readonly WslReclaimMode[] = ['gradual', 'dropcache'];
+
+/**
+ * The reclaim mode a raw `autoMemoryReclaim` value asks for, or null when it
+ * asks for none (absent, `disabled`, or anything unrecognised).
+ *
+ * The mode is returned rather than a boolean because the two are different
+ * mechanisms: a measurement taken under one says nothing about the other.
+ */
+export function reclaimModeOf(value: string | null): WslReclaimMode | null {
+  if (value === null) return null;
+  const normalized = value.trim().toLowerCase();
+  return (RECLAIM_MODES as readonly string[]).includes(normalized) ? (normalized as WslReclaimMode) : null;
+}
 
 export function isReclaimEnabledValue(value: string | null): boolean {
-  if (value === null) return false;
-  return RECLAIM_MODES.includes(value.trim().toLowerCase());
+  return reclaimModeOf(value) !== null;
 }
 
 /**

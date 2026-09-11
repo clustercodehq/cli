@@ -31,9 +31,19 @@ import {
   wslConfigPath,
   type ApplyPlan,
 } from '../lib/runtime-memory-apply.js';
-import { probeHostReclaim, currentWslVersionStamp } from '../lib/host-reclaim.js';
-import { verifyReclaim } from '../lib/reclaim-verify.js';
-import { WSL_RECLAIM_ENTRY, wslMemoryEntry } from '../lib/wslconfig.js';
+import {
+  probeHostReclaim,
+  currentReclaimMode,
+  currentWslVersionStamp,
+  type HostReclaimStatus,
+  type ReclaimVerdict,
+} from '../lib/host-reclaim.js';
+import {
+  reclaimVerificationRefusal,
+  verifyReclaim,
+  type ReclaimVerdictResult,
+} from '../lib/reclaim-verify.js';
+import { WSL_RECLAIM_ENTRY, wslMemoryEntry, type WslReclaimMode } from '../lib/wslconfig.js';
 import {
   readCredentials,
   readAppConfig,
@@ -1050,22 +1060,101 @@ function reportNoReclaimCeiling(ctx: {
   );
 }
 
+/** Everything `runReclaimVerification` reads, runs or writes — injected for tests. */
+export interface ReclaimVerificationDeps {
+  platform: NodeJS.Platform;
+  /** Engine, backend and reclaim status as they stand now: re-probed, not remembered. */
+  probe(): { engineName: string | null; provider: MachineProvider | undefined; status: HostReclaimStatus };
+  wslVersionStamp(): string | null;
+  reclaimMode(): WslReclaimMode | null;
+  measure(log: (line: string) => void): Promise<{ result: ReclaimVerdictResult; detail: string }>;
+  remember(verdict: ReclaimVerdict & { mode: WslReclaimMode }): void;
+  log: {
+    step(message: string): void;
+    info(message: string): void;
+    warn(message: string): void;
+    success(message: string): void;
+  };
+}
+
+function defaultReclaimVerificationDeps(): ReclaimVerificationDeps {
+  return {
+    platform: process.platform,
+    probe: () => {
+      const engineName = checkContainerRuntime().engine?.name ?? null;
+      if (!engineName) return { engineName, provider: undefined, status: 'n/a' };
+      const provider = detectMachineProvider(engineName);
+      return { engineName, provider, status: probeHostReclaim(engineName, process.platform, provider) };
+    },
+    wslVersionStamp: currentWslVersionStamp,
+    reclaimMode: currentReclaimMode,
+    measure: (log) => verifyReclaim({ log }),
+    remember: rememberReclaimVerdict,
+    log: {
+      step: (m) => clack.log.step(m),
+      info: (m) => clack.log.info(m),
+      warn: (m) => clack.log.warn(m),
+      success: (m) => clack.log.success(m),
+    },
+  };
+}
+
 /**
  * Measure, record, and say what was found.
  *
- * An inconclusive run records nothing: the point of the stored verdict is that
- * it is evidence, and "we could not tell" is not evidence of either answer.
+ * Refuses up front whenever the answer could not mean what the stored verdict
+ * claims: off Windows, for anything but Podman on the WSL backend, with reclaim
+ * not switched on, after the memory step failed, or when the WSL build cannot
+ * be read to stamp the result with. An inconclusive run records nothing, and
+ * neither does one during which the WSL build or reclaim mode changed: the
+ * point of the stored verdict is that it is evidence, and "we could not tell"
+ * is not evidence of either answer.
  */
-export async function runReclaimVerification(): Promise<'yes' | 'no' | 'inconclusive'> {
-  clack.log.step('Verifying memory reclaim');
-  const { result, detail } = await verifyReclaim({ log: (line) => clack.log.info(line) });
+export async function runReclaimVerification(
+  opts: { memoryStepOk?: boolean } = {},
+  deps: ReclaimVerificationDeps = defaultReclaimVerificationDeps(),
+): Promise<ReclaimVerdictResult | 'refused'> {
+  const { log } = deps;
+  log.step('Verifying memory reclaim');
+  const refuse = (message: string): 'refused' => {
+    log.warn(message);
+    return 'refused';
+  };
+
+  if (opts.memoryStepOk === false) {
+    return refuse('Skipped: the runtime memory step did not complete, so there is no settled runtime to measure.');
+  }
+  // Before any probe: off Windows there is no WSL to ask, and nothing to spawn.
+  if (deps.platform !== 'win32') {
+    return refuse('Memory reclaim is a Windows (WSL) setting; there is nothing to measure on this platform.');
+  }
+  const refusal = reclaimVerificationRefusal(deps.probe());
+  if (refusal) return refuse(refusal);
+
+  const wslVersion = deps.wslVersionStamp();
+  if (wslVersion === null) {
+    return refuse(
+      'Could not read the WSL version (`wsl --version`), so a result could not be tied to a WSL build. Nothing was measured.',
+    );
+  }
+  const mode = deps.reclaimMode();
+  if (mode === null) {
+    return refuse('Memory reclaim is not enabled in .wslconfig, so there is nothing to measure.');
+  }
+
+  const { result, detail } = await deps.measure((line) => log.info(line));
   if (result === 'inconclusive') {
-    clack.log.warn(detail);
+    log.warn(detail);
     return result;
   }
-  rememberReclaimVerdict(result, currentWslVersionStamp());
-  if (result === 'yes') clack.log.success(detail);
-  else clack.log.warn(detail);
+  // Ten idle minutes is long enough for a WSL update or a hand edit to land.
+  if (deps.wslVersionStamp() !== wslVersion || deps.reclaimMode() !== mode) {
+    log.warn('The WSL version or the reclaim setting changed during the measurement, so the result was not recorded.');
+    return 'inconclusive';
+  }
+  deps.remember({ result, wslVersion, mode });
+  if (result === 'yes') log.success(detail);
+  else log.warn(detail);
   return result;
 }
 
@@ -1143,7 +1232,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     // site below re-runs the checks afterwards and would overwrite it.
     const memoryOk = await offerRuntimeMemory(opts.memory, opts.verifyReclaim === true);
     if (!memoryOk) process.exitCode = 1;
-    if (opts.verifyReclaim) await runReclaimVerification();
+    if (opts.verifyReclaim) await runReclaimVerification({ memoryStepOk: memoryOk });
     clack.outro(
       memoryOk
         ? pc.green('Everything looks good! No issues to fix.')
@@ -1221,7 +1310,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
   }
 
   const memoryOk = await offerRuntimeMemory(opts.memory, opts.verifyReclaim === true);
-  if (opts.verifyReclaim) await runReclaimVerification();
+  if (opts.verifyReclaim) await runReclaimVerification({ memoryStepOk: memoryOk });
 
   // Pre-warm the worker binary so the first `clustercode worker` starts instantly.
   const { readInstalled, ensureWorkerBinary } = await import('../lib/worker-binary.js');

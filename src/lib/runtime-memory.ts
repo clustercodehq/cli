@@ -426,6 +426,16 @@ function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): { text
   // ignore — it has been seen accepted and inert — so a runtime sized as though
   // it works is running on an assumption, and says so until someone checks.
   if (reclaim === 'configured') {
+    // Docker's VM cannot be measured from this CLI, so it stays 'configured'
+    // for good and is never offered a measurement that would only refuse.
+    if (engineName === 'docker') {
+      return oversized
+        ? {
+            warn: true,
+            text: ` — memory reclaim is configured but cannot be verified for Docker, so size as if it does not work; ${lower}`,
+          }
+        : { warn: false, text: ' (memory reclaim configured but not verifiable for Docker)' };
+    }
     if (oversized) {
       return {
         warn: true,

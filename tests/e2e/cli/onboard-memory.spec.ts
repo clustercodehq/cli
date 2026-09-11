@@ -180,6 +180,24 @@ describe('onboard memory step on an engine the CLI cannot size', () => {
     const warnings = stdout.match(/Cannot set runtime memory|not configurable from this CLI/g) ?? [];
     assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}:\n${stdout}`);
   });
+
+  // Only Podman on the WSL backend can be measured. Anything else is refused
+  // before a single guest command runs, and leaves no verdict behind — on
+  // Windows because Docker's VM cannot be measured, elsewhere because there is
+  // no WSL at all.
+  it('refuses --verify-reclaim for Docker and records nothing', () => {
+    seedConfigs();
+    createDockerStub(EIGHT_GIB);
+
+    const { stdout, exitCode } = runOnboard(['--verify-reclaim']);
+    assert.equal(exitCode, 0, stdout);
+    assert.match(stdout, /Verifying memory reclaim/);
+    assert.match(stdout, isWin ? /only be measured for Podman/ : /Windows \(WSL\) setting/);
+    assert.doesNotMatch(stdout, /Loading .* into the VM's cache/);
+    const configPath = join(tempHome, '.clustercode', 'config.json');
+    const config = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
+    assert.equal(config.RUNTIME_RECLAIM_VERIFIED, undefined);
+  });
 });
 
 /**

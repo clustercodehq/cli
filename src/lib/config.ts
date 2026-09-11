@@ -13,6 +13,8 @@ import {
 } from './config-store/index.js';
 import type { Credentials, WorkerConfig, AppConfig } from './config-store/index.js';
 import { MIN_RUNTIME_MEMORY_MIB, maxSafeRuntimeMib } from './runtime-memory.js';
+import type { ReclaimVerdict } from './host-reclaim.js';
+import type { WslReclaimMode } from './wslconfig.js';
 
 // Re-export reads and types so existing CLI imports keep working
 export {
@@ -198,19 +200,21 @@ export function validateReclaimVerified(value: string): string | null {
 }
 
 /**
- * Record a reclaim measurement together with the WSL build it was taken
- * against.
+ * Record a reclaim measurement together with the WSL build and reclaim mode it
+ * was taken against.
  *
- * The stamp is not decoration: the behaviour being measured is a property of
- * the WSL build, so a verdict that outlived its build would keep sizing the
- * runtime on a measurement of different software. Merged in, so recording a
- * verdict cannot drop the remembered memory size.
+ * The stamps are not decoration: the behaviour being measured is a property of
+ * the WSL build and of the mode, so a verdict that outlived either would keep
+ * sizing the runtime on a measurement of different software. Callers refuse to
+ * record rather than pass a placeholder. Merged in, so recording a verdict
+ * cannot drop the remembered memory size.
  */
-export function rememberReclaimVerdict(result: 'yes' | 'no', wslVersion: string): void {
+export function rememberReclaimVerdict(verdict: ReclaimVerdict & { mode: WslReclaimMode }): void {
   writeAppConfig({
     ...readAppConfig(),
-    RUNTIME_RECLAIM_VERIFIED: result,
-    RUNTIME_RECLAIM_VERIFIED_WSL: wslVersion,
+    RUNTIME_RECLAIM_VERIFIED: verdict.result,
+    RUNTIME_RECLAIM_VERIFIED_WSL: verdict.wslVersion,
+    RUNTIME_RECLAIM_VERIFIED_MODE: verdict.mode,
   });
 }
 

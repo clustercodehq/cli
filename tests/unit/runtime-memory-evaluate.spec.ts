@@ -421,6 +421,20 @@ describe('memory reclaim', () => {
     assert.doesNotMatch(r.detail, /--memory 24576/);
   });
 
+  // Docker's VM cannot be measured from this CLI, so offering the measurement
+  // sends a Docker user to a command that will only refuse.
+  test('Docker on WSL is never offered --verify-reclaim', () => {
+    for (const memTotalMib of [25600, 16384]) {
+      const r = wsl({
+        reclaim: 'configured',
+        engineName: 'docker',
+        engine: { memTotalBytes: memTotalMib * MIB, cpus: 8 },
+      });
+      assert.doesNotMatch(r.detail, /verify-reclaim/, String(memTotalMib));
+      assert.match(r.detail, /configured/, String(memTotalMib));
+    }
+  });
+
   // Measured and doing nothing. No amount of configuration will change that, so
   // the only remaining lever is the size itself.
   test('inert above the ceiling says so and names the size to fall back to', () => {

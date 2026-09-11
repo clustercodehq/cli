@@ -22,9 +22,15 @@ export interface AppConfig {
    */
   RUNTIME_RECLAIM_VERIFIED?: 'yes' | 'no';
   /**
-   * The `wsl --version` the verdict above was measured against, or 'manual'
-   * when a user recorded it themselves. A mismatch with the running WSL means
-   * the question is open again rather than settled forever.
+   * The `wsl --version` the verdict above was measured against. A mismatch with
+   * the running WSL means the question is open again rather than settled
+   * forever. (Earlier builds could write 'manual' here; that matches nothing.)
    */
   RUNTIME_RECLAIM_VERIFIED_WSL?: string;
+  /**
+   * The `[experimental] autoMemoryReclaim` mode (`gradual` or `dropcache`) the
+   * verdict was measured under. Absent or different from the current setting
+   * means the verdict is not used.
+   */
+  RUNTIME_RECLAIM_VERIFIED_MODE?: string;
 }
