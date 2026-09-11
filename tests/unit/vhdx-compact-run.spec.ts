@@ -4,6 +4,7 @@ import {
   compactVhdx,
   defaultCompactRunner,
   describeCompactOutcome,
+  settleWithin,
   type CompactRunner,
   type ElevationResult,
 } from '../../src/lib/vhdx-compact.js';
@@ -18,7 +19,15 @@ interface FakeOptions {
   elevation?: ElevationResult;
   startOk?: boolean;
   stopThrows?: boolean;
+  /** Size and free-space probes never answer once the disk is compacted. */
+  snapshotHangsAfterCompact?: boolean;
+  /** Size and free-space probes throw. */
+  snapshotThrows?: boolean;
+  /** The diagnostics gathered after a handle timeout never answer. */
+  listsHang?: boolean;
 }
+
+const never = <T,>(): Promise<T> => new Promise<T>(() => {});
 
 function fakeRunner(opts: FakeOptions = {}) {
   const calls: string[] = [];
@@ -26,8 +35,9 @@ function fakeRunner(opts: FakeOptions = {}) {
   let t = 0;
   let size = 70 * GB;
   let free = 32 * GB;
+  let compacted = false;
   const runner: CompactRunner = {
-    runningContainers: () => (calls.push('runningContainers'), opts.running === undefined ? [] : opts.running),
+    runningContainers: async () => (calls.push('runningContainers'), opts.running === undefined ? [] : opts.running),
     fstrim: async (machine) => (calls.push(`fstrim ${machine}`), { ok: opts.fstrimOk ?? true, output: '/: 10 GiB trimmed' }),
     machineStop: async (machine) => {
       calls.push(`machineStop ${machine}`);
@@ -40,8 +50,8 @@ function fakeRunner(opts: FakeOptions = {}) {
       probes++;
       return probes >= (opts.releasedAfterProbes ?? 1);
     },
-    listRunningDistros: () => (calls.push('listRunningDistros'), ['Ubuntu-24.04']),
-    listVmProcesses: () => (calls.push('listVmProcesses'), ['vmmem']),
+    listRunningDistros: async () => (calls.push('listRunningDistros'), opts.listsHang ? never() : ['Ubuntu-24.04']),
+    listVmProcesses: async () => (calls.push('listVmProcesses'), opts.listsHang ? never() : ['vmmem']),
     now: () => t,
     sleep: async (ms) => {
       t += ms;
@@ -50,14 +60,22 @@ function fakeRunner(opts: FakeOptions = {}) {
       calls.push(`elevate ${path}`);
       const result = opts.elevation ?? { kind: 'ok' };
       if (result.kind === 'ok') {
+        compacted = true;
         size = 31 * GB;
         free = 71 * GB;
       }
       return result;
     },
     machineStart: async (machine) => (calls.push(`machineStart ${machine}`), opts.startOk ?? true),
-    fileSize: () => size,
-    driveFree: (letter) => (letter === 'D' ? free : null),
+    fileSize: async () => {
+      if (opts.snapshotThrows) throw new Error('stat failed');
+      return compacted && opts.snapshotHangsAfterCompact ? never() : size;
+    },
+    driveFree: async (letter) => {
+      if (opts.snapshotThrows) throw new Error('powershell failed');
+      if (compacted && opts.snapshotHangsAfterCompact) return never();
+      return letter === 'D' ? free : null;
+    },
   };
   return { runner, calls };
 }
@@ -153,6 +171,43 @@ describe('compactVhdx', () => {
     assert.equal(calls.at(-1), 'machineStart dev');
   });
 
+  it('reads a size probe that never answers as unknown, and still restarts', async () => {
+    const { runner, calls } = fakeRunner({ snapshotHangsAfterCompact: true });
+    const outcome = await compactVhdx(TARGET, runner, quiet, { timeoutMs: 180_000, intervalMs: 2_000, probeTimeoutMs: 20 });
+    assert.deepEqual(outcome, {
+      kind: 'compacted',
+      before: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
+      after: { vhdxBytes: null, freeBytes: null },
+      drive: 'D',
+      restarted: true,
+    });
+    assert.equal(calls.at(-1), 'machineStart dev');
+  });
+
+  it('reads a size probe that throws as unknown', async () => {
+    const { runner } = fakeRunner({ snapshotThrows: true });
+    const outcome = await compactVhdx(TARGET, runner, quiet);
+    assert.ok(outcome.kind === 'compacted');
+    assert.deepEqual(outcome.before, { vhdxBytes: null, freeBytes: null });
+    assert.deepEqual(outcome.after, { vhdxBytes: null, freeBytes: null });
+    assert.equal(outcome.restarted, true);
+  });
+
+  it('still explains a held disk and restarts when the diagnostics never answer', async () => {
+    const { runner, calls } = fakeRunner({ releasedAfterProbes: Infinity, listsHang: true });
+    const outcome = await compactVhdx(TARGET, runner, quiet, { timeoutMs: 6_000, intervalMs: 2_000, probeTimeoutMs: 20 });
+    assert.ok(outcome.kind === 'handle-timeout' && outcome.restarted);
+    assert.ok(outcome.kind === 'handle-timeout' && /still in use/.test(outcome.message));
+    assert.equal(calls.at(-1), 'machineStart dev');
+  });
+
+  it('treats a release probe that never answers as still held', async () => {
+    const { runner } = fakeRunner();
+    runner.probeReleased = () => never();
+    const outcome = await compactVhdx(TARGET, runner, quiet, { timeoutMs: 0, intervalMs: 2_000, probeTimeoutMs: 20 });
+    assert.ok(outcome.kind === 'handle-timeout' && outcome.restarted);
+  });
+
   it('has no way to shut down all of WSL', () => {
     const { runner } = fakeRunner();
     assert.ok(!('wslShutdown' in runner));
@@ -222,5 +277,27 @@ describe('describeCompactOutcome', () => {
     );
     assert.equal(d.ok, false);
     assert.match(d.lines.at(-1)!, /podman machine start dev/);
+  });
+});
+
+describe('settleWithin', () => {
+  it('returns the value when the work answers in time', async () => {
+    assert.equal(await settleWithin(async () => 5, 1_000, null), 5);
+  });
+
+  it('returns the fallback when the work never answers', async () => {
+    const started = Date.now();
+    assert.equal(await settleWithin(() => new Promise<number>(() => {}), 20, null), null);
+    assert.ok(Date.now() - started < 1_000);
+  });
+
+  it('returns the fallback when the work throws, synchronously or not', async () => {
+    assert.equal(
+      await settleWithin(() => {
+        throw new Error('sync');
+      }, 1_000, 'fallback'),
+      'fallback',
+    );
+    assert.equal(await settleWithin(async () => Promise.reject(new Error('async')), 1_000, 'fallback'), 'fallback');
   });
 });

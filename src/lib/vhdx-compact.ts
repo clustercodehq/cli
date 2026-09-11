@@ -1,9 +1,10 @@
-import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decodeConsoleOutput, windowsDriveFreeBytes } from './checks.js';
-import { runningContainers } from './engine-containers.js';
+import { decodeConsoleOutput, POWERSHELL_PROBE_TIMEOUT_MS } from './checks.js';
+import { ENGINE_QUERY_TIMEOUT_MS, parseContainerNames } from './engine-containers.js';
+import { runProcess } from './run-process.js';
 import {
   driveLetterOf,
   formatGb,
@@ -39,6 +40,18 @@ export const FSTRIM_SCRIPT = 'sudo -n fstrim -av';
 /** Longer than WSL's default 60 s idle timeout, with room for a slow host. */
 export const HANDLE_WAIT_TIMEOUT_MS = 180_000;
 export const HANDLE_POLL_INTERVAL_MS = 2_000;
+
+/**
+ * Backstop for every size, free-space and diagnostic probe the procedure makes.
+ * The machine is stopped for most of it, so no read may hang on the way to the restart.
+ */
+export const PROBE_TIMEOUT_MS = 30_000;
+
+/**
+ * How long the elevated diskpart may take. Generous (compacting a large disk
+ * on a slow drive takes a while) but bounded, so the restart always happens.
+ */
+export const ELEVATION_TIMEOUT_MS = 2 * 60 * 60_000;
 
 /** ERROR_CANCELLED: the user said no at the UAC prompt. */
 export const ELEVATION_DECLINED_EXIT = 1223;
@@ -188,8 +201,8 @@ export interface ReleaseWaitOptions {
   sleep: (ms: number) => Promise<void>;
   timeoutMs: number;
   intervalMs: number;
-  listRunningDistros: () => string[];
-  listVmProcesses: () => string[];
+  listRunningDistros: () => string[] | Promise<string[]>;
+  listVmProcesses: () => string[] | Promise<string[]>;
 }
 
 export type ReleaseWait =
@@ -211,8 +224,8 @@ export async function waitForVhdxRelease(opts: ReleaseWaitOptions): Promise<Rele
       return {
         released: false,
         waitedMs,
-        runningDistros: opts.listRunningDistros(),
-        vmProcesses: opts.listVmProcesses(),
+        runningDistros: await opts.listRunningDistros(),
+        vmProcesses: await opts.listVmProcesses(),
       };
     }
     await opts.sleep(Math.min(opts.intervalMs, opts.timeoutMs - waitedMs));
@@ -258,21 +271,53 @@ export function handleTimeoutMessage(info: {
 // The procedure
 // ---------------------------------------------------------------------------
 
+/**
+ * Everything the procedure does to the host. Every method is async and must
+ * settle within its own bound: once the machine is stopped, a call that never
+ * returns would keep it from being started again. The procedure adds a backstop
+ * (`PROBE_TIMEOUT_MS`) around the reads.
+ */
 export interface CompactRunner {
-  runningContainers(): string[] | null;
+  runningContainers(): Promise<string[] | null>;
   fstrim(machine: string): Promise<{ ok: boolean; output: string }>;
   machineStop(machine: string): Promise<boolean>;
   wslTerminate(distro: string): Promise<boolean>;
-  probeReleased(vhdxPath: string): Promise<boolean> | boolean;
-  listRunningDistros(): string[];
-  listVmProcesses(): string[];
+  probeReleased(vhdxPath: string): Promise<boolean>;
+  listRunningDistros(): Promise<string[]>;
+  listVmProcesses(): Promise<string[]>;
   now(): number;
   sleep(ms: number): Promise<void>;
   elevateCompact(vhdxPath: string): Promise<ElevationResult>;
   /** Must tolerate a machine that is already running. */
   machineStart(machine: string): Promise<boolean>;
-  fileSize(path: string): number | null;
-  driveFree(letter: string): number | null;
+  fileSize(path: string): Promise<number | null>;
+  driveFree(letter: string): Promise<number | null>;
+}
+
+/** The value of `work`, or `fallback` if it throws or has not answered within `ms`. */
+export function settleWithin<T, F>(work: () => T | Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    Promise.resolve()
+      .then(work)
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(fallback);
+        },
+      );
+  });
+}
+
+export interface CompactTimings {
+  timeoutMs: number;
+  intervalMs: number;
+  /** Defaults to `PROBE_TIMEOUT_MS`. */
+  probeTimeoutMs?: number;
 }
 
 export interface CompactLog {
@@ -297,20 +342,26 @@ export async function compactVhdx(
   target: PodmanVhdx,
   runner: CompactRunner,
   log: CompactLog,
-  wait: { timeoutMs: number; intervalMs: number } = { timeoutMs: HANDLE_WAIT_TIMEOUT_MS, intervalMs: HANDLE_POLL_INTERVAL_MS },
+  wait: CompactTimings = { timeoutMs: HANDLE_WAIT_TIMEOUT_MS, intervalMs: HANDLE_POLL_INTERVAL_MS },
 ): Promise<CompactOutcome> {
+  const probeMs = wait.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
+
   // Checked again here, not only before consent: time passes at a prompt, and
   // stopping the machine under a live DevBox is not acceptable.
-  const running = runner.runningContainers();
+  const running = await settleWithin(() => runner.runningContainers(), probeMs, null);
   if (running === null || running.length > 0) return { kind: 'blocked', running };
 
   const steps = compactPlanSteps(target);
   const drive = driveLetterOf(target.vhdxPath);
-  const snapshot = (): SizeSnapshot => ({
-    vhdxBytes: runner.fileSize(target.vhdxPath),
-    freeBytes: drive ? runner.driveFree(drive) : null,
-  });
-  const before = snapshot();
+  // Sizes are only for the report: a read that fails or hangs is "unknown".
+  const snapshot = async (): Promise<SizeSnapshot> => {
+    const [vhdxBytes, freeBytes] = await Promise.all([
+      settleWithin(() => runner.fileSize(target.vhdxPath), probeMs, null),
+      drive ? settleWithin(() => runner.driveFree(drive), probeMs, null) : null,
+    ]);
+    return { vhdxBytes, freeBytes };
+  };
+  const before = await snapshot();
 
   log.step(steps[0]);
   const trimmed = await runner.fstrim(target.machine);
@@ -337,13 +388,13 @@ export async function compactVhdx(
 
     log.step(steps[3]);
     const released = await waitForVhdxRelease({
-      probe: () => runner.probeReleased(target.vhdxPath),
+      probe: () => settleWithin(() => runner.probeReleased(target.vhdxPath), probeMs, false),
       now: () => runner.now(),
       sleep: (ms) => runner.sleep(ms),
       timeoutMs: wait.timeoutMs,
       intervalMs: wait.intervalMs,
-      listRunningDistros: () => runner.listRunningDistros(),
-      listVmProcesses: () => runner.listVmProcesses(),
+      listRunningDistros: () => settleWithin(() => runner.listRunningDistros(), probeMs, []),
+      listVmProcesses: () => settleWithin(() => runner.listVmProcesses(), probeMs, []),
     });
 
     if (!released.released) {
@@ -358,7 +409,7 @@ export async function compactVhdx(
       log.step(steps[4]);
       elevation = await runner.elevateCompact(target.vhdxPath);
       result = elevation.kind === 'ok' ? 'compacted' : elevation.kind;
-      if (elevation.kind === 'ok') after = snapshot();
+      if (elevation.kind === 'ok') after = await snapshot();
     }
   } finally {
     // Every path that got as far as stopping the machine starts it again.
@@ -457,48 +508,6 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
 // The real runner (Windows only)
 // ---------------------------------------------------------------------------
 
-interface SpawnResult {
-  code: number | null;
-  output: string;
-}
-
-/**
- * Async so a multi-minute compact does not freeze the terminal. `timeoutMs` 0
- * means no limit. Never `detached`: a console-less PowerShell loses its exit
- * code, and a declined UAC prompt would then read as success.
- */
-function run(file: string, args: string[], timeoutMs: number): Promise<SpawnResult> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    let child;
-    try {
-      child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, cwd: tmpdir() });
-    } catch {
-      resolve({ code: null, output: '' });
-      return;
-    }
-    const timer = timeoutMs > 0 ? setTimeout(() => child.kill(), timeoutMs) : null;
-    child.stdout.on('data', (c: Buffer) => chunks.push(c));
-    child.stderr.on('data', (c: Buffer) => chunks.push(c));
-    child.on('error', () => {
-      if (timer) clearTimeout(timer);
-      resolve({ code: null, output: decodeConsoleOutput(Buffer.concat(chunks)) });
-    });
-    child.on('close', (code) => {
-      if (timer) clearTimeout(timer);
-      resolve({ code, output: decodeConsoleOutput(Buffer.concat(chunks)) });
-    });
-  });
-}
-
-function runSync(file: string, args: string[], timeoutMs: number): string | null {
-  try {
-    return decodeConsoleOutput(execFileSync(file, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, windowsHide: true, cwd: tmpdir() }));
-  } catch {
-    return null;
-  }
-}
-
 function powershellArgs(script: string): string[] {
   return ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShell(script)];
 }
@@ -519,9 +528,16 @@ async function elevateCompact(vhdxPath: string): Promise<ElevationResult> {
     // which would mangle a non-ASCII user name in the paths.
     writeFileSync(runScript, `﻿${elevatedRunnerScript(paths)}`, 'utf-8');
 
-    // No timeout: killing the launcher would not stop the elevated diskpart, and
-    // restarting the machine under a disk it still has attached is worse than waiting.
-    const launched = await run('powershell', powershellArgs(elevationLauncherScript(runScript)), 0);
+    // Bounded, so the machine is always started again. Giving up does not stop
+    // an elevated diskpart that is still running; the report says so.
+    const launched = await runProcess('powershell', powershellArgs(elevationLauncherScript(runScript)), ELEVATION_TIMEOUT_MS);
+    if (launched.timedOut) {
+      return {
+        kind: 'failed',
+        exitCode: null,
+        logTail: `diskpart did not finish within ${ELEVATION_TIMEOUT_MS / 60_000} minutes. If it is still running, the machine cannot start until it finishes.`,
+      };
+    }
     let logText = '';
     try {
       logText = decodeConsoleOutput(readFileSync(paths.log));
@@ -539,10 +555,10 @@ async function elevateCompact(vhdxPath: string): Promise<ElevationResult> {
   }
 }
 
-function machineRunning(machine: string): boolean {
-  const out = runSync('podman', ['machine', 'list', '--format', MACHINE_LIST_FORMAT], 30_000);
-  if (out === null) return false;
-  return out
+async function machineRunning(machine: string): Promise<boolean> {
+  const r = await runProcess('podman', ['machine', 'list', '--format', MACHINE_LIST_FORMAT], ENGINE_QUERY_TIMEOUT_MS);
+  if (r.code !== 0) return false;
+  return r.stdout
     .split(/\r?\n/)
     .map((line) => parseMachineList(line))
     .some((m) => m !== null && m.name === machine && m.running);
@@ -553,31 +569,37 @@ export function defaultCompactRunner(): CompactRunner {
     throw new Error('Compacting the machine disk is only supported on Windows');
   }
   return {
-    runningContainers: () => runningContainers('podman'),
+    runningContainers: async () => {
+      const r = await runProcess('podman', ['ps', '--format', '{{.Names}}'], ENGINE_QUERY_TIMEOUT_MS);
+      return r.code === 0 ? parseContainerNames(r.stdout) : null;
+    },
     fstrim: async (machine) => {
-      const r = await run('podman', machineSshArgs(machine, FSTRIM_SCRIPT), 15 * 60_000);
+      const r = await runProcess('podman', machineSshArgs(machine, FSTRIM_SCRIPT), 15 * 60_000);
       return { ok: r.code === 0, output: r.output.trim() };
     },
-    machineStop: async (machine) => (await run('podman', ['machine', 'stop', machine], 5 * 60_000)).code === 0,
-    wslTerminate: async (distro) => (await run('wsl', ['--terminate', distro], 60_000)).code === 0,
-    probeReleased: async (vhdxPath) => (await run('powershell', powershellArgs(releaseProbeScript(vhdxPath)), 30_000)).code === 0,
-    listRunningDistros: () => parseRunningDistros(runSync('wsl', ['--list', '--running', '--quiet'], 30_000) ?? ''),
-    listVmProcesses: () => parseTasklistNames(runSync('tasklist', ['/fo', 'csv', '/nh'], 30_000) ?? ''),
+    machineStop: async (machine) => (await runProcess('podman', ['machine', 'stop', machine], 5 * 60_000)).code === 0,
+    wslTerminate: async (distro) => (await runProcess('wsl', ['--terminate', distro], 60_000)).code === 0,
+    probeReleased: async (vhdxPath) =>
+      (await runProcess('powershell', powershellArgs(releaseProbeScript(vhdxPath)), POWERSHELL_PROBE_TIMEOUT_MS)).code === 0,
+    listRunningDistros: async () =>
+      parseRunningDistros((await runProcess('wsl', ['--list', '--running', '--quiet'], ENGINE_QUERY_TIMEOUT_MS)).stdout),
+    listVmProcesses: async () =>
+      parseTasklistNames((await runProcess('tasklist', ['/fo', 'csv', '/nh'], ENGINE_QUERY_TIMEOUT_MS)).stdout),
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     elevateCompact,
     machineStart: async (machine) => {
-      const r = await run('podman', ['machine', 'start', machine], 10 * 60_000);
+      const r = await runProcess('podman', ['machine', 'start', machine], 10 * 60_000);
       // podman exits non-zero for a machine that is already running; ask rather than trust the code.
-      return r.code === 0 || machineRunning(machine);
+      return r.code === 0 || (await machineRunning(machine));
     },
-    fileSize: (path) => {
-      try {
-        return statSync(path).size;
-      } catch {
-        return null;
-      }
+    fileSize: (path) => settleWithin(async () => (await stat(path)).size, POWERSHELL_PROBE_TIMEOUT_MS, null),
+    driveFree: async (letter) => {
+      if (!/^[A-Za-z]$/.test(letter)) return null;
+      const script = `(Get-PSDrive ${letter.toUpperCase()}).Free`;
+      const r = await runProcess('powershell', powershellArgs(script), POWERSHELL_PROBE_TIMEOUT_MS);
+      const bytes = r.code === 0 ? parseInt(r.stdout.trim(), 10) : NaN;
+      return Number.isNaN(bytes) ? null : bytes;
     },
-    driveFree: (letter) => windowsDriveFreeBytes(letter),
   };
 }
