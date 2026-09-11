@@ -62,6 +62,19 @@ Exits non-zero when any check fails, so it works as a scripted gate:
 clustercode doctor --json || echo "not healthy"
 ```
 
+On Windows with a WSL-backed Podman machine, `doctor` also reports how much
+unused space the machine's virtual disk holds:
+
+```
+✓ Runtime disk: 31.7 GB on host, 29.0 GB used inside — ~2.7 GB reclaimable (C: 68.6 GB free)
+⚠ Runtime disk: 70.8 GB on host, 43.0 GB used inside — ~27.8 GB reclaimable (C: 32.0 GB free); run `clustercode machine compact`
+```
+
+It warns when at least 5 GB could be reclaimed **and** that is at least a
+quarter of the drive's free space — 20 GB matters with 30 GB free, not with
+500 GB free. It never fails, and shows no line on macOS, Linux, Docker, or a
+Podman machine that isn't WSL-backed.
+
 ### `clustercode onboard`
 
 Interactive setup wizard that runs all health checks and offers to fix each
@@ -180,6 +193,41 @@ clustercode config list
 
 Show current state: user, worker, tenant, orchestrator connection, and
 container count.
+
+### `clustercode machine compact`
+
+Windows only, for a WSL-backed Podman machine. The machine keeps its
+filesystem in a virtual disk file (`ext4.vhdx`) that grows as containers and
+image builds write to it and **never shrinks** when files are deleted inside
+the machine, so the drive loses space it never gets back. This command returns
+that unused space to Windows:
+
+1. Trims free space inside the machine (`fstrim`).
+2. Stops the machine, and stops its WSL distribution with
+   `wsl --terminate <distribution>` — never `wsl --shutdown`, which would stop
+   every WSL distribution on the computer.
+3. Waits (up to 3 minutes) for WSL's utility VM to release the disk.
+4. Compacts the disk with `diskpart`. This asks for administrator approval once.
+   The disk is detached afterwards even if compacting fails.
+5. Starts the machine again — on every path, including a declined approval or
+   a failure.
+
+It shows the reclaimable space and the full plan, then asks before stopping
+anything. Pass `--yes` to skip the question (Windows still asks for
+administrator approval). It reports the disk size and the drive's free space
+before and after.
+
+It refuses to run while any container is running, or when it cannot ask Podman
+what is running. Stopped containers also hold space inside the machine, which
+compacting does not return; stopped DevBoxes can be cleaned up in the console.
+
+If other WSL distributions keep the utility VM alive, the command names them
+and the `wsl --terminate` command for each, and changes nothing. The disk is
+never converted to a sparse VHDX: sparse disks cannot be compacted this way,
+and the change cannot be undone.
+
+It exits non-zero when it refuses, when approval is declined, when the disk is
+not released in time, when compacting fails, and on any other platform.
 
 ## Configuration files
 
