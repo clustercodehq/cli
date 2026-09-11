@@ -4,6 +4,7 @@ import {
   runReclaimVerification,
   storedSizeAboveNoReclaimCeiling,
   reclaimNeedsTurningOn,
+  runtimeCeilingNote,
   type ReclaimVerificationDeps,
 } from '../../src/commands/onboard.js';
 import { recordManualReclaimVerdict, type ManualVerdictDeps } from '../../src/commands/config.js';
@@ -249,5 +250,33 @@ describe('reclaimNeedsTurningOn', () => {
     assert.equal(reclaimNeedsTurningOn({ ...base, provider: 'hyperv', status: 'off' }), false);
     assert.equal(reclaimNeedsTurningOn({ ...base, provider: 'unknown', status: 'off' }), false);
     assert.equal(reclaimNeedsTurningOn({ ...base, engineName: 'docker', status: 'off' }), false);
+  });
+});
+
+describe('runtimeCeilingNote', () => {
+  // A Podman machine on Hyper-V has no reclaim setting and is not stopped by
+  // `wsl --shutdown`, so the note must not send its user after either.
+  test('Hyper-V gets a note with no WSL wording', () => {
+    const note = runtimeCeilingNote('win32', 'n/a') ?? '';
+    assert.match(note, /Hyper-V/);
+    assert.match(note, /fully used/);
+    assert.doesNotMatch(note, /wsl --shutdown|WSL 2\.0|reclaim/i);
+  });
+
+  test('reclaim that is off, or cannot exist, still names the WSL facts', () => {
+    for (const status of ['off', 'unsupported'] as const) {
+      assert.match(runtimeCeilingNote('win32', status) ?? '', /wsl --shutdown/, status);
+    }
+  });
+
+  test('configured points at the measurement; verified and inert say what was found', () => {
+    assert.match(runtimeCeilingNote('win32', 'configured') ?? '', /--verify-reclaim/);
+    assert.match(runtimeCeilingNote('win32', 'verified') ?? '', /returned to Windows/);
+    assert.match(runtimeCeilingNote('win32', 'inert') ?? '', /does not return memory/);
+  });
+
+  test('macOS has its own note, and Linux none', () => {
+    assert.match(runtimeCeilingNote('darwin', 'n/a') ?? '', /macOS/);
+    assert.equal(runtimeCeilingNote('linux', 'n/a'), null);
   });
 });

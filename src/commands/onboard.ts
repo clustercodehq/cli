@@ -785,22 +785,8 @@ async function offerRuntimeMemory(
       return true;
     }
 
-    // A ceiling is not the same commitment as a reservation, and users
-    // routinely under-allocate out of caution about a number they think is
-    // set aside up front. Say what actually happens before asking them to
-    // pick one.
-    const ceilingNote =
-      platform === 'win32'
-        ? reclaimStatus === 'verified'
-          ? 'This is a ceiling, not a reservation — memory is used while DevBoxes run and returned to Windows gradually while the runtime is idle.'
-          : reclaimStatus === 'configured'
-            ? 'Memory reclaim is configured but has not been verified on this machine — this number is sized as if it does not work; run `clustercode onboard --verify-reclaim` to check.'
-            : reclaimStatus === 'inert'
-              ? 'Memory reclaim does not return memory on this Windows build, so treat this number as fully used.'
-              : 'Without memory reclaim (WSL 2.0+), the runtime keeps everything it has touched until `wsl --shutdown`, so treat this number as fully used.'
-        : platform === 'darwin'
-          ? 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, and macOS does not release it back until the machine restarts, so treat this number as fully used.'
-          : null;
+    // Say what actually happens to the number before asking for one.
+    const ceilingNote = runtimeCeilingNote(platform, reclaimStatus);
     if (ceilingNote) clack.log.info(ceilingNote);
 
     const useOptions: { value: 'dedicated' | 'shared' | 'custom' | 'keep'; label: string }[] = [
@@ -1198,6 +1184,36 @@ export async function runReclaimVerification(
   if (result === 'yes') log.success(detail);
   else log.warn(detail);
   return result;
+}
+
+/**
+ * What the sizing prompt says about the number it is about to ask for, or null.
+ *
+ * A ceiling is not the same commitment as a reservation, and users routinely
+ * under-allocate out of caution about a number they think is set aside up
+ * front — so say what actually happens to it on this host.
+ */
+export function runtimeCeilingNote(platform: NodeJS.Platform, reclaimStatus: HostReclaimStatus): string | null {
+  if (platform === 'darwin') {
+    return 'This is a ceiling, not a reservation — memory is claimed as DevBoxes use it, and macOS does not release it back until the machine restarts, so treat this number as fully used.';
+  }
+  if (platform !== 'win32') return null;
+  switch (reclaimStatus) {
+    case 'verified':
+      return 'This is a ceiling, not a reservation — memory is used while DevBoxes run and returned to Windows while the runtime is idle.';
+    case 'configured':
+      return 'Memory reclaim is configured but has not been verified on this machine — this number is sized as if it does not work; run `clustercode onboard --verify-reclaim` to check.';
+    case 'inert':
+      return 'Memory reclaim does not return memory on this Windows build, so treat this number as fully used.';
+    case 'n/a':
+      // Not WSL — in practice a Podman machine on Hyper-V, which `podman
+      // machine set` gives a fixed amount of memory. It has no reclaim setting,
+      // and `wsl --shutdown` does not stop it.
+      return 'The Podman machine runs on Hyper-V, not WSL, and holds the whole amount while it runs, so treat this number as fully used.';
+    case 'off':
+    case 'unsupported':
+      return 'Without memory reclaim (WSL 2.0+), the runtime keeps everything it has touched until `wsl --shutdown`, so treat this number as fully used.';
+  }
 }
 
 /**
