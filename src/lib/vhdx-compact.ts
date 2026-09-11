@@ -331,7 +331,8 @@ export interface SizeSnapshot {
 }
 
 export type CompactOutcome =
-  | { kind: 'blocked'; running: string[] | null }
+  /** `afterTrim`: the check right before stopping refused, after the trim ran. Nothing was stopped either way. */
+  | { kind: 'blocked'; running: string[] | null; afterTrim: boolean }
   | { kind: 'compacted'; before: SizeSnapshot; after: SizeSnapshot; drive: string | null; restarted: boolean }
   | { kind: 'declined'; restarted: boolean }
   | { kind: 'unavailable'; restarted: boolean }
@@ -349,7 +350,7 @@ export async function compactVhdx(
   // Checked again here, not only before consent: time passes at a prompt, and
   // stopping the machine under a live DevBox is not acceptable.
   const running = await settleWithin(() => runner.runningContainers(), probeMs, null);
-  if (running === null || running.length > 0) return { kind: 'blocked', running };
+  if (running === null || running.length > 0) return { kind: 'blocked', running, afterTrim: false };
 
   const steps = compactPlanSteps(target);
   const drive = driveLetterOf(target.vhdxPath);
@@ -367,6 +368,13 @@ export async function compactVhdx(
   const trimmed = await runner.fstrim(target.machine);
   if (!trimmed.ok) {
     log.warn('fstrim did not complete; continuing, but less space may be returned.');
+  }
+
+  // And once more right before stopping: the trim can take minutes, and a
+  // DevBox started meanwhile would be stopped with the machine.
+  const stillRunning = await settleWithin(() => runner.runningContainers(), probeMs, null);
+  if (stillRunning === null || stillRunning.length > 0) {
+    return { kind: 'blocked', running: stillRunning, afterTrim: true };
   }
 
   let result: Exclude<CompactOutcome, { kind: 'blocked' }>['kind'];
@@ -444,23 +452,29 @@ function sizeOrUnknown(bytes: number | null): string {
 /** What to tell the user about an outcome. `ok` is false for anything that needs their attention. */
 export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVhdx): { ok: boolean; lines: string[] } {
   if (outcome.kind === 'blocked') {
+    const neverStopped = outcome.afterTrim
+      ? ['Free space was trimmed, but the machine was never stopped, so nothing needs restarting.']
+      : [];
     if (outcome.running === null) {
       return {
         ok: false,
         lines: [
           'Could not ask Podman which containers are running, so nothing was stopped. ' +
             `Make sure the machine is running (podman machine start ${target.machine}), then re-run \`clustercode machine compact\`.`,
+          ...neverStopped,
         ],
       };
     }
     const shown = outcome.running.slice(0, MAX_NAMED_CONTAINERS).join(', ');
     const more = outcome.running.length - MAX_NAMED_CONTAINERS;
     const names = more > 0 ? `${shown} and ${more} more` : shown;
+    const head = outcome.afterTrim ? 'Containers started while free space was being trimmed' : 'Containers are running';
     return {
       ok: false,
       lines: [
-        `Containers are running: ${names}. Compacting stops the machine, which would stop them too. ` +
+        `${head}: ${names}. Compacting stops the machine, which would stop them too. ` +
           'Stop them, then re-run `clustercode machine compact`.',
+        ...neverStopped,
       ],
     };
   }

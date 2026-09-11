@@ -14,6 +14,8 @@ const TARGET = { machine: 'dev', distro: 'podman-dev', vhdxPath: 'D:\\wsl\\dev\\
 
 interface FakeOptions {
   running?: string[] | null;
+  /** What the check right before stopping sees; defaults to `running`. */
+  runningAfterTrim?: string[] | null;
   fstrimOk?: boolean;
   releasedAfterProbes?: number;
   elevation?: ElevationResult;
@@ -36,8 +38,15 @@ function fakeRunner(opts: FakeOptions = {}) {
   let size = 70 * GB;
   let free = 32 * GB;
   let compacted = false;
+  let runningChecks = 0;
   const runner: CompactRunner = {
-    runningContainers: async () => (calls.push('runningContainers'), opts.running === undefined ? [] : opts.running),
+    runningContainers: async () => {
+      calls.push('runningContainers');
+      runningChecks++;
+      const first = opts.running === undefined ? [] : opts.running;
+      if (runningChecks === 1) return first;
+      return opts.runningAfterTrim === undefined ? first : opts.runningAfterTrim;
+    },
     fstrim: async (machine) => (calls.push(`fstrim ${machine}`), { ok: opts.fstrimOk ?? true, output: '/: 10 GiB trimmed' }),
     machineStop: async (machine) => {
       calls.push(`machineStop ${machine}`);
@@ -86,15 +95,30 @@ describe('compactVhdx', () => {
   it('refuses while containers are running, and touches nothing else', async () => {
     const { runner, calls } = fakeRunner({ running: ['devbox-1'] });
     const outcome = await compactVhdx(TARGET, runner, quiet);
-    assert.deepEqual(outcome, { kind: 'blocked', running: ['devbox-1'] });
+    assert.deepEqual(outcome, { kind: 'blocked', running: ['devbox-1'], afterTrim: false });
     assert.deepEqual(calls, ['runningContainers']);
   });
 
   it('refuses when the engine cannot say what is running', async () => {
     const { runner, calls } = fakeRunner({ running: null });
     const outcome = await compactVhdx(TARGET, runner, quiet);
-    assert.deepEqual(outcome, { kind: 'blocked', running: null });
+    assert.deepEqual(outcome, { kind: 'blocked', running: null, afterTrim: false });
     assert.deepEqual(calls, ['runningContainers']);
+  });
+
+  it('checks again right before stopping, and never stops for a container that started during the trim', async () => {
+    const { runner, calls } = fakeRunner({ running: [], runningAfterTrim: ['late-devbox'] });
+    const outcome = await compactVhdx(TARGET, runner, quiet);
+    assert.deepEqual(outcome, { kind: 'blocked', running: ['late-devbox'], afterTrim: true });
+    // Never stopped, so there is nothing to start again.
+    assert.deepEqual(calls, ['runningContainers', 'fstrim dev', 'runningContainers']);
+  });
+
+  it('never stops when the engine stops answering during the trim', async () => {
+    const { runner, calls } = fakeRunner({ running: [], runningAfterTrim: null });
+    const outcome = await compactVhdx(TARGET, runner, quiet);
+    assert.deepEqual(outcome, { kind: 'blocked', running: null, afterTrim: true });
+    assert.ok(!calls.some((c) => c.startsWith('machineStop') || c.startsWith('machineStart')));
   });
 
   it('runs fstrim, stop, terminate, wait, elevate, start — in that order', async () => {
@@ -103,6 +127,7 @@ describe('compactVhdx', () => {
     assert.deepEqual(calls, [
       'runningContainers',
       'fstrim dev',
+      'runningContainers',
       'machineStop dev',
       'wslTerminate podman-dev',
       `probe ${TARGET.vhdxPath}`,
@@ -246,14 +271,30 @@ describe('describeCompactOutcome', () => {
   });
 
   it('names running containers when blocked, capped to a few', () => {
-    const d = describeCompactOutcome({ kind: 'blocked', running: ['a', 'b', 'c', 'd', 'e', 'f', 'g'] }, target);
+    const d = describeCompactOutcome(
+      { kind: 'blocked', running: ['a', 'b', 'c', 'd', 'e', 'f', 'g'], afterTrim: false },
+      target,
+    );
     assert.equal(d.ok, false);
     assert.match(d.lines[0], /a, b, c, d, e and 2 more/);
   });
 
   it('explains a block when the engine could not be asked', () => {
-    const d = describeCompactOutcome({ kind: 'blocked', running: null }, target);
+    const d = describeCompactOutcome({ kind: 'blocked', running: null, afterTrim: false }, target);
     assert.match(d.lines[0], /Could not ask Podman/);
+  });
+
+  it('says the machine was never stopped when the block came after the trim', () => {
+    const late = describeCompactOutcome({ kind: 'blocked', running: ['late'], afterTrim: true }, target);
+    assert.equal(late.ok, false);
+    assert.match(late.lines.join('\n'), /late/);
+    assert.match(late.lines.join('\n'), /never stopped/);
+    assert.match(late.lines.join('\n'), /nothing needs restarting/i);
+    assert.doesNotMatch(late.lines.join('\n'), /started again/);
+
+    const silent = describeCompactOutcome({ kind: 'blocked', running: null, afterTrim: true }, target);
+    assert.match(silent.lines.join('\n'), /Could not ask Podman/);
+    assert.match(silent.lines.join('\n'), /never stopped/);
   });
 
   it('fails every non-success outcome, saying the machine was restarted', () => {

@@ -75,7 +75,7 @@ async function runCompact(options: { yes?: boolean }): Promise<number> {
 
   const running = runningContainers('podman');
   if (running === null || running.length > 0) {
-    const { lines } = describeCompactOutcome({ kind: 'blocked', running }, target);
+    const { lines } = describeCompactOutcome({ kind: 'blocked', running, afterTrim: false }, target);
     clack.log.error(lines.join('\n'));
     clack.outro('Nothing was changed.');
     return 1;
