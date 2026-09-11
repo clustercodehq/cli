@@ -6,6 +6,7 @@ import type { MachineProvider } from './runtime-memory.js';
 import { memoryKnob } from './memory-knob.js';
 import {
   patchWslConfigEntries,
+  readWslConfigEntry,
   wslMemoryEntry,
   WSL_RECLAIM_ENTRY,
   type WslEntry,
@@ -160,11 +161,22 @@ export function applyWslEntries(entries: WslEntry[]): { ok: boolean; error?: str
           : read.error,
     };
   }
+  const patched = patchWslConfigEntries(read.text, entries);
+  // The patcher edits lines; WSL reads the file with its own grammar, where the
+  // first occurrence of a key wins and a malformed header does not end a
+  // section. On a file where those disagree, a write WSL would never act on is
+  // worse than none, so check the result the way WSL will read it.
+  if (entries.some((e) => readWslConfigEntry(patched, e.section, e.key) !== e.value)) {
+    return {
+      ok: false,
+      error: `WSL would not read the new setting from ${path} as it is laid out. Set ${manualInstruction(entries)} manually.`,
+    };
+  }
   try {
     if (read.text !== null && !existsSync(`${path}.bak`)) {
       copyFileSync(path, `${path}.bak`);
     }
-    writeFileSync(path, patchWslConfigEntries(read.text, entries), 'utf-8');
+    writeFileSync(path, patched, 'utf-8');
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };

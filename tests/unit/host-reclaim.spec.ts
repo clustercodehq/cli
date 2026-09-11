@@ -161,6 +161,35 @@ describe('resolveHostReclaim', () => {
     );
   });
 
+  // What WSL's parser makes of the line, not what the line looks like.
+  describe('.wslconfig read the way WSL reads it', () => {
+    const cases: [string, string, string][] = [
+      ['a disabled value with a # comment', '[experimental]\nautoMemoryReclaim=disabled # off for now\n', 'off'],
+      ['a quoted disabled value', '[experimental]\nautoMemoryReclaim="disabled"\n', 'off'],
+      ['gradual, then disabled: the first wins', '[experimental]\nautoMemoryReclaim=gradual\nautoMemoryReclaim=disabled\n', 'configured'],
+      ['disabled, then gradual: the first wins', '[experimental]\nautoMemoryReclaim=disabled\nautoMemoryReclaim=gradual\n', 'off'],
+      [
+        'disabled in a repeated [experimental] section',
+        '[experimental]\nsparseVhd=true\n[wsl2]\nmemory=8GB\n[experimental]\nautoMemoryReclaim=disabled\n',
+        'off',
+      ],
+    ];
+    for (const [label, text, status] of cases) {
+      test(`${label} is ${status}`, () => {
+        assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, null), status);
+      });
+    }
+
+    // Measured under real gradual, stamped gradual: a "gradual # note" line must
+    // not read as the default dropcache, or a later edit to the default would
+    // inherit a verdict nobody measured.
+    test('a gradual value with a # comment keeps a gradual verdict', () => {
+      const text = '[experimental]\nautoMemoryReclaim=gradual   # recommended\n';
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, verdict({ mode: 'gradual' })), 'verified');
+      assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, verdict({ mode: 'dropcache' })), 'configured');
+    });
+  });
+
   test('an explicitly disabled value is off, not verified', () => {
     assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DISABLED, WSL_2, null), 'off');
     assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DISABLED, WSL_2_0, null), 'off');
@@ -179,7 +208,7 @@ describe('resolveHostReclaim', () => {
       ['no file at all', null],
       ['a file with only a sized [wsl2] section — the observed shape', '[wsl2]\nmemory=25600MB\nguiApplications=false\n'],
       ['a commented-out setting', '[experimental]\n;autoMemoryReclaim=gradual\n'],
-      ['the setting in the wrong section — [wsl2] does not carry it', '[wsl2]\nautoMemoryReclaim=gradual\n'],
+      ['the setting in the wrong section — WSL knows it only as experimental.autoMemoryReclaim', '[wsl2]\nautoMemoryReclaim=gradual\n'],
     ];
 
     for (const [label, text] of noKey) {

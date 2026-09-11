@@ -206,3 +206,36 @@ describe('applyWslEntries', () => {
     });
   });
 });
+
+describe('applyWslEntries layout guard', () => {
+  // The patcher takes "[ experimental ]" for the section; WSL rejects that
+  // header, so the line written under it would never be read, and WSL would go
+  // on acting on the "disabled" further down.
+  test('refuses a write WSL would not read, and leaves the file untouched', () => {
+    withTempHome(() => {
+      const path = wslConfigPath();
+      const original = '[ experimental ]\nsparseVhd=true\n\n[experimental]\nautoMemoryReclaim=disabled\n';
+      writeFileSync(path, original, 'utf-8');
+
+      const result = applyWslEntries([WSL_RECLAIM_ENTRY]);
+
+      assert.equal(result.ok, false);
+      assert.match(result.error!, /WSL would not read the new setting/);
+      assert.match(result.error!, /\[experimental\] autoMemoryReclaim=gradual/);
+      assert.equal(readFileSync(path, 'utf-8'), original);
+      assert.equal(existsSync(`${path}.bak`), false);
+    });
+  });
+
+  test('writes over a disabled value that carries a comment', () => {
+    withTempHome(() => {
+      const path = wslConfigPath();
+      writeFileSync(path, '[experimental]\nautoMemoryReclaim=disabled # off for now\n', 'utf-8');
+
+      const result = applyWslEntries([WSL_RECLAIM_ENTRY]);
+
+      assert.equal(result.ok, true);
+      assert.equal(readFileSync(path, 'utf-8'), '[experimental]\nautoMemoryReclaim=gradual\n');
+    });
+  });
+});

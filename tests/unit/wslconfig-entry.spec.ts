@@ -179,6 +179,77 @@ describe('readWslConfigEntry', () => {
     assert.equal(readWslConfigEntry(null, 'experimental', 'autoMemoryReclaim'), null);
   });
 
+  // The cases below follow WSL's own parser (src/shared/configfile/configfile.cpp).
+  const reclaim = (text: string) => readWslConfigEntry(text, 'experimental', 'autoMemoryReclaim');
+
+  test('an unquoted # ends the value, and the spaces before it go', () => {
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=disabled # off for now\n'), 'disabled');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=gradual   # recommended\n'), 'gradual');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=disabled#tight\n'), 'disabled');
+  });
+
+  test('; is not a comment inside a value', () => {
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=disabled ; off for now\n'), 'disabled ; off for now');
+  });
+
+  test('quotes are dropped, and keep what is inside them', () => {
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim="disabled"\n'), 'disabled');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=" gradual"\n'), ' gradual');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim="dis#abled"\n'), 'dis#abled');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=dis"abl"ed\n'), 'disabled');
+  });
+
+  test('escapes are decoded, and a line ending in \\ continues', () => {
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=dis\\"abled\n'), 'dis"abled');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=dis\\\nabled\n'), 'disabled');
+  });
+
+  test('a line WSL rejects is skipped, not read', () => {
+    // Unterminated quote, unknown escape.
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim="disabled\n'), null);
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=dis\\abled\n'), null);
+    // The line after a rejected one is still read.
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim="disabled\nautoMemoryReclaim=gradual\n'), 'gradual');
+  });
+
+  test('the first occurrence wins, even when a later one says otherwise', () => {
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=gradual\nautoMemoryReclaim=disabled\n'), 'gradual');
+    assert.equal(reclaim('[experimental]\nautoMemoryReclaim=bogus\nautoMemoryReclaim=disabled\n'), 'bogus');
+    assert.equal(
+      reclaim('[experimental]\nautoMemoryReclaim=disabled\n[wsl2]\nmemory=8GB\n[experimental]\nautoMemoryReclaim=gradual\n'),
+      'disabled',
+    );
+  });
+
+  test('a repeated section carries on the same keys', () => {
+    assert.equal(reclaim('[experimental]\nsparseVhd=true\n[wsl2]\nmemory=8GB\n[experimental]\nautoMemoryReclaim=disabled\n'), 'disabled');
+  });
+
+  test('section and key names match in any case', () => {
+    assert.equal(reclaim('[Experimental]\nAUTOMEMORYRECLAIM=disabled\n'), 'disabled');
+  });
+
+  test('a header with spaces inside the brackets is no header', () => {
+    // Rejected before the name is read, so the key stays in the section above.
+    assert.equal(reclaim('[experimental]\n[ wsl2 ]\nautoMemoryReclaim=disabled\n'), 'disabled');
+    // Rejected after the name is read: the key gets a mangled name, and matches nothing.
+    assert.equal(reclaim('[experimental]\n[wsl2 ]\nautoMemoryReclaim=disabled\n'), null);
+    assert.equal(reclaim('[ experimental ]\nautoMemoryReclaim=disabled\n'), null);
+  });
+
+  test('a # comment may follow a header; a ; comment may not', () => {
+    assert.equal(reclaim('[experimental] # reclaim\nautoMemoryReclaim=disabled\n'), 'disabled');
+    assert.equal(reclaim('[wsl2]\n[experimental] ; reclaim\nautoMemoryReclaim=disabled\n'), null);
+  });
+
+  test('CRLF line endings and a byte-order mark read the same', () => {
+    assert.equal(reclaim('﻿[experimental]\r\nautoMemoryReclaim=disabled # off\r\n'), 'disabled');
+  });
+
+  test('a key outside any section is not in one', () => {
+    assert.equal(reclaim('autoMemoryReclaim=disabled\n'), null);
+  });
+
   test('reads back exactly what the patcher wrote', () => {
     const after = patchWslConfigEntries(OBSERVED_HOST, [wslMemoryEntry(23552), WSL_RECLAIM_ENTRY]);
     assert.equal(readWslConfigEntry(after, 'wsl2', 'memory'), '23552MB');
@@ -233,7 +304,10 @@ describe('effectiveReclaimMode', () => {
 
   test('the named modes, in any case, are those modes', () => {
     assert.equal(effectiveReclaimMode('gradual', V27), 'gradual');
-    assert.equal(effectiveReclaimMode(' Gradual ', V27), 'gradual');
+    assert.equal(effectiveReclaimMode('Gradual', V27), 'gradual');
+    // The parser has already trimmed what WSL trims; spaces kept inside quotes
+    // make it no mode at all, so WSL's default.
+    assert.equal(effectiveReclaimMode(' gradual', V27), 'dropcache');
     assert.equal(effectiveReclaimMode('dropCache', V27), 'dropcache');
     assert.equal(effectiveReclaimMode('DROPCACHE', [2, 0, 9, 0]), 'dropcache');
   });

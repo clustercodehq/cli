@@ -93,11 +93,12 @@ export type WslEffectiveReclaim = WslReclaimMode | 'off' | 'unknown';
  *   of `.wslconfig` on the strength of a missing key alone.
  */
 export function effectiveReclaimMode(value: string | null, version: number[] | null): WslEffectiveReclaim {
-  const requested = value?.trim().toLowerCase() ?? null;
+  // Not trimmed: the value is already what WSL's parser hands the enum lookup,
+  // and a quoted " gradual" is no mode to WSL.
+  const requested = value?.toLowerCase() ?? null;
   if (version !== null && !wslSupportsAutoMemoryReclaim(version)) return 'off';
   if (requested === 'disabled') return 'off';
-  const mode = reclaimModeOf(requested);
-  if (mode !== null) return mode;
+  if (requested === 'gradual' || requested === 'dropcache') return requested;
   if (version === null) return 'unknown';
   return versionAtLeast(version, WSL_DROPCACHE_DEFAULT_SINCE) ? 'dropcache' : 'off';
 }
@@ -193,35 +194,202 @@ export function patchWslConfigEntries(existing: string | null, entries: WslEntry
   return text ?? '';
 }
 
+const EOF = -1;
+const TAB = 0x09;
+const LF = 0x0a;
+const CR = 0x0d;
+const SPACE = 0x20;
+const QUOTE = 0x22;
+const HASH = 0x23;
+const EQUALS = 0x3d;
+const OPEN_BRACKET = 0x5b;
+const BACKSLASH = 0x5c;
+const CLOSE_BRACKET = 0x5d;
+
+const isHSpace = (ch: number) => ch === SPACE || ch === TAB;
+// The C runtime's isalpha/isalnum in the "C" locale: ASCII only.
+const isAlpha = (ch: number) => (ch >= 0x41 && ch <= 0x5a) || (ch >= 0x61 && ch <= 0x7a);
+const isAlnum = (ch: number) => isAlpha(ch) || (ch >= 0x30 && ch <= 0x39);
+// `static_cast<char>` of a UTF-16 code unit keeps its low byte.
+const narrow = (ch: number) => String.fromCharCode(ch & 0xff);
+
 /**
- * Raw value of a key in a section, or null when it is absent.
+ * Every value in a `.wslconfig`, read the way WSL reads it: a map from the
+ * lower-cased `section.key` name to the value WSL would act on.
  *
- * A commented-out line (`#` or `;`) is not a value: `;autoMemoryReclaim=gradual`
- * is no setting at all, and what that means is WSL's default, not the mode the
- * comment names.
+ * A line-for-line port of the parse path of `ParseConfigFile` and of
+ * `ConfigKey::Parse` in WSL's `src/shared/configfile/configfile.cpp` (the parse
+ * path is identical at tags 2.5.8 through 2.9.11, the published source), called
+ * the way the service reads `.wslconfig` (`src/windows/common/WslCoreConfig.cpp`:
+ * UTF-8 text mode, `CFG_SKIP_INVALID_LINES`). What that means in practice:
+ *
+ * - Only `#` starts a comment — a whole line, after a value, or after a section
+ *   header. `;` is not a comment character: `;key=value` is an invalid line,
+ *   skipped, and `key=value ; note` keeps `; note` in the value.
+ * - A section header is `[` + a letter + letters or digits + `]`, nothing else;
+ *   a key is a letter + letters or digits, then `=`. Spaces are allowed around
+ *   `=` and before a line, not inside the brackets. Anything else is an invalid
+ *   line and is skipped — and an invalid header does not end the section before
+ *   it, so the keys below it keep that section's name (or a mangled one, which
+ *   matches no key at all).
+ * - In a value, `"` toggles quoting and is dropped, `\` escapes `\ " b n t` and
+ *   joins a line ending in `\`, and an unquoted `#` ends it; trailing unquoted
+ *   spaces are trimmed. An unterminated quote or unknown escape skips the line.
+ * - Section and key names match case-insensitively (`strcasecmp`).
+ * - The FIRST occurrence of a known key wins, across repeated sections too, even
+ *   when WSL then rejects its value: `ConfigKey::Parse` warns about and ignores
+ *   every later one. Every key this CLI reads is one WSL knows.
+ *
+ * A Ctrl+Z byte, which the C runtime's text mode may treat as the end of the
+ * file, is not modelled; a `.wslconfig` has no business carrying one.
+ */
+export function readWslConfigValues(text: string | null): Map<string, string> {
+  const values = new Map<string, string>();
+  if (!text) return values;
+  // Text mode folds CRLF to LF, and `ccs=UTF-8` consumes a byte-order mark.
+  const src = text.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  let pos = 0;
+  let atEof = false;
+  const get = (): number => {
+    if (pos < src.length) return src.charCodeAt(pos++);
+    atEof = true;
+    return EOF;
+  };
+  const unget = (ch: number) => {
+    if (ch !== EOF) pos--;
+  };
+
+  let ch = 0;
+  // Starts as a one-NUL string, exactly as `std::string key = {0}` does.
+  let key = '\0';
+  let sectionLength = 0;
+
+  type State = 'newline' | 'section' | 'keyValue' | 'invalid';
+  let state: State = 'newline';
+
+  for (;;) {
+    if (state === 'newline') {
+      // Skip any pending comment.
+      if (ch === HASH) {
+        do {
+          ch = get();
+          if (ch === CR) ch = get();
+        } while (ch !== LF && ch !== EOF);
+      }
+      if (atEof) return values;
+      do ch = get();
+      while (isHSpace(ch));
+      if (ch === EOF || ch === LF || ch === HASH) continue;
+      if (ch === CR) {
+        const next = get();
+        if (next !== LF) unget(next);
+        continue;
+      }
+      if (ch === OPEN_BRACKET) state = 'section';
+      else state = isAlpha(ch) ? 'keyValue' : 'invalid';
+      continue;
+    }
+
+    if (state === 'section') {
+      ch = get();
+      if (!isAlpha(ch)) {
+        state = 'invalid';
+        continue;
+      }
+      key = '';
+      do {
+        key += narrow(ch);
+        ch = get();
+      } while (isAlnum(ch));
+      if (ch !== CLOSE_BRACKET) {
+        state = 'invalid';
+        continue;
+      }
+      do ch = get();
+      while (isHSpace(ch));
+      if (ch !== EOF && ch !== LF && ch !== CR && ch !== HASH) {
+        state = 'invalid';
+        continue;
+      }
+      sectionLength = key.length;
+      state = 'newline';
+      continue;
+    }
+
+    if (state === 'keyValue') {
+      // `std::string::resize` truncates, or pads with NULs.
+      key = key.slice(0, sectionLength).padEnd(sectionLength, '\0');
+      if (key.length > 0) key += '.';
+      do {
+        key += narrow(ch);
+        ch = get();
+      } while (isAlnum(ch));
+      while (isHSpace(ch)) ch = get();
+      if (ch !== EQUALS) {
+        state = 'invalid';
+        continue;
+      }
+      do ch = get();
+      while (isHSpace(ch));
+
+      let value = '';
+      let trimmedLength = 0;
+      let inQuote = false;
+      let invalid = false;
+      value: while (ch !== EOF && ch !== LF && ch !== CR) {
+        switch (ch) {
+          case QUOTE:
+            inQuote = !inQuote;
+            break;
+          case BACKSLASH: {
+            const ch2 = get();
+            if (ch2 === BACKSLASH || ch2 === QUOTE) value += narrow(ch2);
+            else if (ch2 === 0x62) value += '\b';
+            else if (ch2 === 0x6e) value += '\n';
+            else if (ch2 === 0x74) value += '\t';
+            else if (ch2 !== CR && ch2 !== LF) {
+              invalid = true;
+              break value;
+            }
+            break;
+          }
+          case HASH:
+            if (!inQuote) break value;
+            value += narrow(ch);
+            break;
+          default:
+            value += narrow(ch);
+        }
+        if (!isHSpace(ch)) trimmedLength = value.length;
+        ch = get();
+      }
+      if (invalid || inQuote) {
+        state = 'invalid';
+        continue;
+      }
+      // `SetConfig` looks the key up by its C string: up to the first NUL.
+      const name = key.split('\0')[0].toLowerCase();
+      if (!values.has(name)) values.set(name, value.slice(0, trimmedLength));
+      state = 'newline';
+      continue;
+    }
+
+    // Invalid line: skipped to its end.
+    while (ch !== EOF && ch !== LF) ch = get();
+    state = 'newline';
+  }
+}
+
+/**
+ * The value WSL acts on for a key in a section, or null when there is none.
+ * See `readWslConfigValues` for how WSL reads the file.
  */
 export function readWslConfigEntry(
   existing: string | null,
   section: WslSection,
   key: string,
 ): string | null {
-  if (!existing) return null;
-
-  const lines = existing.split(/\r?\n/);
-  const isHeader = sectionHeaderMatcher(section);
-  const isKey = keyMatcher(key);
-
-  const headerIdx = lines.findIndex(isHeader);
-  if (headerIdx === -1) return null;
-
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (isSectionHeader(line)) break;
-    if (/^\s*[;#]/.test(line)) continue;
-    if (!isKey(line)) continue;
-    return line.slice(line.indexOf('=') + 1).trim();
-  }
-  return null;
+  return readWslConfigValues(existing).get(`${section}.${key}`.toLowerCase()) ?? null;
 }
 
 /**
