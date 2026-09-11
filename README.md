@@ -70,6 +70,10 @@ unused space the machine's virtual disk holds:
 ⚠ Runtime disk: 70.8 GB on host, 43.0 GB used inside — ~27.8 GB reclaimable (C: 32.0 GB free); run `clustercode machine compact`
 ```
 
+It measures the default Podman machine, or the first one listed when none is
+set as the default. When there are several machines, the line names the one it
+measured: `Runtime disk (machine dev): …`.
+
 It warns when at least 5 GB could be reclaimed **and** that is at least a
 quarter of the drive's free space — 20 GB matters with 30 GB free, not with
 500 GB free. It never fails, and shows no line on macOS, Linux, Docker, or a
@@ -208,15 +212,28 @@ that unused space to Windows:
    every WSL distribution on the computer.
 3. Waits (up to 3 minutes) for WSL's utility VM to release the disk.
 4. Compacts the disk with `diskpart`. This asks for administrator approval once.
-   The disk is detached afterwards even if compacting fails.
+   The disk is detached afterwards even if compacting fails, after the
+   15-second pause Microsoft recommends between `diskpart` runs.
 5. Starts the machine again — on every path once it was stopped, including a
    declined approval, a failure or a timeout. Every step has a time limit, so
    the restart is never left waiting on a step that hangs.
 
+It acts on one machine: the default Podman machine, or the first one listed
+when none is set as the default. It names that machine first, and when there
+are several it says why that one, for example
+`Podman machine: dev (the default of 3 machines)`.
+
 It shows the reclaimable space and the full plan, then asks before stopping
 anything. Pass `--yes` to skip the question (Windows still asks for
 administrator approval). It reports the disk size and the drive's free space
-before and after, and says so when compacting returned no space.
+before and after.
+
+When compacting returns no space, or the disk cannot be measured afterwards, it
+shows a warning rather than a success, followed by the end of `diskpart`'s
+output. No space is expected when there was nothing to reclaim, but `diskpart`'s
+error messages are only recognised in English: on a Windows display language
+other than English, check that output to tell a failed compact from a disk that
+was already compact.
 
 It refuses to run while any container is running, or when it cannot ask Podman
 what is running; it checks again right before stopping the machine, after the
@@ -229,12 +246,18 @@ has no short 8.3 name for it, the command refuses before stopping anything.
 
 If other WSL distributions keep the utility VM alive, the command names them
 and the `wsl --terminate` command for each, and changes nothing. The disk is
-never converted to a sparse VHDX: sparse disks cannot be compacted this way,
-and the change cannot be undone.
+never converted to a sparse VHDX: Windows cannot compact a sparse disk this
+way, and some WSL releases have disabled sparse mode because of a
+data-corruption risk.
 
-It exits non-zero when it refuses, when approval is declined, when the disk is
-not released in time, when compacting fails (including a `diskpart` error that
-still exits 0), and on any other platform. Pressing Ctrl+C does not abandon a
+It exits 0 when the disk was compacted and the machine started again, including
+the warning above, and when you answer no at the confirmation prompt, which
+prints "Cancelled — nothing was changed." It exits non-zero when it refuses,
+when administrator approval is declined at the Windows prompt or cannot be
+given, when the disk is not released in time, when compacting fails (including
+a recognised `diskpart` error message after an exit code of 0), when the
+machine does not start again, when it needs to ask but has no terminal (pass
+`--yes`), and on any other platform. Pressing Ctrl+C does not abandon a
 compact half-way: the command carries on to the restart and reports the result.
 
 ## Configuration files

@@ -30,8 +30,9 @@ import {
  *      repeated in a PowerShell `finally`, so the disk is never left attached.
  *   5. Start the machine again — on every path, including failures.
  *
- * The disk is never made sparse: sparse VHDXs cannot be compacted with diskpart
- * and the setting cannot be undone.
+ * The disk is never made sparse: Windows cannot compact a sparse VHDX with
+ * diskpart (Optimize-VHD refuses one too), and some WSL releases have disabled
+ * sparse mode because of a data-corruption risk.
  */
 
 /** In-machine trim, as ONE string: `podman machine ssh` re-parses its argv in the guest shell. */
