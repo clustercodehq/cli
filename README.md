@@ -209,17 +209,23 @@ that unused space to Windows:
 3. Waits (up to 3 minutes) for WSL's utility VM to release the disk.
 4. Compacts the disk with `diskpart`. This asks for administrator approval once.
    The disk is detached afterwards even if compacting fails.
-5. Starts the machine again — on every path, including a declined approval or
-   a failure.
+5. Starts the machine again — on every path once it was stopped, including a
+   declined approval, a failure or a timeout. Every step has a time limit, so
+   the restart is never left waiting on a step that hangs.
 
 It shows the reclaimable space and the full plan, then asks before stopping
 anything. Pass `--yes` to skip the question (Windows still asks for
 administrator approval). It reports the disk size and the drive's free space
-before and after.
+before and after, and says so when compacting returned no space.
 
 It refuses to run while any container is running, or when it cannot ask Podman
-what is running. Stopped containers also hold space inside the machine, which
-compacting does not return; stopped DevBoxes can be cleaned up in the console.
+what is running; it checks again right before stopping the machine, after the
+trim. Stopped containers also hold space inside the machine, which compacting
+does not return; stopped DevBoxes can be cleaned up in the console.
+
+`diskpart` reads the disk's path in the system's OEM code page. If the path has
+characters outside it (for example, a user name in another script) and Windows
+has no short 8.3 name for it, the command refuses before stopping anything.
 
 If other WSL distributions keep the utility VM alive, the command names them
 and the `wsl --terminate` command for each, and changes nothing. The disk is
@@ -227,7 +233,9 @@ never converted to a sparse VHDX: sparse disks cannot be compacted this way,
 and the change cannot be undone.
 
 It exits non-zero when it refuses, when approval is declined, when the disk is
-not released in time, when compacting fails, and on any other platform.
+not released in time, when compacting fails (including a `diskpart` error that
+still exits 0), and on any other platform. Pressing Ctrl+C does not abandon a
+compact half-way: the command carries on to the restart and reports the result.
 
 ## Configuration files
 
