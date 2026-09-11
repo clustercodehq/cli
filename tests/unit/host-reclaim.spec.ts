@@ -334,14 +334,18 @@ describe('resolveHostReclaim', () => {
     assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_1, null), 'unsupported');
   });
 
-  test('an unreadable version is treated as unsupported, not as verified', () => {
-    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, null, verdict()), 'unsupported');
+  // Not 'unsupported': that would say the build predates the setting, and all
+  // that is known is that its version could not be read.
+  test('an unreadable version is version-unknown, not unsupported and not verified', () => {
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, null, verdict()), 'version-unknown');
+    assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', RECLAIM_ON, null, null), 'version-unknown');
   });
 
   // Without a version the default cannot be known, so a missing key must not
   // read as off — off is what invites a rewrite of .wslconfig.
   test('an unreadable version with no key is never off', () => {
-    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, null, null), 'unsupported');
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', null, null, null), 'version-unknown');
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', DISABLED, null, null), 'version-unknown');
   });
 });
 

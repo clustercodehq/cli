@@ -57,6 +57,11 @@ export type HostReclaimStatus =
   | 'off'
   /** This WSL build predates the setting. */
   | 'unsupported'
+  /**
+   * `wsl --version` could not be read, so neither whether the build has the
+   * setting nor what its default is can be told. Sized as if it does not work.
+   */
+  | 'version-unknown'
   /** No such knob here — another VM backend, or no VM at all. */
   | 'n/a';
 
@@ -127,9 +132,10 @@ export function resolveHostReclaim(
   // all, so reporting its reclaim state from that file would be a fiction.
   if (provider !== undefined && provider !== 'wsl' && provider !== 'unknown') return 'n/a';
   if (engineName !== 'podman' && engineName !== 'docker') return 'n/a';
-  // Also where an unreadable version lands (the inbox WSL has no `--version`,
-  // and predates the setting) — never 'off', so a missing key alone cannot
-  // invite a rewrite of .wslconfig.
+  // Never 'off' (or 'unsupported', which says more than is known), so a missing
+  // key alone cannot invite a rewrite of .wslconfig. The inbox WSL, which has no
+  // `--version`, lands here too.
+  if (wslVersion === null) return 'version-unknown';
   if (!wslSupportsAutoMemoryReclaim(wslVersion)) return 'unsupported';
 
   const mode = effectiveReclaimMode(
@@ -139,16 +145,15 @@ export function resolveHostReclaim(
   // The setting wins over the verdict: a measurement of a feature that is no
   // longer switched on says nothing about the machine as it stands today.
   if (mode === 'off') return 'off';
-  // Unreachable while an unreadable version is 'unsupported' above; kept so a
-  // default nobody can confirm is never reported as either on or off.
-  if (mode === 'unknown') return 'unsupported';
+  // Unreachable while an unreadable version returns above; kept so a default
+  // nobody can confirm is never reported as either on or off.
+  if (mode === 'unknown') return 'version-unknown';
 
   // Only a verdict about *this* VM counts. The measurement runs against a
   // Podman machine on the WSL backend; Docker's VM is never measured, and a
   // backend that could not be identified may not be a WSL VM at all.
   if (engineName !== 'podman' || provider !== 'wsl') return 'configured';
-  // `wslVersion` is non-null here: a null one returned 'unsupported' above.
-  const unverified: HostReclaimStatus = reclaimMeasurable(mode, wslVersion ?? []) ? 'configured' : 'unmeasurable';
+  const unverified: HostReclaimStatus = reclaimMeasurable(mode, wslVersion) ? 'configured' : 'unmeasurable';
   if (verdict === null) return unverified;
   // A verdict measured against a different WSL, or under a different mode,
   // re-opens the question rather than settling it: this behaviour is a property

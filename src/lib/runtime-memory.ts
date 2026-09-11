@@ -300,7 +300,7 @@ export interface RuntimeMemoryReading {
   /**
    * Whether the VM returns memory to the host while it runs. Only `'verified'`
    * — configured *and* measured to work on this host — is sized optimistically;
-   * `'configured'`, `'inert'`, `'off'`, `'unsupported'` and an absent value are
+   * every other status, and an absent value, are
    * all graded the same, because a recommendation built on an assumption of
    * reclaim that turns out to be wrong is the exact shape of the failure this
    * field was added for.
@@ -419,6 +419,11 @@ function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): { text
 
   if (reclaim === 'unsupported') {
     const base = ' — memory reclaim needs WSL 2.0 or newer, so the runtime keeps everything it touches';
+    return { warn: true, text: oversized ? `${base}; ${lower}` : base };
+  }
+
+  if (reclaim === 'version-unknown') {
+    const base = ' — could not read the WSL version (`wsl --version`), so memory reclaim cannot be counted on';
     return { warn: true, text: oversized ? `${base}; ${lower}` : base };
   }
 

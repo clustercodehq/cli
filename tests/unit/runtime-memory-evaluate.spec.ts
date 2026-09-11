@@ -502,6 +502,17 @@ describe('memory reclaim', () => {
     assert.doesNotMatch(r.detail, /lower/);
   });
 
+  test('an unreadable WSL version says so, and still names the no-reclaim ceiling', () => {
+    const above = wsl({ reclaim: 'version-unknown', engine: { memTotalBytes: 26624 * MIB, cpus: 8 } });
+    assert.equal(above.status, 'warn');
+    assert.match(above.detail, /could not read the WSL version/);
+    assert.match(above.detail, /clustercode onboard --memory 24576/);
+    assert.doesNotMatch(above.detail, /WSL 2\.0|verify-reclaim/);
+
+    const within = wsl({ reclaim: 'version-unknown', engine: { memTotalBytes: 8192 * MIB, cpus: 8 } });
+    assert.doesNotMatch(within.detail, /lower|WSL 2\.0/);
+  });
+
   test('a Hyper-V backend is never told about a WSL setting', () => {
     const r = wsl({ reclaim: 'n/a', provider: 'hyperv' });
     assert.doesNotMatch(r.detail, /reclaim|autoMemoryReclaim/);

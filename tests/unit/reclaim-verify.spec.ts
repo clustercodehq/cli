@@ -370,6 +370,12 @@ describe('reclaimVerificationRefusal', () => {
     assert.match(reclaimVerificationRefusal({ ...ok, status: 'unsupported' }) ?? '', /WSL 2\.0/);
   });
 
+  test('refuses when the WSL version could not be read, and says so rather than blaming the build', () => {
+    const refusal = reclaimVerificationRefusal({ ...ok, status: 'version-unknown' }) ?? '';
+    assert.match(refusal, /Could not read the WSL version/);
+    assert.doesNotMatch(refusal, /WSL 2\.0/);
+  });
+
   // No advice to switch modes: that would measure a setting the user did not choose.
   test('refuses dropcache on a WSL build whose reclaim loop cannot be measured', () => {
     const refusal = reclaimVerificationRefusal({ ...ok, status: 'unmeasurable' }) ?? '';

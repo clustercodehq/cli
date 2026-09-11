@@ -162,6 +162,14 @@ describe('evaluateHostMemory', () => {
     }
   });
 
+  test('says the WSL version could not be read, rather than that it is too old', () => {
+    const r = evaluateHostMemory(
+      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'version-unknown' }),
+    );
+    assert.match(r.detail, /memory reclaim cannot be checked, because the WSL version could not be read/);
+    assert.doesNotMatch(r.detail, /WSL 2\.0/);
+  });
+
   test('says reclaim needs a newer WSL when the build predates it', () => {
     const r = evaluateHostMemory(
       reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'unsupported' }),

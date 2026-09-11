@@ -90,6 +90,7 @@ describe('runReclaimVerification', () => {
     ['reclaim off', { engineName: 'podman', provider: 'wsl', status: 'off' }],
     ['WSL too old', { engineName: 'podman', provider: 'wsl', status: 'unsupported' }],
     ['dropcache before WSL 2.9.8', { engineName: 'podman', provider: 'wsl', status: 'unmeasurable' }],
+    ['WSL version unreadable', { engineName: 'podman', provider: 'wsl', status: 'version-unknown' }],
     ['Docker', { engineName: 'docker', provider: 'wsl', status: 'configured' }],
     ['Hyper-V', { engineName: 'podman', provider: 'hyperv', status: 'n/a' }],
     ['unknown backend', { engineName: 'podman', provider: 'unknown', status: 'configured' }],
@@ -258,7 +259,7 @@ describe('storedSizeAboveNoReclaimCeiling', () => {
   // A size chosen while reclaim was verified outlives the verdict that justified
   // it: a WSL update re-opens the question, but the stored number stays.
   test('names the ceiling when a stored size is above it and reclaim is not verified', () => {
-    for (const status of ['configured', 'unmeasurable', 'inert', 'off', 'unsupported'] as const) {
+    for (const status of ['configured', 'unmeasurable', 'inert', 'off', 'unsupported', 'version-unknown'] as const) {
       assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status }), 24576, status);
     }
   });
@@ -289,7 +290,7 @@ describe('reclaimNeedsTurningOn', () => {
   // A default install on WSL 2.1.3+ resolves to 'configured' (dropcache in
   // effect), as does an explicit mode: neither is offered a rewrite.
   test('not offered where a mode is already in effect, or cannot be', () => {
-    for (const status of ['configured', 'unmeasurable', 'verified', 'inert', 'unsupported', 'n/a'] as const) {
+    for (const status of ['configured', 'unmeasurable', 'verified', 'inert', 'unsupported', 'version-unknown', 'n/a'] as const) {
       assert.equal(reclaimNeedsTurningOn({ ...base, status }), false, status);
     }
   });
@@ -322,6 +323,13 @@ describe('runtimeCeilingNote', () => {
     assert.match(runtimeCeilingNote('win32', 'configured') ?? '', /--verify-reclaim/);
     assert.match(runtimeCeilingNote('win32', 'verified') ?? '', /returned to Windows/);
     assert.match(runtimeCeilingNote('win32', 'inert') ?? '', /does not return memory/);
+  });
+
+  test('an unreadable WSL version says so, not that WSL is too old', () => {
+    const note = runtimeCeilingNote('win32', 'version-unknown') ?? '';
+    assert.match(note, /Could not read the WSL version/);
+    assert.match(note, /fully used/);
+    assert.doesNotMatch(note, /WSL 2\.0/);
   });
 
   // The measurement would only refuse, so the note must not send anyone to it.

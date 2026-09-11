@@ -194,6 +194,8 @@ function reclaimPhrase(reclaim: HostReclaimStatus): string | null {
       return 'is on but inert on this build';
     case 'unsupported':
       return 'needs WSL 2.0 or newer';
+    case 'version-unknown':
+      return 'cannot be checked, because the WSL version could not be read';
     case 'off':
       return 'is off';
     case 'n/a':

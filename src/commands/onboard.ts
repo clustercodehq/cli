@@ -1222,6 +1222,8 @@ export function runtimeCeilingNote(platform: NodeJS.Platform, reclaimStatus: Hos
       // machine set` gives a fixed amount of memory. It has no reclaim setting,
       // and `wsl --shutdown` does not stop it.
       return 'The Podman machine runs on Hyper-V, not WSL, and holds the whole amount while it runs, so treat this number as fully used.';
+    case 'version-unknown':
+      return 'Could not read the WSL version, so memory reclaim cannot be counted on — treat this number as fully used.';
     case 'off':
     case 'unsupported':
       return 'Without memory reclaim (WSL 2.0+), the runtime keeps everything it has touched until `wsl --shutdown`, so treat this number as fully used.';

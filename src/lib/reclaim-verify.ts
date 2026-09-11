@@ -343,6 +343,8 @@ export function reclaimVerificationRefusal(ctx: {
       return 'Memory reclaim is off, so there is nothing to measure. Run `clustercode onboard` to turn it on first.';
     case 'unsupported':
       return 'This WSL build predates memory reclaim (it needs WSL 2.0 or newer), so there is nothing to measure.';
+    case 'version-unknown':
+      return 'Could not read the WSL version (`wsl --version`), so a result could not be tied to a WSL build. Nothing was measured.';
     default:
       return 'Memory reclaim can only be measured for a Podman machine on the WSL backend.';
   }
