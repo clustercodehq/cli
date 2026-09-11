@@ -3,6 +3,7 @@ import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { augmentPathWithKnownEngineDirs } from '../lib/env-path.js';
 import { confirmPlan } from '../lib/consent.js';
+import { withInterruptNotice } from '../lib/interrupt.js';
 import { runningContainers, stoppedContainerCount } from '../lib/engine-containers.js';
 import { releaseStdin, restoreRawMode } from '../lib/tty.js';
 import {
@@ -117,19 +118,14 @@ async function runCompact(options: { yes?: boolean }): Promise<number> {
 
   // Once the machine is stopped, quitting half-way would leave it stopped (and
   // possibly under an attached disk). Ctrl+C is acknowledged, not obeyed.
-  const onInterrupt = (): void => {
-    clack.log.warn('Finishing safely first — the machine will be started again when this completes.');
-  };
-  process.on('SIGINT', onInterrupt);
-  let outcome;
-  try {
-    outcome = await compactVhdx(target, defaultCompactRunner(), {
-      step: (m) => clack.log.step(m),
-      warn: (m) => clack.log.warn(m),
-    });
-  } finally {
-    process.off('SIGINT', onInterrupt);
-  }
+  const outcome = await withInterruptNotice(
+    () =>
+      compactVhdx(target, defaultCompactRunner(), {
+        step: (m) => clack.log.step(m),
+        warn: (m) => clack.log.warn(m),
+      }),
+    () => clack.log.warn('Finishing safely first — the machine will be started again when this completes.'),
+  );
   const { ok, lines } = describeCompactOutcome(outcome, target);
 
   if (ok) {
