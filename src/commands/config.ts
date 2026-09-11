@@ -9,8 +9,79 @@ import {
   getAllowedConfigKeys,
   validateWorkerName,
   validateRuntimeMemoryMb,
+  validateReclaimVerified,
+  rememberReclaimVerdict,
   resetAllConfig,
 } from '../lib/config.js';
+import { currentReclaimMode, currentWslVersionStamp, type ReclaimVerdict } from '../lib/host-reclaim.js';
+import { reclaimMeasurable, versionFromStamp, type WslReclaimMode } from '../lib/wslconfig.js';
+
+export interface ManualVerdictDeps {
+  platform: NodeJS.Platform;
+  wslVersionStamp(): string | null;
+  reclaimMode(): WslReclaimMode | null;
+  remember(verdict: ReclaimVerdict & { mode: WslReclaimMode }): void;
+}
+
+const defaultManualVerdictDeps = (): ManualVerdictDeps => ({
+  platform: process.platform,
+  wslVersionStamp: currentWslVersionStamp,
+  reclaimMode: currentReclaimMode,
+  remember: rememberReclaimVerdict,
+});
+
+/**
+ * Record a reclaim verdict by hand.
+ *
+ * A verdict is only meaningful next to the WSL build and reclaim mode it
+ * describes, so recording one by hand stamps both, and refuses when either
+ * cannot be read: an unstamped verdict would be ignored at best, and at worst
+ * (as an earlier wildcard stamp was) trusted across every future build.
+ */
+export function recordManualReclaimVerdict(
+  value: string,
+  deps: ManualVerdictDeps = defaultManualVerdictDeps(),
+): { ok: boolean; message: string } {
+  const error = validateReclaimVerified(value);
+  if (error) return { ok: false, message: error };
+  // Checked before anything is spawned: there is no wsl.exe to ask elsewhere.
+  if (deps.platform !== 'win32') {
+    return {
+      ok: false,
+      message: 'Memory reclaim verification only applies to Windows with WSL. Nothing was recorded.',
+    };
+  }
+  const wslVersion = deps.wslVersionStamp();
+  if (wslVersion === null) {
+    return {
+      ok: false,
+      message:
+        'Could not read the WSL version (`wsl --version`), so the verdict cannot be tied to a WSL build. Nothing was recorded.',
+    };
+  }
+  const mode = deps.reclaimMode();
+  if (mode === null) {
+    return {
+      ok: false,
+      message:
+        'Memory reclaim is not in effect ([experimental] autoMemoryReclaim is disabled, is unset or unrecognised on WSL older than 2.1.3, or WSL is older than 2.0), or .wslconfig could not be read, so there is nothing for a verdict to describe. Nothing was recorded.',
+    };
+  }
+  const result = value.trim().toLowerCase() as 'yes' | 'no';
+  // The same 'no' the measurement refuses to record, and `doctor` would not use.
+  if (result === 'no' && !reclaimMeasurable(mode, versionFromStamp(wslVersion))) {
+    return {
+      ok: false,
+      message:
+        'On this WSL version (older than 2.9.8), dropcache mode drops the cache only after about 10 idle minutes, and only once per idle period, so a "no" cannot be told apart from a drop that had not come round yet. Nothing was recorded.',
+    };
+  }
+  deps.remember({ result, wslVersion, mode });
+  return {
+    ok: true,
+    message: `Set RUNTIME_RECLAIM_VERIFIED = ${result} (WSL ${wslVersion}, reclaim mode ${mode})`,
+  };
+}
 
 export const configCommand = new Command('config')
   .description('Manage ClusterCode CLI configuration');
@@ -43,6 +114,12 @@ configCommand
         process.exitCode = 1;
         return;
       }
+    }
+    if (key === 'RUNTIME_RECLAIM_VERIFIED') {
+      const outcome = recordManualReclaimVerdict(value);
+      console.log(`${outcome.ok ? pc.green('✓') : pc.red('✗')} ${outcome.message}`);
+      if (!outcome.ok) process.exitCode = 1;
+      return;
     }
     const config = readAppConfig();
     config[key] = value.trim();

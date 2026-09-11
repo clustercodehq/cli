@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { homedir, totalmem } from 'node:os';
+import { homedir, tmpdir, totalmem } from 'node:os';
 import { parse } from 'node:path';
 import {
   readCredentials,
@@ -11,9 +11,10 @@ import {
 } from './config.js';
 import { readInstalled } from './worker-binary.js';
 import { augmentPathWithKnownEngineDirs, resolveExecutable } from './env-path.js';
-import { checkRuntimeMemory } from './runtime-memory.js';
+import { checkRuntimeMemory, probeRuntime } from './runtime-memory.js';
+import { checkHostMemory } from './host-memory.js';
 
-export { checkRuntimeMemory };
+export { checkRuntimeMemory, checkHostMemory };
 
 export interface CheckResult {
   name: string;
@@ -54,10 +55,10 @@ export function decodeConsoleOutput(buf: Buffer): string {
   return buf.toString('utf-8');
 }
 
-function execSilent(cmd: string): string | null {
+function execSilent(cmd: string, timeoutMs?: number): string | null {
   try {
     // No `encoding` option, so this returns a Buffer we can decode ourselves.
-    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] })).trim();
+    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, cwd: tmpdir() })).trim();
   } catch {
     return null;
   }
@@ -72,7 +73,7 @@ function execSilent(cmd: string): string | null {
  */
 function execProbe(cmd: string): { ok: boolean; stderr: string } {
   try {
-    execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] });
+    execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], cwd: tmpdir() });
     return { ok: true, stderr: '' };
   } catch (err) {
     const e = err as { stderr?: Buffer | string };
@@ -412,10 +413,17 @@ export async function runAllChecks(): Promise<CheckResult[]> {
   }
 
   const containerRuntime = checkContainerRuntime();
+  // One round of probing for both memory checks: each is a process spawn, and
+  // they are slow enough on Windows to matter to a command run this often.
+  const runtimeProbe = probeRuntime(containerRuntime);
 
   results.push(
     containerRuntime,
-    checkRuntimeMemory(containerRuntime),
+    checkRuntimeMemory(containerRuntime, runtimeProbe),
+    // Immediately after it, deliberately: one line says what the runtime was
+    // promised and the next says what the host actually has left. Whether the
+    // reserve between them is real is the whole question.
+    checkHostMemory(containerRuntime, runtimeProbe),
     checkDiskSpace(),
     checkMemory(),
   );

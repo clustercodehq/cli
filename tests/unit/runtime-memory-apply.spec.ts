@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { planMemoryApply, runApplySteps } from '../../src/lib/runtime-memory-apply.js';
+import { planMemoryApply, planWslReclaimApply, runApplySteps } from '../../src/lib/runtime-memory-apply.js';
 
 describe('planMemoryApply', () => {
   test('uses .wslconfig on the WSL provider — podman flags are inert there', () => {
@@ -8,6 +8,33 @@ describe('planMemoryApply', () => {
     assert.equal(plan.kind, 'wslconfig');
     assert.ok(plan.steps.some((s) => /wsl --shutdown/.test(s)));
     assert.match(plan.warning!, /all WSL/i);
+  });
+
+  test('names the section each key goes in — two sections are now in play', () => {
+    const plan = planMemoryApply('wsl', 'win32', 'podman', 24576);
+    assert.equal(plan.steps[0], 'Set memory=24576MB in [wsl2] of .wslconfig');
+  });
+
+  test('adds the reclaim step only when asked for', () => {
+    const withReclaim = planMemoryApply('wsl', 'win32', 'podman', 24576, { reclaim: true });
+    assert.deepEqual(withReclaim.steps, [
+      'Set memory=24576MB in [wsl2] of .wslconfig',
+      'Set autoMemoryReclaim=gradual in [experimental] of .wslconfig',
+      'wsl --shutdown',
+      'podman machine start',
+    ]);
+    const without = planMemoryApply('wsl', 'win32', 'podman', 24576);
+    assert.ok(!without.steps.some((s) => /autoMemoryReclaim/.test(s)));
+    assert.deepEqual(planMemoryApply('wsl', 'win32', 'podman', 24576, { reclaim: false }).steps, without.steps);
+  });
+
+  test('the machine-set plan is untouched by the reclaim option — it is a WSL setting', () => {
+    const plan = planMemoryApply('applehv', 'darwin', 'podman', 8192, { reclaim: true });
+    assert.deepEqual(plan.steps, [
+      'podman machine stop',
+      'podman machine set --memory 8192',
+      'podman machine start',
+    ]);
   });
 
   test('uses podman machine set on applehv', () => {
@@ -62,6 +89,23 @@ describe('planMemoryApply', () => {
     assert.equal(plan.kind, 'unsupported');
     assert.match(plan.reason!, /no virtual machine/i);
     assert.doesNotMatch(plan.reason!, /Docker Desktop/);
+  });
+});
+
+// An install whose size is already right can still be holding the host's
+// memory, so reclaim has to be applicable on its own rather than only as a
+// rider on a resize.
+describe('planWslReclaimApply', () => {
+  test('sets only the reclaim key, and still restarts WSL for it to take effect', () => {
+    const plan = planWslReclaimApply();
+    assert.equal(plan.kind, 'wslconfig');
+    assert.deepEqual(plan.steps, [
+      'Set autoMemoryReclaim=gradual in [experimental] of .wslconfig',
+      'wsl --shutdown',
+      'podman machine start',
+    ]);
+    assert.ok(!plan.steps.some((s) => /memory=/.test(s)));
+    assert.match(plan.warning!, /all WSL/i);
   });
 });
 
