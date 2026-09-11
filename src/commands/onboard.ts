@@ -3,7 +3,7 @@ import * as clack from '@clack/prompts';
 import pc from 'picocolors';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { totalmem } from 'node:os';
+import { tmpdir, totalmem } from 'node:os';
 import {
   runAllChecks,
   checkContainerRuntime,
@@ -77,9 +77,14 @@ import {
 } from '../lib/engine-install.js';
 import { releaseStdin } from '../lib/tty.js';
 
+/**
+ * Every spawn in this file runs from the temp directory: `podman machine ssh`
+ * writes its known-hosts entry to a literal file named `NUL` in the working
+ * directory when an MSYS ssh, such as Git for Windows', is first on PATH.
+ */
 function execSilent(cmd: string, timeout?: number): string | null {
   try {
-    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout }).trim();
+    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout, cwd: tmpdir() }).trim();
   } catch {
     return null;
   }
@@ -119,7 +124,7 @@ export function classifyLinuxDistro(osRelease: string, hasDnf: boolean): LinuxDi
 
 function detectLinuxDistro(): LinuxDistro {
   try {
-    const osRelease = execSync('cat /etc/os-release', { encoding: 'utf-8' });
+    const osRelease = execSync('cat /etc/os-release', { encoding: 'utf-8', cwd: tmpdir() });
     return classifyLinuxDistro(osRelease, execSilent('command -v dnf') !== null);
   } catch {
     return 'unknown';
@@ -147,7 +152,7 @@ interface CommandOutcome {
 
 function runCommand(cmd: string): CommandOutcome {
   try {
-    execSync(cmd, { stdio: 'inherit' });
+    execSync(cmd, { stdio: 'inherit', cwd: tmpdir() });
     return { ok: true, code: 0 };
   } catch (err) {
     return { ok: false, code: (err as { status?: number }).status ?? 1 };
@@ -448,7 +453,7 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
   if (process.platform === 'darwin') {
     // Check if Homebrew is installed
     try {
-      execSync('which brew', { stdio: 'pipe' });
+      execSync('which brew', { stdio: 'pipe', cwd: tmpdir() });
     } catch {
       clack.log.warn('Homebrew is not installed.');
       clack.log.info(`Install it manually from ${pc.cyan('https://brew.sh')}:`);
@@ -459,7 +464,7 @@ async function fixContainerRuntime(flagMemory?: string, flagEngine?: EngineName)
       if (clack.isCancel(done) || !done) return false;
 
       try {
-        execSync('which brew', { stdio: 'pipe' });
+        execSync('which brew', { stdio: 'pipe', cwd: tmpdir() });
       } catch {
         clack.log.error('Homebrew is still not available. Please install it and try again.');
         return false;

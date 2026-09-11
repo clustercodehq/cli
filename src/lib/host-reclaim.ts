@@ -22,6 +22,7 @@
  */
 
 import { execSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import type { MachineProvider } from './runtime-memory.js';
 import { decodeConsoleOutput } from './checks.js';
 import { readWslConfigUtf8 } from './runtime-memory-apply.js';
@@ -177,7 +178,7 @@ export function wslVersionOutput(): string | null {
     // No `encoding` option: wsl.exe writes UTF-16LE, so this decodes the raw
     // buffer rather than reading NUL-interleaved text that defeats every regex.
     return decodeConsoleOutput(
-      execSync('wsl --version', { stdio: ['pipe', 'pipe', 'pipe'], timeout: WSL_VERSION_TIMEOUT_MS }),
+      execSync('wsl --version', { stdio: ['pipe', 'pipe', 'pipe'], timeout: WSL_VERSION_TIMEOUT_MS, cwd: tmpdir() }),
     ).trim();
   } catch {
     return null;

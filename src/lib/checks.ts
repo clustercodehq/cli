@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { homedir, totalmem } from 'node:os';
+import { homedir, tmpdir, totalmem } from 'node:os';
 import { parse } from 'node:path';
 import {
   readCredentials,
@@ -55,10 +55,10 @@ export function decodeConsoleOutput(buf: Buffer): string {
   return buf.toString('utf-8');
 }
 
-function execSilent(cmd: string): string | null {
+function execSilent(cmd: string, timeoutMs?: number): string | null {
   try {
     // No `encoding` option, so this returns a Buffer we can decode ourselves.
-    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] })).trim();
+    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, cwd: tmpdir() })).trim();
   } catch {
     return null;
   }
@@ -73,7 +73,7 @@ function execSilent(cmd: string): string | null {
  */
 function execProbe(cmd: string): { ok: boolean; stderr: string } {
   try {
-    execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'] });
+    execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], cwd: tmpdir() });
     return { ok: true, stderr: '' };
   } catch (err) {
     const e = err as { stderr?: Buffer | string };

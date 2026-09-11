@@ -10,7 +10,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { freemem, totalmem } from 'node:os';
+import { freemem, tmpdir, totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
 import {
   probeRuntime,
@@ -58,7 +58,7 @@ export function hostAvailableBytes(): number {
   if (process.platform !== 'darwin') return freemem();
   let out: string | null = null;
   try {
-    out = execSync('vm_stat', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
+    out = execSync('vm_stat', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000, cwd: tmpdir() });
   } catch {
     out = null;
   }

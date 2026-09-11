@@ -43,6 +43,7 @@
 
 import { execFileSync, execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { win32 } from 'node:path';
 import { hostAvailableBytes as readHostAvailableBytes, hostPressureFloorMib } from './host-memory.js';
 import { wslConfigPath } from './runtime-memory-apply.js';
@@ -353,7 +354,12 @@ const MACHINE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 
 function runPodman(args: string[], timeoutMs: number): string | null {
   try {
-    return execFileSync('podman', args, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs });
+    return execFileSync('podman', args, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: timeoutMs,
+      cwd: tmpdir(),
+    });
   } catch {
     return null;
   }
@@ -452,6 +458,7 @@ function defaultProbes(): ReclaimProbes {
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: 30_000,
+            cwd: tmpdir(),
           }).trim() !== ''
         );
       } catch {
@@ -467,6 +474,7 @@ function defaultProbes(): ReclaimProbes {
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: 10_000,
+            cwd: tmpdir(),
           }),
           workerImageNames(),
         );
@@ -480,6 +488,7 @@ function defaultProbes(): ReclaimProbes {
           encoding: 'utf-8',
           stdio: ['pipe', 'pipe', 'pipe'],
           timeout: 10_000,
+          cwd: tmpdir(),
         });
       } catch {
         return null;
@@ -500,7 +509,7 @@ function defaultProbes(): ReclaimProbes {
             `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; ` +
               `if ($p -and $p.CreationDate) { $p.CreationDate.ToUniversalTime().ToString('o') }`,
           ],
-          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000 },
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000, cwd: tmpdir() },
         ).trim();
         const at = Date.parse(out);
         return Number.isFinite(at) ? at : null;
@@ -521,6 +530,7 @@ function defaultProbes(): ReclaimProbes {
           encoding: 'utf-8',
           stdio: ['pipe', 'pipe', 'pipe'],
           timeout: timeoutMs,
+          cwd: tmpdir(),
         });
       } catch {
         return null;

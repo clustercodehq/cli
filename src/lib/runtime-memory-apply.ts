@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { MachineProvider } from './runtime-memory.js';
 import { memoryKnob } from './memory-knob.js';
@@ -193,7 +193,7 @@ export function runApplySteps(steps: string[]): { ok: boolean; failed?: string }
     // Descriptive steps (the .wslconfig edit) are handled by the caller.
     if (!/^(podman|wsl) /.test(step)) continue;
     try {
-      execSync(step, { stdio: 'inherit' });
+      execSync(step, { stdio: 'inherit', cwd: tmpdir() });
     } catch {
       // podman exits non-zero when the machine is already in the requested
       // state (already running for `start`, already stopped for `stop`); the
