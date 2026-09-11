@@ -7,9 +7,8 @@ import {
   parseMemAvailable,
   parseCached,
   parseDuBytes,
-  parseDropCounters,
-  cacheDropped,
-  DROP_COUNTERS_SCRIPT,
+  processListed,
+  workerImageNames,
   planFill,
   shellQuote,
   reclaimVerificationRefusal,
@@ -23,7 +22,6 @@ import {
 } from '../../src/lib/reclaim-verify.js';
 
 const GIB = 1024 * 1024 * 1024;
-const VMSTAT_SAMPLE = 'nr_free_pages 12345\nnr_zone_inactive_anon 1\ndrop_pagecache 6\ndrop_slab 0\noom_kill 0\n';
 const MIB = 1024 * 1024;
 
 function sample(vmGib: number, hostGib = 12, pid = 100): ReclaimSample {
@@ -299,53 +297,36 @@ describe('guest probes', () => {
     assert.equal(parseDuBytes(null), null);
   });
 
-  test('drop counters are read from a real vmstat', () => {
-    assert.deepEqual(parseDropCounters(VMSTAT_SAMPLE), { pagecache: 6, slab: 0 });
+  test('a worker process is found by image name, in any case', () => {
+    const csv =
+      '"System Idle Process","0","Services","0","8 K"\r\n' +
+      '"CLUSTERCODE-AGENT.EXE","4242","Console","1","61,204 K"\r\n';
+    assert.equal(processListed(csv, ['clustercode-agent.exe']), true);
   });
 
-  test('a vmstat missing either counter, or no output at all, is null', () => {
-    assert.equal(parseDropCounters('drop_pagecache 6\n'), null);
-    assert.equal(parseDropCounters('drop_slab 0\n'), null);
-    assert.equal(parseDropCounters(''), null);
-    assert.equal(parseDropCounters(null), null);
+  test('no matching row, including a localized "no tasks" line, is no process rather than unknown', () => {
+    assert.equal(processListed('"node.exe","1","Console","1","1 K"\r\n', ['clustercode-agent.exe']), false);
+    assert.equal(
+      processListed('INFO: No tasks are running which match the specified criteria.\r\n', ['clustercode-agent.exe']),
+      false,
+    );
+    assert.equal(processListed('', ['clustercode-agent.exe']), false);
   });
 
-  test('a cache drop is any increase in either counter; unreadable is unknown, not "no drop"', () => {
-    const at = (pagecache: number, slab: number) => ({ pagecache, slab });
-    assert.equal(cacheDropped(at(6, 0), at(6, 0)), false);
-    assert.equal(cacheDropped(at(6, 0), at(7, 0)), true);
-    assert.equal(cacheDropped(at(6, 0), at(6, 1)), true);
-    assert.equal(cacheDropped(null, at(6, 0)), null);
-    assert.equal(cacheDropped(at(6, 0), null), null);
+  test('a name that only contains the image name is not it', () => {
+    assert.equal(processListed('"not-clustercode-agent.exe","1","Console","1","1 K"\r\n', ['clustercode-agent.exe']), false);
   });
 
-  // `podman machine ssh` joins its arguments with spaces and hands the result
-  // to the guest's shell, so the script is passed as one argument and must
-  // read back as the same words after that join.
-  test('the drop-counter command survives the join-and-reparse of machine ssh', () => {
-    const argv = ['machine', 'ssh', DROP_COUNTERS_SCRIPT];
-    const remote = argv.slice(2).join(' ');
-    // A minimal POSIX word splitter: single quotes only, and anything else a
-    // shell would treat specially, outside quotes, fails the test.
-    const words: string[] = [];
-    let word: string | null = null;
-    for (let i = 0; i < remote.length; i++) {
-      const c = remote[i];
-      if (c === "'") {
-        const end = remote.indexOf("'", i + 1);
-        assert.notEqual(end, -1, 'unterminated quote');
-        word = (word ?? '') + remote.slice(i + 1, end);
-        i = end;
-      } else if (c === ' ') {
-        if (word !== null) words.push(word);
-        word = null;
-      } else {
-        assert.doesNotMatch(c, /[|&;<>()$`\\"*?[\]{}~#\s]/, `unquoted ${JSON.stringify(c)} in ${remote}`);
-        word = (word ?? '') + c;
-      }
-    }
-    if (word !== null) words.push(word);
-    assert.deepEqual(words, ['grep', '-E', '^drop_(pagecache|slab)', '/proc/vmstat']);
+  test('no output at all is unknown', () => {
+    assert.equal(processListed(null, ['clustercode-agent.exe']), null);
+  });
+
+  test('the worker runs as the agent binary, or as a local binary it was pointed at', () => {
+    assert.deepEqual(workerImageNames({}), ['clustercode-agent.exe']);
+    assert.deepEqual(workerImageNames({ CLUSTERCODE_WORKER_BINARY: 'C:\\dev\\bin\\my-agent.exe' }), [
+      'clustercode-agent.exe',
+      'my-agent.exe',
+    ]);
   });
 
   test('shellQuote makes any path a single literal word', () => {
@@ -418,11 +399,9 @@ interface FakeOptions {
   fillOutput?: string | null;
   vmStartedAt?: number | null;
   wslConfigWrittenAt?: number | null;
-  /** /proc/vmstat output per read, in order; the last one repeats. Default: unchanged counters. */
-  vmstat?: Array<string | null>;
+  /** Worker-process answers per check, in order; the last one repeats. Default: no worker. */
+  worker?: Array<boolean | null>;
 }
-
-const VMSTAT = 'nr_free_pages 12345\ndrop_pagecache 6\ndrop_slab 0\npgfault 99\n';
 
 function meminfo(availableBytes: number, cachedBytes: number | null): string {
   return (
@@ -431,18 +410,22 @@ function meminfo(availableBytes: number, cachedBytes: number | null): string {
   );
 }
 
-function fakeProbes(o: FakeOptions = {}): ReclaimProbes & { guestScripts: string[]; slept: number } {
+function fakeProbes(o: FakeOptions = {}): ReclaimProbes & { guestScripts: string[]; slept: number; workerChecks: number } {
   const ticks = o.ticks ?? [];
   let tick = 0;
   let clock = 1_000_000;
   let meminfoReads = 0;
-  let vmstatReads = 0;
   const current = (): Tick => ticks[Math.min(tick, ticks.length - 1)] ?? { vmGib: 0, hostGib: 0, csv: null };
   const fake = {
     platform: o.platform ?? 'win32',
     guestScripts: [] as string[],
     slept: 0,
+    workerChecks: 0,
     containersRunning: () => o.containersRunning ?? false,
+    workerRunning: () => {
+      const answers = o.worker ?? [false];
+      return answers[Math.min(fake.workerChecks++, answers.length - 1)];
+    },
     vmProcessList: () => {
       const t = current();
       if (t.csv !== undefined) return t.csv;
@@ -467,10 +450,6 @@ function fakeProbes(o: FakeOptions = {}): ReclaimProbes & { guestScripts: string
         return meminfo(available, o.cachedAfterIdleBytes === undefined ? 1.5 * GIB : o.cachedAfterIdleBytes);
       }
       if (script.includes('tar ')) return o.fillOutput === undefined ? '' : o.fillOutput;
-      if (script.includes('/proc/vmstat')) {
-        const outputs = o.vmstat ?? [VMSTAT];
-        return outputs[Math.min(vmstatReads++, outputs.length - 1)];
-      }
       return null;
     },
     sleep: async (ms: number) => {
@@ -490,6 +469,7 @@ function untouchable(platform: NodeJS.Platform): ReclaimProbes {
   return {
     platform,
     containersRunning: boom,
+    workerRunning: boom,
     vmProcessList: boom,
     hostAvailableBytes: boom,
     vmStartedAt: boom,
@@ -626,64 +606,78 @@ describe('verifyReclaim', () => {
     assert.match(detail, /guest/);
   });
 
-  // A running ClusterCode worker drops the guest's cache when Windows runs low
-  // on memory. That returns memory exactly the way reclaim would, so a run it
-  // touched says nothing about reclaim.
-  describe('a cache drop by anything else', () => {
+  // A worker drops the guest's cache when Windows runs low on memory, and polls
+  // the runtime so the guest never goes idle. Cache-drop counters cannot tell
+  // its drops from WSL's own reclaim (which writes the same drop_caches), so the
+  // run excludes the worker by its process instead — before, during and after.
+  describe('a ClusterCode worker on this machine', () => {
     const yes = [back(7), back(7), back(7)];
 
-    test('unchanged counters still allow a yes', async () => {
-      const { probes, outcome } = run(yes, { vmstat: [VMSTAT, VMSTAT] });
-      assert.equal((await outcome).result, 'yes');
-      const reads = probes.guestScripts.filter((s) => s === DROP_COUNTERS_SCRIPT);
-      assert.equal(reads.length, 2);
+    test('running at the start refuses before anything touches the guest, and says what to do', async () => {
+      const probes = fakeProbes({ ticks: [{ vmGib: 6, hostGib: 20 }], worker: [true] });
+      const { result, detail } = await verifyReclaim({ log: quiet, probes });
+      assert.equal(result, 'inconclusive');
+      assert.match(detail, /ClusterCode worker is running/);
+      assert.match(detail, /Stop the worker/);
+      assert.deepEqual(probes.guestScripts, []);
     });
 
-    test('the first reading is taken before the fill starts', async () => {
-      const { probes, outcome } = run(yes);
-      await outcome;
-      const first = probes.guestScripts.indexOf(DROP_COUNTERS_SCRIPT);
-      const fill = probes.guestScripts.findIndex((s) => s.includes('tar '));
-      assert.ok(first >= 0 && first < fill, probes.guestScripts.join(' | '));
+    test('a process list that cannot be read at the start refuses without blaming a worker', async () => {
+      const probes = fakeProbes({ ticks: [{ vmGib: 6, hostGib: 20 }], worker: [null] });
+      const { result, detail } = await verifyReclaim({ log: quiet, probes });
+      assert.equal(result, 'inconclusive');
+      assert.match(detail, /tasklist/);
+      assert.doesNotMatch(detail, /Stop the worker/);
+      assert.deepEqual(probes.guestScripts, []);
     });
 
-    test('a page-cache drop during the run is inconclusive, and says what to do', async () => {
-      const { outcome } = run(yes, { vmstat: [VMSTAT, VMSTAT.replace('drop_pagecache 6', 'drop_pagecache 7')] });
+    test('appearing mid-run is inconclusive, even where the samples read as a yes', async () => {
+      const { outcome } = run(yes, { worker: [false, false, true] });
       const { result, detail } = await outcome;
       assert.equal(result, 'inconclusive');
-      assert.match(detail, /dropped the VM's cache/);
+      assert.match(detail, /started during the measurement/);
       assert.match(detail, /Stop the worker/);
     });
 
-    test('a slab drop during the run is inconclusive too', async () => {
-      const { outcome } = run(yes, { vmstat: [VMSTAT, VMSTAT.replace('drop_slab 0', 'drop_slab 1')] });
+    test('appearing mid-run also keeps a no from being recorded', async () => {
+      const idle = Array.from({ length: 30 }, () => ({ vmGib: 10, hostGib: 16 }));
+      const { outcome } = run(idle, { worker: [false, false, false, false, true] });
       assert.equal((await outcome).result, 'inconclusive');
     });
 
-    test('a drop during the run also keeps a no from being recorded', async () => {
-      const idle = Array.from({ length: 30 }, () => ({ vmGib: 10, hostGib: 16 }));
-      const { outcome } = run(idle, { vmstat: [VMSTAT, VMSTAT.replace('drop_pagecache 6', 'drop_pagecache 8')] });
-      assert.equal((await outcome).result, 'inconclusive');
+    test('appearing only by the final check is still caught', async () => {
+      // Start, then one check per idle sample (three for a yes), then the end.
+      const { outcome } = run(yes, { worker: [false, false, false, false, true] });
+      const { result, detail } = await outcome;
+      assert.equal(result, 'inconclusive');
+      assert.match(detail, /Stop the worker/);
     });
 
-    for (const [label, vmstat] of [
-      ['before the fill', [null, VMSTAT]],
-      ['at the end', [VMSTAT, null]],
-      ['without the counters in it', ['nr_free_pages 1\n']],
-    ] as const) {
-      test(`counters that cannot be read ${label} never allow a yes`, async () => {
-        const { probes, outcome } = run(yes, { vmstat: [...vmstat] });
-        const { result, detail } = await outcome;
-        assert.equal(result, 'inconclusive');
-        assert.match(detail, /could not be read/);
-        // The run was not blocked: it still loaded the cache and watched.
-        assert.ok(probes.guestScripts.some((s) => s.includes('tar ')));
-      });
-    }
+    test('a process list that stops reading mid-run is inconclusive, without blaming a worker', async () => {
+      const { outcome } = run(yes, { worker: [false, null] });
+      const { result, detail } = await outcome;
+      assert.equal(result, 'inconclusive');
+      assert.match(detail, /could not be listed/);
+      assert.doesNotMatch(detail, /Stop the worker/);
+    });
 
-    test('unreadable counters do not turn an honest no into anything else', async () => {
+    test('is asked at the start, at every idle sample, and at the end', async () => {
+      const { probes, outcome } = run(yes);
+      assert.equal((await outcome).result, 'yes');
+      assert.equal(probes.workerChecks, 5);
+    });
+
+    // With no worker, a drop is WSL's own reclaim — exactly what is being
+    // measured — so the guest's drop counters are not consulted at all.
+    test('with no worker, a yes stands without reading any cache-drop counter', async () => {
+      const { probes, outcome } = run(yes);
+      assert.equal((await outcome).result, 'yes');
+      assert.equal(probes.guestScripts.some((s) => s.includes('vmstat')), false);
+    });
+
+    test('with no worker, a no stands too', async () => {
       const idle = Array.from({ length: 30 }, () => ({ vmGib: 10, hostGib: 16 }));
-      const { outcome } = run(idle, { vmstat: [null] });
+      const { outcome } = run(idle);
       assert.equal((await outcome).result, 'no');
     });
   });

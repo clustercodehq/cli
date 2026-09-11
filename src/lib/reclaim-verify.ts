@@ -22,6 +22,10 @@
  *   proves nothing, so the fill is also sized to keep the host clear of that.
  * - Finally the guest is asked: reclaim works by the guest releasing its cache,
  *   and a trim leaves that cache exactly where it was.
+ * - No ClusterCode worker may run on this machine at any point of the run. A
+ *   worker drops the guest's cache when Windows runs low, which returns memory
+ *   exactly the way reclaim does, and its periodic probes of the runtime keep
+ *   the guest from ever going idle.
  *
  * Two further properties of the procedure matter more than they look:
  *
@@ -39,10 +43,12 @@
 
 import { execFileSync, execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
+import { win32 } from 'node:path';
 import { hostAvailableBytes as readHostAvailableBytes, hostPressureFloorMib } from './host-memory.js';
 import { wslConfigPath } from './runtime-memory-apply.js';
 import type { MachineProvider } from './runtime-memory.js';
 import type { HostReclaimStatus } from './host-reclaim.js';
+import { binaryFileName } from './worker-binary.js';
 
 export interface ReclaimSample {
   /** Working set of the WSL VM process. */
@@ -200,37 +206,32 @@ export function parseCached(meminfo: string | null): number | null {
 }
 
 /**
- * Reads the guest kernel's cache-drop counters.
+ * Whether a process with one of these image names appears in
+ * `tasklist /fo csv /nh` output, or null when there is no output to judge by.
  *
- * One argument to `podman machine ssh`, which joins its arguments with spaces
- * for the guest's shell: the only metacharacters are inside the single quotes.
+ * Only quoted CSV rows count. A localized "no tasks" INFO line has none, and is
+ * an honest "no such process".
  */
-export const DROP_COUNTERS_SCRIPT = "grep -E '^drop_(pagecache|slab)' /proc/vmstat";
-
-/** How many times the guest's caches have been dropped (`/proc/sys/vm/drop_caches`) since boot. */
-export interface DropCounters {
-  pagecache: number;
-  slab: number;
-}
-
-/** The `drop_pagecache` and `drop_slab` counters in a `/proc/vmstat`, or null unless both are there. */
-export function parseDropCounters(vmstat: string | null): DropCounters | null {
-  const field = (name: string): number | null => {
-    const value = Number(vmstat?.match(new RegExp(`^${name}\\s+(\\d+)\\s*$`, 'm'))?.[1]);
-    return vmstat && Number.isInteger(value) ? value : null;
-  };
-  const pagecache = field('drop_pagecache');
-  const slab = field('drop_slab');
-  return pagecache === null || slab === null ? null : { pagecache, slab };
+export function processListed(csv: string | null, imageNames: readonly string[]): boolean | null {
+  if (csv === null) return null;
+  const wanted = new Set(imageNames.map((name) => name.toLowerCase()));
+  for (const line of csv.split(/\r?\n/)) {
+    const image = line.match(/^"([^"]*)"/)?.[1];
+    if (image !== undefined && wanted.has(image.toLowerCase())) return true;
+  }
+  return false;
 }
 
 /**
- * Whether anything dropped the guest's caches between two readings. Null when
- * either reading is missing: that is "cannot tell", never "no drop".
+ * The image names a ClusterCode worker runs under on Windows: the agent binary
+ * `clustercode worker` starts, and a local binary it was pointed at instead.
  */
-export function cacheDropped(before: DropCounters | null, after: DropCounters | null): boolean | null {
-  if (before === null || after === null) return null;
-  return after.pagecache > before.pagecache || after.slab > before.slab;
+export function workerImageNames(env: NodeJS.ProcessEnv = process.env): string[] {
+  const names = [binaryFileName('win32')];
+  const override = env.CLUSTERCODE_WORKER_BINARY?.trim();
+  // win32's basename, whatever this runs on: the path is a Windows path.
+  if (override) names.push(win32.basename(override));
+  return names;
 }
 
 /** Bytes reported by `du -sb <path>` (its first field), or null. */
@@ -344,6 +345,11 @@ export function reclaimVerificationRefusal(ctx: {
 export interface ReclaimProbes {
   platform: NodeJS.Platform;
   containersRunning(): boolean;
+  /**
+   * Whether a ClusterCode worker process is running on this machine, or null
+   * when the process list could not be read.
+   */
+  workerRunning(): boolean | null;
   /** `tasklist` CSV rows for `vmmem*` images, or null. */
   vmProcessList(): string | null;
   hostAvailableBytes(): number;
@@ -373,6 +379,20 @@ function defaultProbes(): ReclaimProbes {
         // Podman not answering is not evidence of a busy machine; the samples
         // that follow will fail honestly if the runtime really is unreachable.
         return false;
+      }
+    },
+    workerRunning: () => {
+      try {
+        return processListed(
+          execSync('tasklist /fo csv /nh', {
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: 10_000,
+          }),
+          workerImageNames(),
+        );
+      } catch {
+        return null;
       }
     },
     vmProcessList: () => {
@@ -465,6 +485,41 @@ export async function verifyReclaim(opts: {
   if (probes.containersRunning()) {
     return inconclusive('Containers are running, so the runtime never goes idle. Stop them and try again.');
   }
+  // Apart from WSL's own reclaim, a worker is the one thing on this machine that
+  // drops the guest's cache unasked: it only ever does so for a local WSL
+  // machine, and always from a Windows process (the agent, via `podman`). So
+  // no worker process for the whole run rules it out, without having to tell
+  // its drops apart from WSL's — `dropcache` reclaim, and `gradual` where the
+  // kernel cannot reclaim gently, write the very same `/proc/sys/vm/drop_caches`,
+  // so the kernel's drop counters rise for reclaim that works. A worker would
+  // also keep probing the runtime, which keeps the guest from going idle.
+  const worker = probes.workerRunning();
+  if (worker === null) {
+    return inconclusive(
+      'Could not list the running processes (tasklist) to check that no ClusterCode worker is running, ' +
+        'so nothing was measured. Try again.',
+    );
+  }
+  if (worker) {
+    return inconclusive(
+      "A ClusterCode worker is running on this machine. It keeps the runtime busy and drops the VM's cache " +
+        'when Windows runs low on memory, either of which would skew the result. Stop the worker and try again.',
+    );
+  }
+  // Re-asked through the run: a worker started mid-run touches it just the same.
+  const workerStarted = (): string | null => {
+    const seen = probes.workerRunning();
+    if (seen === null) {
+      return (
+        'Reclaim could not be measured: the running processes could not be listed (tasklist) to check that ' +
+        'no ClusterCode worker started during the measurement. Nothing was recorded.'
+      );
+    }
+    return seen
+      ? 'Reclaim could not be measured: a ClusterCode worker started during the measurement, and a worker keeps ' +
+          "the runtime busy and drops the VM's cache when Windows runs low on memory. Stop the worker and try again."
+      : null;
+  };
 
   const sample = (): ReclaimSample | null => {
     const vm = parseWslVmProcess(probes.vmProcessList());
@@ -516,12 +571,6 @@ export async function verifyReclaim(opts: {
     return inconclusive(`Could not load the VM's cache: ${plan.reason}.`);
   }
 
-  // Something else dropping the guest's cache — by hand, or a running ClusterCode
-  // worker when Windows runs low — returns memory exactly the way reclaim does.
-  // The kernel counts every drop, so compare the count before the fill with the
-  // count at the end rather than trying to spot who might do it.
-  const dropsBefore = parseDropCounters(probes.guest(DROP_COUNTERS_SCRIPT, 60_000));
-
   log(`Loading ${gib(plan.fillBytes)} GiB of the runtime's own data into the VM's cache...`);
   // Reads only. The guest's disk never shrinks, so writing a filler file would
   // permanently consume that much of the host's drive.
@@ -556,6 +605,8 @@ export async function verifyReclaim(opts: {
     // idleness that reclaim waits for, and would measure our own probing.
     const s = sample();
     if (s === null) return inconclusive('The runtime VM stopped during the measurement.');
+    const worker = workerStarted();
+    if (worker !== null) return inconclusive(worker);
     idle.push(s);
     const remaining = Math.max(0, Math.round((deadline - probes.now()) / 60_000));
     log(
@@ -569,15 +620,10 @@ export async function verifyReclaim(opts: {
     return inconclusive(`Reclaim could not be measured: ${outcome.reason}.`);
   }
   const last = idle[idle.length - 1] ?? afterFill;
-  // The idle phase is over, so the guest can be asked again.
-  const dropped = cacheDropped(dropsBefore, parseDropCounters(probes.guest(DROP_COUNTERS_SCRIPT, 60_000)));
-  if (dropped === true) {
-    return inconclusive(
-      "Reclaim could not be measured: something dropped the VM's cache during the measurement " +
-        '(a running ClusterCode worker does this when Windows runs low on memory), so the result ' +
-        'would not show reclaim at work. Stop the worker and try again.',
-    );
-  }
+  // Once more at the end, so a worker started after the last sample is caught
+  // before either answer is given.
+  const workerAtEnd = workerStarted();
+  if (workerAtEnd !== null) return inconclusive(workerAtEnd);
   if (outcome.result === 'no') {
     return {
       result: 'no',
@@ -585,15 +631,6 @@ export async function verifyReclaim(opts: {
         `Memory reclaim did not return memory on this machine: the VM still holds ` +
         `${gib(last.vmMemBytes)} GiB after idling. The runtime will be sized as if reclaim does not work.`,
     };
-  }
-
-  // An unreadable count cannot rule a drop out, and a drop looks exactly like a
-  // yes. A no stands: a drop could only have made the VM smaller.
-  if (dropped === null) {
-    return inconclusive(
-      "Windows got memory back from the VM, but the VM's cache-drop counters (/proc/vmstat) could not be " +
-        'read, so something else dropping its cache cannot be ruled out. Nothing was recorded.',
-    );
   }
 
   // Windows says the memory came back. Ask the guest whether it was reclaim
