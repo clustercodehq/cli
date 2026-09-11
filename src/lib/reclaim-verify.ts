@@ -199,6 +199,40 @@ export function parseCached(meminfo: string | null): number | null {
   return meminfoField(meminfo, 'Cached');
 }
 
+/**
+ * Reads the guest kernel's cache-drop counters.
+ *
+ * One argument to `podman machine ssh`, which joins its arguments with spaces
+ * for the guest's shell: the only metacharacters are inside the single quotes.
+ */
+export const DROP_COUNTERS_SCRIPT = "grep -E '^drop_(pagecache|slab)' /proc/vmstat";
+
+/** How many times the guest's caches have been dropped (`/proc/sys/vm/drop_caches`) since boot. */
+export interface DropCounters {
+  pagecache: number;
+  slab: number;
+}
+
+/** The `drop_pagecache` and `drop_slab` counters in a `/proc/vmstat`, or null unless both are there. */
+export function parseDropCounters(vmstat: string | null): DropCounters | null {
+  const field = (name: string): number | null => {
+    const value = Number(vmstat?.match(new RegExp(`^${name}\\s+(\\d+)\\s*$`, 'm'))?.[1]);
+    return vmstat && Number.isInteger(value) ? value : null;
+  };
+  const pagecache = field('drop_pagecache');
+  const slab = field('drop_slab');
+  return pagecache === null || slab === null ? null : { pagecache, slab };
+}
+
+/**
+ * Whether anything dropped the guest's caches between two readings. Null when
+ * either reading is missing: that is "cannot tell", never "no drop".
+ */
+export function cacheDropped(before: DropCounters | null, after: DropCounters | null): boolean | null {
+  if (before === null || after === null) return null;
+  return after.pagecache > before.pagecache || after.slab > before.slab;
+}
+
 /** Bytes reported by `du -sb <path>` (its first field), or null. */
 export function parseDuBytes(out: string | null): number | null {
   const bytes = Number(out?.trim().match(/^(\d+)/)?.[1]);
@@ -482,6 +516,12 @@ export async function verifyReclaim(opts: {
     return inconclusive(`Could not load the VM's cache: ${plan.reason}.`);
   }
 
+  // Something else dropping the guest's cache — by hand, or a running ClusterCode
+  // worker when Windows runs low — returns memory exactly the way reclaim does.
+  // The kernel counts every drop, so compare the count before the fill with the
+  // count at the end rather than trying to spot who might do it.
+  const dropsBefore = parseDropCounters(probes.guest(DROP_COUNTERS_SCRIPT, 60_000));
+
   log(`Loading ${gib(plan.fillBytes)} GiB of the runtime's own data into the VM's cache...`);
   // Reads only. The guest's disk never shrinks, so writing a filler file would
   // permanently consume that much of the host's drive.
@@ -529,6 +569,15 @@ export async function verifyReclaim(opts: {
     return inconclusive(`Reclaim could not be measured: ${outcome.reason}.`);
   }
   const last = idle[idle.length - 1] ?? afterFill;
+  // The idle phase is over, so the guest can be asked again.
+  const dropped = cacheDropped(dropsBefore, parseDropCounters(probes.guest(DROP_COUNTERS_SCRIPT, 60_000)));
+  if (dropped === true) {
+    return inconclusive(
+      "Reclaim could not be measured: something dropped the VM's cache during the measurement " +
+        '(a running ClusterCode worker does this when Windows runs low on memory), so the result ' +
+        'would not show reclaim at work. Stop the worker and try again.',
+    );
+  }
   if (outcome.result === 'no') {
     return {
       result: 'no',
@@ -538,9 +587,18 @@ export async function verifyReclaim(opts: {
     };
   }
 
-  // Windows says the memory came back. The idle phase is over, so the guest can
-  // be asked whether it was reclaim that returned it, rather than Windows
-  // trimming a VM that still holds every page.
+  // An unreadable count cannot rule a drop out, and a drop looks exactly like a
+  // yes. A no stands: a drop could only have made the VM smaller.
+  if (dropped === null) {
+    return inconclusive(
+      "Windows got memory back from the VM, but the VM's cache-drop counters (/proc/vmstat) could not be " +
+        'read, so something else dropping its cache cannot be ruled out. Nothing was recorded.',
+    );
+  }
+
+  // Windows says the memory came back. Ask the guest whether it was reclaim
+  // that returned it, rather than Windows trimming a VM that still holds every
+  // page.
   const cachedAfterIdle = parseCached(probes.guest('cat /proc/meminfo', 60_000));
   if (!guestReleasedCache(cachedAfterFill, cachedAfterIdle, grew * RETURN_FRACTION)) {
     return inconclusive(

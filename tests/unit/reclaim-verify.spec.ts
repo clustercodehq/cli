@@ -7,6 +7,9 @@ import {
   parseMemAvailable,
   parseCached,
   parseDuBytes,
+  parseDropCounters,
+  cacheDropped,
+  DROP_COUNTERS_SCRIPT,
   planFill,
   shellQuote,
   reclaimVerificationRefusal,
@@ -20,6 +23,7 @@ import {
 } from '../../src/lib/reclaim-verify.js';
 
 const GIB = 1024 * 1024 * 1024;
+const VMSTAT_SAMPLE = 'nr_free_pages 12345\nnr_zone_inactive_anon 1\ndrop_pagecache 6\ndrop_slab 0\noom_kill 0\n';
 const MIB = 1024 * 1024;
 
 function sample(vmGib: number, hostGib = 12, pid = 100): ReclaimSample {
@@ -295,6 +299,55 @@ describe('guest probes', () => {
     assert.equal(parseDuBytes(null), null);
   });
 
+  test('drop counters are read from a real vmstat', () => {
+    assert.deepEqual(parseDropCounters(VMSTAT_SAMPLE), { pagecache: 6, slab: 0 });
+  });
+
+  test('a vmstat missing either counter, or no output at all, is null', () => {
+    assert.equal(parseDropCounters('drop_pagecache 6\n'), null);
+    assert.equal(parseDropCounters('drop_slab 0\n'), null);
+    assert.equal(parseDropCounters(''), null);
+    assert.equal(parseDropCounters(null), null);
+  });
+
+  test('a cache drop is any increase in either counter; unreadable is unknown, not "no drop"', () => {
+    const at = (pagecache: number, slab: number) => ({ pagecache, slab });
+    assert.equal(cacheDropped(at(6, 0), at(6, 0)), false);
+    assert.equal(cacheDropped(at(6, 0), at(7, 0)), true);
+    assert.equal(cacheDropped(at(6, 0), at(6, 1)), true);
+    assert.equal(cacheDropped(null, at(6, 0)), null);
+    assert.equal(cacheDropped(at(6, 0), null), null);
+  });
+
+  // `podman machine ssh` joins its arguments with spaces and hands the result
+  // to the guest's shell, so the script is passed as one argument and must
+  // read back as the same words after that join.
+  test('the drop-counter command survives the join-and-reparse of machine ssh', () => {
+    const argv = ['machine', 'ssh', DROP_COUNTERS_SCRIPT];
+    const remote = argv.slice(2).join(' ');
+    // A minimal POSIX word splitter: single quotes only, and anything else a
+    // shell would treat specially, outside quotes, fails the test.
+    const words: string[] = [];
+    let word: string | null = null;
+    for (let i = 0; i < remote.length; i++) {
+      const c = remote[i];
+      if (c === "'") {
+        const end = remote.indexOf("'", i + 1);
+        assert.notEqual(end, -1, 'unterminated quote');
+        word = (word ?? '') + remote.slice(i + 1, end);
+        i = end;
+      } else if (c === ' ') {
+        if (word !== null) words.push(word);
+        word = null;
+      } else {
+        assert.doesNotMatch(c, /[|&;<>()$`\\"*?[\]{}~#\s]/, `unquoted ${JSON.stringify(c)} in ${remote}`);
+        word = (word ?? '') + c;
+      }
+    }
+    if (word !== null) words.push(word);
+    assert.deepEqual(words, ['grep', '-E', '^drop_(pagecache|slab)', '/proc/vmstat']);
+  });
+
   test('shellQuote makes any path a single literal word', () => {
     assert.equal(shellQuote('/var/lib/containers/storage'), "'/var/lib/containers/storage'");
     assert.equal(shellQuote("/tmp/it's here"), "'/tmp/it'\\''s here'");
@@ -365,7 +418,11 @@ interface FakeOptions {
   fillOutput?: string | null;
   vmStartedAt?: number | null;
   wslConfigWrittenAt?: number | null;
+  /** /proc/vmstat output per read, in order; the last one repeats. Default: unchanged counters. */
+  vmstat?: Array<string | null>;
 }
+
+const VMSTAT = 'nr_free_pages 12345\ndrop_pagecache 6\ndrop_slab 0\npgfault 99\n';
 
 function meminfo(availableBytes: number, cachedBytes: number | null): string {
   return (
@@ -379,6 +436,7 @@ function fakeProbes(o: FakeOptions = {}): ReclaimProbes & { guestScripts: string
   let tick = 0;
   let clock = 1_000_000;
   let meminfoReads = 0;
+  let vmstatReads = 0;
   const current = (): Tick => ticks[Math.min(tick, ticks.length - 1)] ?? { vmGib: 0, hostGib: 0, csv: null };
   const fake = {
     platform: o.platform ?? 'win32',
@@ -409,6 +467,10 @@ function fakeProbes(o: FakeOptions = {}): ReclaimProbes & { guestScripts: string
         return meminfo(available, o.cachedAfterIdleBytes === undefined ? 1.5 * GIB : o.cachedAfterIdleBytes);
       }
       if (script.includes('tar ')) return o.fillOutput === undefined ? '' : o.fillOutput;
+      if (script.includes('/proc/vmstat')) {
+        const outputs = o.vmstat ?? [VMSTAT];
+        return outputs[Math.min(vmstatReads++, outputs.length - 1)];
+      }
       return null;
     },
     sleep: async (ms: number) => {
@@ -562,6 +624,68 @@ describe('verifyReclaim', () => {
     const { result, detail } = await outcome;
     assert.equal(result, 'inconclusive');
     assert.match(detail, /guest/);
+  });
+
+  // A running ClusterCode worker drops the guest's cache when Windows runs low
+  // on memory. That returns memory exactly the way reclaim would, so a run it
+  // touched says nothing about reclaim.
+  describe('a cache drop by anything else', () => {
+    const yes = [back(7), back(7), back(7)];
+
+    test('unchanged counters still allow a yes', async () => {
+      const { probes, outcome } = run(yes, { vmstat: [VMSTAT, VMSTAT] });
+      assert.equal((await outcome).result, 'yes');
+      const reads = probes.guestScripts.filter((s) => s === DROP_COUNTERS_SCRIPT);
+      assert.equal(reads.length, 2);
+    });
+
+    test('the first reading is taken before the fill starts', async () => {
+      const { probes, outcome } = run(yes);
+      await outcome;
+      const first = probes.guestScripts.indexOf(DROP_COUNTERS_SCRIPT);
+      const fill = probes.guestScripts.findIndex((s) => s.includes('tar '));
+      assert.ok(first >= 0 && first < fill, probes.guestScripts.join(' | '));
+    });
+
+    test('a page-cache drop during the run is inconclusive, and says what to do', async () => {
+      const { outcome } = run(yes, { vmstat: [VMSTAT, VMSTAT.replace('drop_pagecache 6', 'drop_pagecache 7')] });
+      const { result, detail } = await outcome;
+      assert.equal(result, 'inconclusive');
+      assert.match(detail, /dropped the VM's cache/);
+      assert.match(detail, /Stop the worker/);
+    });
+
+    test('a slab drop during the run is inconclusive too', async () => {
+      const { outcome } = run(yes, { vmstat: [VMSTAT, VMSTAT.replace('drop_slab 0', 'drop_slab 1')] });
+      assert.equal((await outcome).result, 'inconclusive');
+    });
+
+    test('a drop during the run also keeps a no from being recorded', async () => {
+      const idle = Array.from({ length: 30 }, () => ({ vmGib: 10, hostGib: 16 }));
+      const { outcome } = run(idle, { vmstat: [VMSTAT, VMSTAT.replace('drop_pagecache 6', 'drop_pagecache 8')] });
+      assert.equal((await outcome).result, 'inconclusive');
+    });
+
+    for (const [label, vmstat] of [
+      ['before the fill', [null, VMSTAT]],
+      ['at the end', [VMSTAT, null]],
+      ['without the counters in it', ['nr_free_pages 1\n']],
+    ] as const) {
+      test(`counters that cannot be read ${label} never allow a yes`, async () => {
+        const { probes, outcome } = run(yes, { vmstat: [...vmstat] });
+        const { result, detail } = await outcome;
+        assert.equal(result, 'inconclusive');
+        assert.match(detail, /could not be read/);
+        // The run was not blocked: it still loaded the cache and watched.
+        assert.ok(probes.guestScripts.some((s) => s.includes('tar ')));
+      });
+    }
+
+    test('unreadable counters do not turn an honest no into anything else', async () => {
+      const idle = Array.from({ length: 30 }, () => ({ vmGib: 10, hostGib: 16 }));
+      const { outcome } = run(idle, { vmstat: [null] });
+      assert.equal((await outcome).result, 'no');
+    });
   });
 
   test('a host that runs short of memory mid-run is inconclusive', async () => {
