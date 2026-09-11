@@ -27,6 +27,8 @@ describe('CLI', () => {
     assert.match(output, /onboard/);
     assert.match(output, /config/);
     assert.match(output, /status/);
+    // Anchored: "machine" also appears in the worker command's description.
+    assert.match(output, /^\s+machine\b/m);
   });
 
   it('--help does not show removed start command', () => {

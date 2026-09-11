@@ -62,6 +62,30 @@ Exits non-zero when any check fails, so it works as a scripted gate:
 clustercode doctor --json || echo "not healthy"
 ```
 
+On Windows with a WSL-backed Podman machine, `doctor` also reports how much
+unused space the machine's virtual disk holds:
+
+```
+✓ Runtime disk: 31.7 GB on host, 30.2 GB used inside — ~1.5 GB reclaimable (C: 68.6 GB free)
+⚠ Runtime disk: 70.8 GB on host, 43.0 GB used inside — ~27.8 GB reclaimable (C: 32.0 GB free); run `clustercode machine compact`
+```
+
+"Used inside" counts the machine's files plus the space its ext4 filesystem
+keeps for itself (the journal and the inode-table entries of files in use),
+which stays in the disk after a compact. When that cannot be read, it counts
+the files alone. The estimate is approximate: partly used blocks of the virtual
+disk are not returned either, so a freshly compacted disk can still show a GB
+or two.
+
+It measures the default Podman machine, or the first one listed when none is
+set as the default. When there are several machines, the line names the one it
+measured: `Runtime disk (machine dev): …`.
+
+It warns when at least 5 GB could be reclaimed **and** that is at least a
+quarter of the drive's free space — 20 GB matters with 30 GB free, not with
+500 GB free. It never fails, and shows no line on macOS, Linux, Docker, or a
+Podman machine that isn't WSL-backed.
+
 ### `clustercode onboard`
 
 Interactive setup wizard that runs all health checks and offers to fix each
@@ -180,6 +204,72 @@ clustercode config list
 
 Show current state: user, worker, tenant, orchestrator connection, and
 container count.
+
+### `clustercode machine compact`
+
+Windows only, for a WSL-backed Podman machine. The machine keeps its
+filesystem in a virtual disk file (`ext4.vhdx`) that grows as containers and
+image builds write to it and **never shrinks** when files are deleted inside
+the machine, so the drive loses space it never gets back. This command returns
+that unused space to Windows:
+
+1. Trims free space inside the machine (`fstrim`).
+2. Stops the machine, and stops its WSL distribution with
+   `wsl --terminate <distribution>` — never `wsl --shutdown`, which would stop
+   every WSL distribution on the computer.
+3. Waits (up to 3 minutes) for WSL's utility VM to release the disk.
+4. Compacts the disk with `diskpart`. This asks for administrator approval once.
+   The disk is detached afterwards even if compacting fails, after the
+   15-second pause Microsoft recommends between `diskpart` runs.
+5. Starts the machine again — on every path once it was stopped, including a
+   declined approval, a failure or a timeout. Every step has a time limit, so
+   the restart is never left waiting on a step that hangs.
+
+It acts on one machine: the default Podman machine, or the first one listed
+when none is set as the default. It names that machine first, and when there
+are several it says why that one, for example
+`Podman machine: dev (the default of 3 machines)`.
+
+It shows the reclaimable space and the full plan, then asks before stopping
+anything. Pass `--yes` to skip the question (Windows still asks for
+administrator approval). It reports the disk size and the drive's free space
+before and after.
+
+When compacting returns no space, or the disk cannot be measured afterwards, it
+shows a warning rather than a success, followed by the end of `diskpart`'s
+output. No space is expected when there was nothing to reclaim, but `diskpart`'s
+error messages are only recognised in English: on a Windows display language
+other than English, check that output to tell a failed compact from a disk that
+was already compact.
+
+It refuses to run while any container is running in that machine, or when it
+cannot confirm that none is. It asks inside the machine itself, both as the
+machine's user (`podman ps`) and as root (`sudo -n podman ps`), rather than
+through the active Podman connection, which may point at another machine or
+miss rootful containers; if either list fails, including when `sudo` would ask
+for a password, it refuses before stopping anything. It checks again right
+before stopping the machine, after the trim. Stopped containers also hold space inside the machine, which compacting
+does not return; stopped DevBoxes can be cleaned up in the console.
+
+`diskpart` reads the disk's path in the system's OEM code page. If the path has
+characters outside it (for example, a user name in another script) and Windows
+has no short 8.3 name for it, the command refuses before stopping anything.
+
+If other WSL distributions keep the utility VM alive, the command names them
+and the `wsl --terminate` command for each, and changes nothing. The disk is
+never converted to a sparse VHDX: Windows cannot compact a sparse disk this
+way, and some WSL releases have disabled sparse mode because of a
+data-corruption risk.
+
+It exits 0 when the disk was compacted and the machine started again, including
+the warning above, and when you answer no at the confirmation prompt, which
+prints "Cancelled — nothing was changed." It exits non-zero when it refuses,
+when administrator approval is declined at the Windows prompt or cannot be
+given, when the disk is not released in time, when compacting fails (including
+a recognised `diskpart` error message after an exit code of 0), when the
+machine does not start again, when it needs to ask but has no terminal (pass
+`--yes`), and on any other platform. Pressing Ctrl+C does not abandon a
+compact half-way: the command carries on to the restart and reports the result.
 
 ## Configuration files
 

@@ -10,6 +10,7 @@ import { doctorCommand } from "./commands/doctor.js";
 import { onboardCommand } from "./commands/onboard.js";
 import { configCommand } from "./commands/config.js";
 import { statusCommand } from "./commands/status.js";
+import { machineCommand } from "./commands/machine.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -29,5 +30,6 @@ program.addCommand(doctorCommand);
 program.addCommand(onboardCommand);
 program.addCommand(configCommand);
 program.addCommand(statusCommand);
+program.addCommand(machineCommand);
 
 program.parse();

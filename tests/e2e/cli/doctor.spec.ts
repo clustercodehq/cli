@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
@@ -98,6 +98,39 @@ describe('doctor', () => {
     // Both used to render as a bare "26.4GB free", which is unreadable side by side.
     assert.match(byName.get('disk')!, /^(Disk:|Could not determine)/);
     assert.match(byName.get('memory')!, /^RAM:/);
+  });
+
+  // The runtime-disk check reads the machine's disk file, whose path embeds the
+  // user's home directory. The JSON is meant to be pasted into bug reports.
+  it('doctor --json never contains the home directory', () => {
+    const { stdout } = runCli('doctor', '--json');
+    const jsonStart = stdout.match(/^\s*\{/m);
+    assert.ok(jsonStart !== null);
+    const json = stdout.slice(jsonStart.index!);
+    const result = JSON.parse(json);
+    const home = homedir();
+    for (const check of result.checks as Array<{ detail: string }>) {
+      assert.ok(!check.detail.includes(home), `home directory in: ${check.detail}`);
+    }
+    // Also the escaped form, in case a path lands in some other field.
+    assert.ok(!json.includes(JSON.stringify(home).slice(1, -1)), 'home directory in doctor --json');
+  });
+
+  it('reports runtime disk only on Windows, and never as a failure', () => {
+    const { stdout } = runCli('doctor', '--json');
+    const jsonStart = stdout.match(/^\s*\{/m);
+    assert.ok(jsonStart !== null);
+    const result = JSON.parse(stdout.slice(jsonStart.index!));
+    const disk = result.checks.find((c: { name: string }) => c.name === 'runtime-disk');
+    if (process.platform !== 'win32') {
+      assert.equal(disk, undefined, 'runtime-disk must not appear off Windows');
+      return;
+    }
+    // On Windows it appears only for a WSL-backed Podman machine.
+    if (disk === undefined) return;
+    assert.ok(['pass', 'warn'].includes(disk.status), disk.status);
+    // The machine is named only when there are several.
+    assert.match(disk.detail, /^Runtime disk( \(machine [^)]+\))?: /);
   });
 });
 
