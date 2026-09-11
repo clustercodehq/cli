@@ -41,12 +41,17 @@ import {
 import {
   reclaimVerificationRefusal,
   DROPCACHE_UNMEASURABLE_REFUSAL,
+  GRADUAL_FALLBACK_REFUSAL,
+  GRADUAL_PROBE_FAILED_REFUSAL,
+  probeGradualReclaim,
   verifyReclaim,
+  type GradualProbe,
   type ReclaimVerdictResult,
 } from '../lib/reclaim-verify.js';
 import {
   WSL_RECLAIM_ENTRY,
   reclaimMeasurable,
+  gradualNeedsGuestCheck,
   versionFromStamp,
   wslMemoryEntry,
   type WslReclaimMode,
@@ -1102,6 +1107,8 @@ export interface ReclaimVerificationDeps {
   probe(): { engineName: string | null; provider: MachineProvider | undefined; status: HostReclaimStatus };
   wslVersionStamp(): string | null;
   reclaimMode(): WslReclaimMode | null;
+  /** Whether the runtime VM can write the file WSL tests before running `gradual`. */
+  gradualReclaimProbe(): GradualProbe;
   measure(log: (line: string) => void): Promise<{ result: ReclaimVerdictResult; detail: string }>;
   remember(verdict: ReclaimVerdict & { mode: WslReclaimMode }): void;
   log: {
@@ -1123,6 +1130,7 @@ function defaultReclaimVerificationDeps(): ReclaimVerificationDeps {
     },
     wslVersionStamp: currentWslVersionStamp,
     reclaimMode: currentReclaimMode,
+    gradualReclaimProbe: () => probeGradualReclaim(),
     measure: (log) => verifyReclaim({ log }),
     remember: rememberReclaimVerdict,
     log: {
@@ -1139,9 +1147,10 @@ function defaultReclaimVerificationDeps(): ReclaimVerificationDeps {
  *
  * Refuses up front whenever the answer could not mean what the stored verdict
  * claims: off Windows, for anything but Podman on the WSL backend, with reclaim
- * not switched on or in a mode this WSL build cannot have measured, after the
- * memory step failed, or when the WSL build cannot be read to stamp the result
- * with. An inconclusive run records nothing, and neither does one during which
+ * not switched on or in a mode this WSL build cannot have measured (including
+ * `gradual` before WSL 2.9.8 when the runtime VM cannot write memory.reclaim,
+ * or cannot be asked), after the memory step failed, or when the WSL build
+ * cannot be read to stamp the result with. An inconclusive run records nothing, and neither does one during which
  * the WSL build or reclaim mode changed: the point of the stored verdict is that
  * it is evidence, and "we could not tell" is not evidence of either answer.
  */
@@ -1179,6 +1188,14 @@ export async function runReclaimVerification(
   // The probe already refuses this; checked again against the values the
   // verdict would be stamped with, in case the setting changed in between.
   if (!reclaimMeasurable(mode, versionFromStamp(wslVersion))) return refuse(DROPCACHE_UNMEASURABLE_REFUSAL);
+  // Before 2.9.8 WSL runs `gradual` as that same loop when the guest cannot
+  // reclaim gently, and only the guest can say which it got. Asked before the
+  // fill; anything but a plain "writable" refuses.
+  if (gradualNeedsGuestCheck(mode, versionFromStamp(wslVersion))) {
+    const guest = deps.gradualReclaimProbe();
+    if (guest === 'not-writable') return refuse(GRADUAL_FALLBACK_REFUSAL);
+    if (guest !== 'writable') return refuse(GRADUAL_PROBE_FAILED_REFUSAL);
+  }
 
   const { result, detail } = await deps.measure((line) => log.info(line));
   if (result === 'inconclusive') {

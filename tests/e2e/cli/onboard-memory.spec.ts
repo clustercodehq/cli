@@ -401,4 +401,33 @@ describe('onboard memory step on Podman over WSL', () => {
     assert.equal(config.RUNTIME_RECLAIM_VERIFIED, 'no');
     assert.equal(config.RUNTIME_RECLAIM_VERIFIED_WSL, '2.7.13.0');
   });
+
+  // Before 2.9.8 WSL runs gradual as the old dropcache loop when the VM cannot
+  // write memory.reclaim, so the VM is asked first. The stubs cannot answer
+  // that question, which is the failed-probe case: it must refuse, not measure.
+  it('refuses to measure gradual before WSL 2.9.8 when the VM cannot be asked', { skip: !isWin || !HOST_BIG_ENOUGH }, () => {
+    const hostMib = Math.floor(totalmem() / 1024 / 1024);
+    const storedMib = hostMib - 6144;
+    seedConfigs();
+    writeFileSync(
+      join(tempHome, '.clustercode', 'config.json'),
+      JSON.stringify({ RUNTIME_MEMORY_MB: String(storedMib) }),
+    );
+    createPodmanWslStubs(storedMib * 1024 * 1024, '2.7.13.0');
+    writeFileSync(
+      join(tempHome, '.wslconfig'),
+      ['[wsl2]', `memory=${storedMib}MB`, '[experimental]', 'autoMemoryReclaim=gradual', ''].join('\r\n'),
+      'utf-8',
+    );
+    if (skipUnlessStubbed()) return;
+
+    const refused = runOnboard(['--verify-reclaim']);
+    assert.equal(refused.exitCode, 0, refused.stdout);
+    assert.match(refused.stdout, /Verifying memory reclaim/);
+    assert.match(refused.stdout, /The VM could not be asked/);
+    assert.match(refused.stdout, /Nothing was measured or recorded/);
+    assert.doesNotMatch(refused.stdout, /Loading .* into the VM's cache/);
+    const config = JSON.parse(readFileSync(join(tempHome, '.clustercode', 'config.json'), 'utf-8'));
+    assert.equal(config.RUNTIME_RECLAIM_VERIFIED, undefined);
+  });
 });

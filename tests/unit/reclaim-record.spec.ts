@@ -9,7 +9,11 @@ import {
 } from '../../src/commands/onboard.js';
 import { recordManualReclaimVerdict, type ManualVerdictDeps } from '../../src/commands/config.js';
 import type { ReclaimVerdict } from '../../src/lib/host-reclaim.js';
-import { DROPCACHE_UNMEASURABLE_REFUSAL } from '../../src/lib/reclaim-verify.js';
+import {
+  DROPCACHE_UNMEASURABLE_REFUSAL,
+  GRADUAL_FALLBACK_REFUSAL,
+  GRADUAL_PROBE_FAILED_REFUSAL,
+} from '../../src/lib/reclaim-verify.js';
 
 /**
  * Recording a verdict is the one step that can unlock the smaller host reserve,
@@ -23,11 +27,13 @@ interface Recorder {
   remembered: ReclaimVerdict[];
   measured: number;
   probed: number;
+  /** Times the runtime VM was asked about memory.reclaim. */
+  guestProbed: number;
   lines: string[];
 }
 
 function recorder(over: Partial<ReclaimVerificationDeps> = {}, results: { result: 'yes' | 'no' | 'inconclusive'; detail: string } = { result: 'yes', detail: 'works' }): Recorder {
-  const r: Recorder = { remembered: [], measured: 0, probed: 0, lines: [], deps: undefined as unknown as ReclaimVerificationDeps };
+  const r: Recorder = { remembered: [], measured: 0, probed: 0, guestProbed: 0, lines: [], deps: undefined as unknown as ReclaimVerificationDeps };
   const log = (line: string) => r.lines.push(line);
   r.deps = {
     platform: 'win32',
@@ -37,6 +43,10 @@ function recorder(over: Partial<ReclaimVerificationDeps> = {}, results: { result
     },
     wslVersionStamp: () => '2.7.13.0',
     reclaimMode: () => 'gradual',
+    gradualReclaimProbe: () => {
+      r.guestProbed++;
+      return 'writable';
+    },
     measure: async () => {
       r.measured++;
       return results;
@@ -154,10 +164,47 @@ describe('runReclaimVerification', () => {
     }
   });
 
-  test('gradual on an older WSL build is still measured', async () => {
-    const r = recorder({ wslVersionStamp: () => '2.7.13.0', reclaimMode: () => 'gradual' });
-    assert.equal(await runReclaimVerification({}, r.deps), 'yes');
-    assert.equal(r.measured, 1);
+  // Before 2.9.8 WSL runs gradual as the old dropcache loop when the guest
+  // cannot write memory.reclaim, so the guest is asked first.
+  test('gradual on an older WSL build is measured when the VM can write memory.reclaim', async () => {
+    for (const version of ['2.7.13.0', '2.9.7.0']) {
+      const r = recorder({ wslVersionStamp: () => version, reclaimMode: () => 'gradual' });
+      assert.equal(await runReclaimVerification({}, r.deps), 'yes', version);
+      assert.equal(r.guestProbed, 1);
+      assert.equal(r.measured, 1);
+      assert.deepEqual(r.remembered, [{ result: 'yes', wslVersion: version, mode: 'gradual' }]);
+    }
+  });
+
+  test('gradual on an older WSL build refuses when the VM cannot write memory.reclaim, and says why', async () => {
+    const r = recorder({ gradualReclaimProbe: () => 'not-writable' });
+    assert.equal(await runReclaimVerification({}, r.deps), 'refused');
+    assert.equal(r.measured, 0);
+    assert.deepEqual(r.remembered, []);
+    assert.ok(r.lines.includes(GRADUAL_FALLBACK_REFUSAL), r.lines.join('\n'));
+  });
+
+  test('gradual on an older WSL build refuses when the VM could not be asked', async () => {
+    const r = recorder({ gradualReclaimProbe: () => 'failed' });
+    assert.equal(await runReclaimVerification({}, r.deps), 'refused');
+    assert.equal(r.measured, 0);
+    assert.deepEqual(r.remembered, []);
+    assert.ok(r.lines.includes(GRADUAL_PROBE_FAILED_REFUSAL), r.lines.join('\n'));
+  });
+
+  test('from WSL 2.9.8 on the VM is not asked, whatever the mode', async () => {
+    for (const mode of ['gradual', 'dropcache'] as const) {
+      const r = recorder({ wslVersionStamp: () => '2.9.8.0', reclaimMode: () => mode, gradualReclaimProbe: () => 'not-writable' });
+      assert.equal(await runReclaimVerification({}, r.deps), 'yes', mode);
+      assert.equal(r.measured, 1);
+    }
+  });
+
+  test('dropcache on an older WSL build refuses without asking the VM', async () => {
+    let asked = 0;
+    const r = recorder({ reclaimMode: () => 'dropcache', gradualReclaimProbe: () => (asked++, 'writable') });
+    assert.equal(await runReclaimVerification({}, r.deps), 'refused');
+    assert.equal(asked, 0);
   });
 
   test('no reclaim mode in .wslconfig refuses', async () => {

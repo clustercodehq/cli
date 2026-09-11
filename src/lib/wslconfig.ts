@@ -84,13 +84,30 @@ export function versionAtLeast(version: readonly number[], floor: readonly numbe
  * PR #41096 ("Improve WSL2 guest memory reclaim") replaced that loop with one
  * that decides idleness over 2 minutes; its first tag is 2.9.5, but the first
  * published release to carry it is 2.9.8, so builds in between are treated as
- * the old loop. `gradual` is not affected: it needs 3 idle minutes on either.
+ * the old loop. `gradual` needs only 3 idle minutes on either loop, but the old
+ * one runs it as this same `dropcache` loop when the guest cannot reclaim
+ * gently — see `gradualNeedsGuestCheck`.
  */
 export const WSL_DROPCACHE_MEASURABLE_SINCE: readonly number[] = [2, 9, 8];
 
 /** Whether a measurement of `mode` on `version` can mean what it records. */
 export function reclaimMeasurable(mode: WslReclaimMode, version: readonly number[]): boolean {
   return mode !== 'dropcache' || versionAtLeast(version, WSL_DROPCACHE_MEASURABLE_SINCE);
+}
+
+/**
+ * Whether `gradual` on `version` can only be measured once the guest says it
+ * can reclaim gently.
+ *
+ * When the VM starts, WSL's init checks, as root,
+ * `access("/sys/fs/cgroup/memory.reclaim", W_OK)` and runs `gradual` as
+ * `dropcache` when that fails (`src/linux/init/main.cpp` at 2.7.13). Before
+ * 2.9.8 that is the old loop `WSL_DROPCACHE_MEASURABLE_SINCE` describes; from
+ * 2.9.8 the fallback runs in the new loop, which can be measured. Nothing on
+ * the Windows side shows which one a VM got, so the measurement asks the guest.
+ */
+export function gradualNeedsGuestCheck(mode: WslReclaimMode, version: readonly number[]): boolean {
+  return mode === 'gradual' && !versionAtLeast(version, WSL_DROPCACHE_MEASURABLE_SINCE);
 }
 
 /** What WSL does about reclaim, as opposed to what `.wslconfig` says. */

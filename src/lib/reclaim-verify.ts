@@ -309,6 +309,71 @@ export const DROPCACHE_UNMEASURABLE_REFUSAL =
   'about 10 idle minutes, and only once per idle period, so this CLI cannot measure it reliably. Nothing was ' +
   'measured or recorded, and the runtime stays sized as if reclaim does not work.';
 
+/** Why `gradual` is not measured before WSL 2.9.8 when the guest cannot reclaim gently. */
+export const GRADUAL_FALLBACK_REFUSAL =
+  'Memory reclaim is in gradual mode, but the runtime VM cannot write /sys/fs/cgroup/memory.reclaim, so on this ' +
+  'WSL version (older than 2.9.8) WSL falls back to dropping the cache only after about 10 idle minutes, and only ' +
+  'once per idle period, which this CLI cannot measure reliably. Nothing was measured or recorded, and the ' +
+  'runtime stays sized as if reclaim does not work.';
+
+/** Why `gradual` is not measured before WSL 2.9.8 when the guest could not be asked. */
+export const GRADUAL_PROBE_FAILED_REFUSAL =
+  'Memory reclaim is in gradual mode, and on this WSL version (older than 2.9.8) WSL falls back to dropping the ' +
+  'cache only after about 10 idle minutes, and only once per idle period, unless the runtime VM can write ' +
+  '/sys/fs/cgroup/memory.reclaim. The VM could not be asked (`podman machine ssh`), so this CLI cannot tell ' +
+  'whether a measurement would mean anything. Nothing was measured or recorded. Make sure the Podman machine ' +
+  'is running and try again.';
+
+/**
+ * The guest's side of the test WSL's init makes before running `gradual`
+ * (`gradualNeedsGuestCheck`): write access to the root cgroup's
+ * `memory.reclaim`.
+ *
+ * As root, because WSL's init runs as root and the file is writable by root
+ * only (`--w-------`): asked as the machine's login user, it reads "not
+ * writable" on every host. `sudo -n` fails instead of prompting, and then
+ * prints neither word, which reads as a failed probe. Where the machine's own
+ * view differs from init's — a distro that mounts cgroup v1, or a read-only
+ * cgroup mount — the guest can only see less, so the error is a refusal,
+ * never a measurement.
+ */
+export const GRADUAL_PROBE_SCRIPT =
+  "sudo -n sh -c 'test -w /sys/fs/cgroup/memory.reclaim && echo writable || echo not-writable'";
+
+export type GradualProbe = 'writable' | 'not-writable' | 'failed';
+
+/** Exactly one of the two words, or the probe failed. */
+export function parseGradualProbe(out: string | null): GradualProbe {
+  const answer = out?.trim();
+  return answer === 'writable' || answer === 'not-writable' ? answer : 'failed';
+}
+
+/** Podman's own rule for machine names; nothing else is passed on. */
+const MACHINE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
+function runPodman(args: string[], timeoutMs: number): string | null {
+  try {
+    return execFileSync('podman', args, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ask the runtime VM whether WSL can run `gradual` as `gradual`.
+ *
+ * The machine is named: `podman machine inspect` without a name describes the
+ * default machine, the one the measurement's unnamed `podman machine ssh`
+ * reaches. Both calls are bounded by a timeout.
+ */
+export function probeGradualReclaim(
+  podman: (args: string[], timeoutMs: number) => string | null = runPodman,
+): GradualProbe {
+  const name = podman(['machine', 'inspect', '--format', '{{.Name}}'], 30_000)?.trim();
+  if (!name || !MACHINE_NAME.test(name)) return 'failed';
+  return parseGradualProbe(podman(['machine', 'ssh', name, GRADUAL_PROBE_SCRIPT], 60_000));
+}
+
 /**
  * Who may be measured at all.
  *

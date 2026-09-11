@@ -11,6 +11,9 @@ import {
   workerImageNames,
   planFill,
   shellQuote,
+  parseGradualProbe,
+  probeGradualReclaim,
+  GRADUAL_PROBE_SCRIPT,
   reclaimVerificationRefusal,
   verifyReclaim,
   MAX_FILL_MIB,
@@ -723,5 +726,63 @@ describe('verifyReclaim', () => {
     const { result, detail } = await outcome;
     assert.equal(result, 'no');
     assert.match(detail, /did not return memory/);
+  });
+});
+
+describe('probeGradualReclaim', () => {
+  type Call = { args: string[]; timeoutMs: number };
+  function podman(answers: { name?: string | null; ssh?: string | null }) {
+    const calls: Call[] = [];
+    const run = (args: string[], timeoutMs: number): string | null => {
+      calls.push({ args, timeoutMs });
+      if (args[1] === 'inspect') return answers.name === undefined ? 'podman-machine-default\n' : answers.name;
+      if (args[1] === 'ssh') return answers.ssh === undefined ? 'writable\n' : answers.ssh;
+      return null;
+    };
+    return { calls, run };
+  }
+
+  // WSL's init makes this test as root; the machine's login user cannot write
+  // the file on any host, so the probe must go through sudo.
+  test('the guest script is the root-run write test WSL makes, as one string', () => {
+    assert.equal(
+      GRADUAL_PROBE_SCRIPT,
+      "sudo -n sh -c 'test -w /sys/fs/cgroup/memory.reclaim && echo writable || echo not-writable'",
+    );
+  });
+
+  test('names the default machine and passes the script as one argument, with timeouts', () => {
+    const p = podman({});
+    assert.equal(probeGradualReclaim(p.run), 'writable');
+    assert.deepEqual(p.calls.map((c) => c.args), [
+      ['machine', 'inspect', '--format', '{{.Name}}'],
+      ['machine', 'ssh', 'podman-machine-default', GRADUAL_PROBE_SCRIPT],
+    ]);
+    assert.ok(p.calls.every((c) => c.timeoutMs > 0 && c.timeoutMs <= 60_000));
+  });
+
+  test('not writable is reported as such', () => {
+    assert.equal(probeGradualReclaim(podman({ ssh: 'not-writable\r\n' }).run), 'not-writable');
+  });
+
+  test('a failed or ambiguous answer is a failed probe', () => {
+    for (const ssh of [null, '', 'sudo: a password is required', 'writable\nnot-writable', 'Writable']) {
+      assert.equal(probeGradualReclaim(podman({ ssh }).run), 'failed', String(ssh));
+    }
+  });
+
+  test('no usable machine name fails without reaching into any machine', () => {
+    for (const name of [null, '', '-oProxyCommand=x', 'two words', 'a\nb']) {
+      const p = podman({ name });
+      assert.equal(probeGradualReclaim(p.run), 'failed', String(name));
+      assert.equal(p.calls.filter((c) => c.args[1] === 'ssh').length, 0);
+    }
+  });
+
+  test('parseGradualProbe takes exactly one of the two words', () => {
+    assert.equal(parseGradualProbe(' writable \n'), 'writable');
+    assert.equal(parseGradualProbe('not-writable'), 'not-writable');
+    assert.equal(parseGradualProbe(null), 'failed');
+    assert.equal(parseGradualProbe('maybe'), 'failed');
   });
 });

@@ -8,6 +8,7 @@ import {
   wslSupportsAutoMemoryReclaim,
   effectiveReclaimMode,
   reclaimMeasurable,
+  gradualNeedsGuestCheck,
   versionFromStamp,
   wslMemoryEntry,
   WSL_RECLAIM_ENTRY,
@@ -359,7 +360,8 @@ describe('reclaimMeasurable', () => {
     assert.equal(reclaimMeasurable('dropcache', [3, 0]), true);
   });
 
-  test('gradual is measurable on any build that has it', () => {
+  // Whether the guest can run it gently is asked at measurement time: gradualNeedsGuestCheck.
+  test('gradual is never ruled out by the WSL version alone', () => {
     assert.equal(reclaimMeasurable('gradual', [2, 0, 9, 0]), true);
     assert.equal(reclaimMeasurable('gradual', [2, 7, 13, 0]), true);
   });
@@ -367,5 +369,22 @@ describe('reclaimMeasurable', () => {
   test('a version stamp reads back as the numbers it was written from', () => {
     assert.deepEqual(versionFromStamp('2.9.8.0'), [2, 9, 8, 0]);
     assert.deepEqual(versionFromStamp('2.10.1'), [2, 10, 1]);
+  });
+});
+
+describe('gradualNeedsGuestCheck', () => {
+  // Before 2.9.8 WSL's init runs gradual as the old dropcache loop when it
+  // cannot write /sys/fs/cgroup/memory.reclaim; from 2.9.8 the fallback is
+  // the new loop, which can be measured.
+  test('gradual needs the guest asked before 2.9.8 only', () => {
+    assert.equal(gradualNeedsGuestCheck('gradual', [2, 7, 13, 0]), true);
+    assert.equal(gradualNeedsGuestCheck('gradual', [2, 9, 7, 0]), true);
+    assert.equal(gradualNeedsGuestCheck('gradual', [2, 9, 8, 0]), false);
+    assert.equal(gradualNeedsGuestCheck('gradual', [2, 10, 0]), false);
+  });
+
+  test('dropcache never does: it is refused or measured on the version alone', () => {
+    assert.equal(gradualNeedsGuestCheck('dropcache', [2, 7, 13, 0]), false);
+    assert.equal(gradualNeedsGuestCheck('dropcache', [2, 9, 8, 0]), false);
   });
 });
