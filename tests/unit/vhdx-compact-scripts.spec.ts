@@ -229,7 +229,12 @@ describe('interpretLauncher', () => {
 
 describe('interpretDiskpart', () => {
   it('reads 0 as success', () => {
-    assert.deepEqual(interpretDiskpart(0, 'DiskPart successfully compacted the virtual disk file.'), { kind: 'ok' });
+    assert.deepEqual(interpretDiskpart(0, 'Microsoft DiskPart version 10.0\r\n\r\nDiskPart successfully compacted the virtual disk file.\r\n'), {
+      kind: 'ok',
+      // Kept for the report: on a Windows display language other than English the
+      // error phrases above are not recognised, so the user may need to read it.
+      logTail: 'Microsoft DiskPart version 10.0\nDiskPart successfully compacted the virtual disk file.',
+    });
   });
 
   it('reads an exit code of 0 as a failure when the log shows a diskpart error', () => {

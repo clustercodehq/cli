@@ -104,7 +104,10 @@ describe('elevateCompact', () => {
 
   it('reads success from the elevated side, decoding its UTF-16 log', async () => {
     const { deps } = fakeDeps({ leaves: ran('0') });
-    assert.deepEqual(await elevateCompact(DISKPART_PATH, deps, TIMING), { kind: 'ok' });
+    assert.deepEqual(await elevateCompact(DISKPART_PATH, deps, TIMING), {
+      kind: 'ok',
+      logTail: 'DiskPart successfully compacted the virtual disk file.',
+    });
   });
 
   it("uses diskpart's exit code, not the launcher's", async () => {
@@ -151,7 +154,7 @@ describe('elevateCompact', () => {
       launched: { code: null },
       laterAfterPolls: { polls: 3, files: { [FILES.compactLog]: utf16('DiskPart successfully compacted'), [FILES.done]: Buffer.from('0') } },
     });
-    assert.deepEqual(await elevateCompact(DISKPART_PATH, deps, TIMING), { kind: 'ok' });
+    assert.deepEqual(await elevateCompact(DISKPART_PATH, deps, TIMING), { kind: 'ok', logTail: 'DiskPart successfully compacted' });
   });
 
   it('gives up at the deadline when the elevated side never finishes, saying so', async () => {

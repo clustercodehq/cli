@@ -126,15 +126,21 @@ async function runCompact(options: { yes?: boolean }): Promise<number> {
       }),
     () => clack.log.warn('Finishing safely first — the machine will be started again when this completes.'),
   );
-  const { ok, lines } = describeCompactOutcome(outcome, target);
+  const report = describeCompactOutcome(outcome, target);
+  const text = report.lines.join('\n');
 
-  if (ok) {
-    clack.log.success(lines.join('\n'));
-    clack.outro(pc.green('Machine disk compacted.'));
+  if (report.ok && report.warning) {
+    clack.log.warn(text);
+    clack.outro(pc.yellow(report.outro));
     return 0;
   }
-  clack.log.error(lines.join('\n'));
-  clack.outro(outcome.kind === 'compacted' ? 'Compacted, but the machine needs attention.' : 'The disk was not compacted.');
+  if (report.ok) {
+    clack.log.success(text);
+    clack.outro(pc.green(report.outro));
+    return 0;
+  }
+  clack.log.error(text);
+  clack.outro(report.outro);
   return 1;
 }
 

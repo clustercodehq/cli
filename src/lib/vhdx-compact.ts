@@ -245,7 +245,8 @@ export function releaseProbeScript(vhdxPath: string): string {
 }
 
 export type ElevationResult =
-  | { kind: 'ok' }
+  /** `logTail`: the end of diskpart's output, for when the result needs a second look. */
+  | { kind: 'ok'; logTail: string }
   | { kind: 'declined' }
   | { kind: 'unavailable' }
   | { kind: 'failed'; exitCode: number | null; logTail: string };
@@ -286,7 +287,7 @@ export const DISKPART_ERROR_MARKERS: readonly RegExp[] = [
 
 /** The elevated script finished: diskpart's exit code and its log. */
 export function interpretDiskpart(exitCode: number | null, log: string): ElevationResult {
-  if (exitCode === 0 && !DISKPART_ERROR_MARKERS.some((marker) => marker.test(log))) return { kind: 'ok' };
+  if (exitCode === 0 && !DISKPART_ERROR_MARKERS.some((marker) => marker.test(log))) return { kind: 'ok', logTail: logTail(log) };
   return { kind: 'failed', exitCode, logTail: logTail(log) };
 }
 
@@ -456,7 +457,15 @@ export type CompactOutcome =
   | { kind: 'blocked'; running: string[] | null; afterTrim: boolean }
   /** diskpart could not be given a path it reads correctly. Nothing was stopped. */
   | { kind: 'path-refused'; reason: Extract<DiskpartPath, { ok: false }>['reason'] }
-  | { kind: 'compacted'; before: SizeSnapshot; after: SizeSnapshot; drive: string | null; restarted: boolean }
+  | {
+      kind: 'compacted';
+      before: SizeSnapshot;
+      after: SizeSnapshot;
+      drive: string | null;
+      /** The end of diskpart's output. */
+      diskpartOutput: string;
+      restarted: boolean;
+    }
   | { kind: 'declined'; restarted: boolean }
   | { kind: 'unavailable'; restarted: boolean }
   | { kind: 'handle-timeout'; message: string; restarted: boolean }
@@ -561,7 +570,14 @@ export async function compactVhdx(
 
   switch (result) {
     case 'compacted':
-      return { kind: 'compacted', before, after, drive, restarted };
+      return {
+        kind: 'compacted',
+        before,
+        after,
+        drive,
+        diskpartOutput: (elevation as Extract<ElevationResult, { kind: 'ok' }>).logTail,
+        restarted,
+      };
     case 'handle-timeout':
       return { kind: 'handle-timeout', message: timeoutMessage, restarted };
     case 'failed': {
@@ -579,59 +595,81 @@ function sizeOrUnknown(bytes: number | null): string {
   return bytes === null ? 'unknown' : formatGb(bytes);
 }
 
+/**
+ * diskpart's error phrases are only matched in English. When the result gives
+ * reason to doubt the compact, say so and show diskpart's own words.
+ */
+function diskpartDoubt(lead: string, output: string): string[] {
+  const note = "diskpart reported no error, but its messages are only recognised in English";
+  return output === ''
+    ? [`${lead} ${note}.`]
+    : [`${lead} ${note}; if Windows uses another display language, check diskpart's output:`, output];
+}
+
+export interface OutcomeReport {
+  /** Exit 0. */
+  ok: boolean;
+  /** Exit 0, but show it as a warning rather than a success. */
+  warning: boolean;
+  lines: string[];
+  outro: string;
+}
+
 /** What to tell the user about an outcome. `ok` is false for anything that needs their attention. */
-export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVhdx): { ok: boolean; lines: string[] } {
+export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVhdx): OutcomeReport {
+  const refused = (lines: string[]): OutcomeReport => ({ ok: false, warning: false, lines, outro: 'Nothing was changed.' });
+
   if (outcome.kind === 'blocked') {
     const neverStopped = outcome.afterTrim
       ? ['Free space was trimmed, but the machine was never stopped, so nothing needs restarting.']
       : [];
     if (outcome.running === null) {
-      return {
-        ok: false,
-        lines: [
-          'Could not ask Podman which containers are running, so nothing was stopped. ' +
-            `Make sure the machine is running (podman machine start ${target.machine}), then re-run \`clustercode machine compact\`.`,
-          ...neverStopped,
-        ],
-      };
+      return refused([
+        'Could not ask Podman which containers are running, so nothing was stopped. ' +
+          `Make sure the machine is running (podman machine start ${target.machine}), then re-run \`clustercode machine compact\`.`,
+        ...neverStopped,
+      ]);
     }
     const shown = outcome.running.slice(0, MAX_NAMED_CONTAINERS).join(', ');
     const more = outcome.running.length - MAX_NAMED_CONTAINERS;
     const names = more > 0 ? `${shown} and ${more} more` : shown;
     const head = outcome.afterTrim ? 'Containers started while free space was being trimmed' : 'Containers are running';
-    return {
-      ok: false,
-      lines: [
-        `${head}: ${names}. Compacting stops the machine, which would stop them too. ` +
-          'Stop them, then re-run `clustercode machine compact`.',
-        ...neverStopped,
-      ],
-    };
+    return refused([
+      `${head}: ${names}. Compacting stops the machine, which would stop them too. ` +
+        'Stop them, then re-run `clustercode machine compact`.',
+      ...neverStopped,
+    ]);
   }
 
   if (outcome.kind === 'path-refused') {
-    return {
-      ok: false,
-      lines: [
-        outcome.reason === 'not-representable'
-          ? "The disk's path has characters diskpart cannot read on this system, and it has no short (8.3) name to use instead, so nothing was stopped or compacted."
-          : "Could not check that diskpart can read the disk's path, so nothing was stopped or compacted.",
-      ],
-    };
+    return refused([
+      outcome.reason === 'not-representable'
+        ? "The disk's path has characters diskpart cannot read on this system, and it has no short (8.3) name to use instead, so nothing was stopped or compacted."
+        : "Could not check that diskpart can read the disk's path, so nothing was stopped or compacted.",
+    ]);
   }
 
   const lines: string[] = [];
+  let doubt: 'none' | 'no-space' | 'unknown' = 'none';
   switch (outcome.kind) {
     case 'compacted': {
       const { before, after } = outcome;
       if (before.vhdxBytes !== null && after.vhdxBytes !== null && after.vhdxBytes >= before.vhdxBytes) {
-        lines.push(`Compacted, but no space was returned: the disk is still ${formatGb(after.vhdxBytes)}.`);
+        doubt = 'no-space';
+        lines.push(`Compacting returned no space: the disk is still ${formatGb(after.vhdxBytes)}.`);
+        lines.push(...diskpartDoubt('That is expected when there was nothing to reclaim.', outcome.diskpartOutput));
       } else {
         const returned =
           before.vhdxBytes !== null && after.vhdxBytes !== null
             ? ` (${formatGb(before.vhdxBytes - after.vhdxBytes)} returned to Windows)`
             : '';
         lines.push(`Disk: ${sizeOrUnknown(before.vhdxBytes)} → ${sizeOrUnknown(after.vhdxBytes)}${returned}`);
+        if (after.vhdxBytes === null) {
+          doubt = 'unknown';
+          lines.push(
+            ...diskpartDoubt('Could not measure the disk afterwards, so the space returned is unknown.', outcome.diskpartOutput),
+          );
+        }
       }
       if (outcome.drive) {
         lines.push(`${outcome.drive}: free: ${sizeOrUnknown(before.freeBytes)} → ${sizeOrUnknown(after.freeBytes)}`);
@@ -666,7 +704,19 @@ export function describeCompactOutcome(outcome: CompactOutcome, target: PodmanVh
       ? 'The machine was started again.'
       : `The machine did not start again. Start it with: podman machine start ${target.machine}`,
   );
-  return { ok: outcome.kind === 'compacted' && outcome.restarted, lines };
+
+  if (outcome.kind !== 'compacted') {
+    return { ok: false, warning: false, lines, outro: 'The disk was not compacted.' };
+  }
+  if (!outcome.restarted) {
+    return { ok: false, warning: false, lines, outro: 'Compacted, but the machine needs attention.' };
+  }
+  // A no-space result is not treated as a failure: diskpart exits non-zero when a
+  // scripted command fails, and re-running on an already compact disk returns
+  // nothing legitimately. It is shown as a warning, never as a success.
+  if (doubt === 'no-space') return { ok: true, warning: true, lines, outro: 'Compacted, but no space was returned.' };
+  if (doubt === 'unknown') return { ok: true, warning: true, lines, outro: 'Compacted, but the space returned is unknown.' };
+  return { ok: true, warning: false, lines, outro: 'Machine disk compacted.' };
 }
 
 // ---------------------------------------------------------------------------

@@ -75,7 +75,7 @@ function fakeRunner(opts: FakeOptions = {}) {
     },
     elevateCompact: async (path) => {
       calls.push(`elevate ${path}`);
-      const result = opts.elevation ?? { kind: 'ok' };
+      const result = opts.elevation ?? { kind: 'ok', logTail: 'DiskPart successfully compacted the virtual disk file.' };
       if (result.kind === 'ok') {
         compacted = true;
         size = 31 * GB;
@@ -149,6 +149,7 @@ describe('compactVhdx', () => {
       before: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
       after: { vhdxBytes: 31 * GB, freeBytes: 71 * GB },
       drive: 'D',
+      diskpartOutput: 'DiskPart successfully compacted the virtual disk file.',
       restarted: true,
     });
   });
@@ -238,6 +239,7 @@ describe('compactVhdx', () => {
       before: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
       after: { vhdxBytes: null, freeBytes: null },
       drive: 'D',
+      diskpartOutput: 'DiskPart successfully compacted the virtual disk file.',
       restarted: true,
     });
     assert.equal(calls.at(-1), 'machineStart dev');
@@ -292,44 +294,69 @@ describe('describeCompactOutcome', () => {
         before: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
         after: { vhdxBytes: 31 * GB, freeBytes: 71 * GB },
         drive: 'D',
+        diskpartOutput: 'DiskPart successfully compacted the virtual disk file.',
         restarted: true,
       },
       target,
     );
     assert.equal(d.ok, true);
+    assert.equal(d.warning, false);
     assert.deepEqual(d.lines, [
       'Disk: 70.0 GB → 31.0 GB (39.0 GB returned to Windows)',
       'D: free: 32.0 GB → 71.0 GB',
       'The machine was started again.',
     ]);
+    assert.equal(d.outro, 'Machine disk compacted.');
   });
 
-  it('says so when the compact returned no space, without failing', () => {
+  it('warns, with diskpart output, when the compact returned no space', () => {
+    // diskpart's error phrases are only recognised in English, so on another
+    // display language a failed compact can look like this. Not a success line.
     const d = describeCompactOutcome(
       {
         kind: 'compacted',
         before: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
         after: { vhdxBytes: 70 * GB, freeBytes: 32 * GB },
         drive: 'D',
+        diskpartOutput: 'DiskPart a rencontré une erreur : Le fichier est utilisé.',
         restarted: true,
       },
       target,
     );
     assert.equal(d.ok, true);
+    assert.equal(d.warning, true);
     assert.deepEqual(d.lines, [
-      'Compacted, but no space was returned: the disk is still 70.0 GB.',
+      'Compacting returned no space: the disk is still 70.0 GB.',
+      "That is expected when there was nothing to reclaim. diskpart reported no error, but its messages are only recognised in English; if Windows uses another display language, check diskpart's output:",
+      'DiskPart a rencontré une erreur : Le fichier est utilisé.',
       'D: free: 32.0 GB → 32.0 GB',
       'The machine was started again.',
     ]);
+    assert.equal(d.outro, 'Compacted, but no space was returned.');
   });
 
   it('reports unknown sizes without guessing what was returned', () => {
     const d = describeCompactOutcome(
-      { kind: 'compacted', before: { vhdxBytes: 70 * GB, freeBytes: null }, after: { vhdxBytes: null, freeBytes: null }, drive: 'D', restarted: true },
+      {
+        kind: 'compacted',
+        before: { vhdxBytes: 70 * GB, freeBytes: null },
+        after: { vhdxBytes: null, freeBytes: null },
+        drive: 'D',
+        diskpartOutput: 'DiskPart successfully compacted the virtual disk file.',
+        restarted: true,
+      },
       target,
     );
     assert.equal(d.ok, true);
-    assert.deepEqual(d.lines, ['Disk: 70.0 GB → unknown', 'D: free: unknown → unknown', 'The machine was started again.']);
+    assert.equal(d.warning, true);
+    assert.deepEqual(d.lines, [
+      'Disk: 70.0 GB → unknown',
+      "Could not measure the disk afterwards, so the space returned is unknown. diskpart reported no error, but its messages are only recognised in English; if Windows uses another display language, check diskpart's output:",
+      'DiskPart successfully compacted the virtual disk file.',
+      'D: free: unknown → unknown',
+      'The machine was started again.',
+    ]);
+    assert.equal(d.outro, 'Compacted, but the space returned is unknown.');
   });
 
   it('describes a diskpart error behind an exit code of 0, and a compact that did not complete', () => {
@@ -356,6 +383,7 @@ describe('describeCompactOutcome', () => {
   it('explains a block when the engine could not be asked', () => {
     const d = describeCompactOutcome({ kind: 'blocked', running: null, afterTrim: false }, target);
     assert.match(d.lines[0], /Could not ask Podman/);
+    assert.equal(d.outro, 'Nothing was changed.');
   });
 
   it('says the machine was never stopped when the block came after the trim', () => {
@@ -383,6 +411,19 @@ describe('describeCompactOutcome', () => {
     assert.match(failed.lines.join('\n'), /nothing was stopped or compacted/);
   });
 
+  it('leaves out the output line when diskpart printed nothing', () => {
+    const d = describeCompactOutcome(
+      { kind: 'compacted', before: { vhdxBytes: 5, freeBytes: null }, after: { vhdxBytes: 5, freeBytes: null }, drive: null, diskpartOutput: '', restarted: true },
+      target,
+    );
+    assert.equal(d.warning, true);
+    assert.deepEqual(d.lines, [
+      'Compacting returned no space: the disk is still 0.0 GB.',
+      'That is expected when there was nothing to reclaim. diskpart reported no error, but its messages are only recognised in English.',
+      'The machine was started again.',
+    ]);
+  });
+
   it('fails every non-success outcome, saying the machine was restarted', () => {
     const outcomes = [
       { kind: 'declined', restarted: true },
@@ -393,17 +434,20 @@ describe('describeCompactOutcome', () => {
     for (const o of outcomes) {
       const d = describeCompactOutcome(o, target);
       assert.equal(d.ok, false, o.kind);
+      assert.equal(d.warning, false, o.kind);
       assert.equal(d.lines.at(-1), 'The machine was started again.', o.kind);
+      assert.equal(d.outro, 'The disk was not compacted.', o.kind);
     }
   });
 
   it('tells the user to start the machine when the restart failed, even after a compact', () => {
     const d = describeCompactOutcome(
-      { kind: 'compacted', before: { vhdxBytes: 1, freeBytes: 1 }, after: { vhdxBytes: 1, freeBytes: 1 }, drive: 'D', restarted: false },
+      { kind: 'compacted', before: { vhdxBytes: 2, freeBytes: 1 }, after: { vhdxBytes: 1, freeBytes: 1 }, drive: 'D', diskpartOutput: '', restarted: false },
       target,
     );
     assert.equal(d.ok, false);
     assert.match(d.lines.at(-1)!, /podman machine start dev/);
+    assert.equal(d.outro, 'Compacted, but the machine needs attention.');
   });
 });
 
