@@ -280,7 +280,7 @@ export function patchWslConfig(existing: string | null, memoryMib: number): stri
 }
 
 import { execSync } from 'node:child_process';
-import { totalmem } from 'node:os';
+import { tmpdir, totalmem } from 'node:os';
 import type { CheckResult } from './checks.js';
 import { decodeConsoleOutput, socketDeniedPhrase } from './checks.js';
 // Imported from the underlying store, not from './config.js': config.ts
@@ -446,7 +446,7 @@ export function evaluateRuntimeMemory(reading: RuntimeMemoryReading): CheckResul
 
 function execSilent(cmd: string, timeoutMs?: number): string | null {
   try {
-    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs })).trim();
+    return decodeConsoleOutput(execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, cwd: tmpdir() })).trim();
   } catch {
     return null;
   }
