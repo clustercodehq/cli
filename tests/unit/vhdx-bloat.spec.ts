@@ -113,7 +113,7 @@ describe('evaluateVhdxBloat', () => {
 
   it('mentions stopped containers only on a warning, and generically', () => {
     const warn = evaluateVhdxBloat(reading({ stoppedContainers: 2 }));
-    assert.match(warn.detail, /stopped containers also hold space; clean them up in the console$/);
+    assert.match(warn.detail, /stopped containers also hold space; stopped DevBoxes can be cleaned up in the console$/);
     const pass = evaluateVhdxBloat(reading({ hostFreeBytes: 500 * GB, stoppedContainers: 2 }));
     assert.doesNotMatch(pass.detail, /stopped/);
     const none = evaluateVhdxBloat(reading({ stoppedContainers: 0 }));
