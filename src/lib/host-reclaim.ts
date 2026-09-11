@@ -14,7 +14,7 @@
  * where freeing the guest's cache by hand still returns the memory to Windows
  * within seconds. So configuration alone answers `'configured'`, and only a
  * recorded measurement (`clustercode onboard --verify-reclaim`) answers
- * `'enforced'`. Sizing is optimistic for that one status and no other, which is
+ * `'verified'`. Sizing is optimistic for that one status and no other, which is
  * the entire point of the distinction.
  *
  * Everywhere else there is either no such knob or no VM at all: `'n/a'`.
@@ -38,7 +38,7 @@ import {
 
 export type HostReclaimStatus =
   /** Configured AND measured to return memory on this host, against this WSL and mode. */
-  | 'enforced'
+  | 'verified'
   /** Configured, never measured (or measured against something else). Sized as if it does not work. */
   | 'configured'
   /** Configured and measured NOT to return memory on this build. */
@@ -98,7 +98,7 @@ export function readReclaimVerdict(config: AppConfig): ReclaimVerdict | null {
  *
  * Every path that is not an exact match — a different build, a different mode,
  * a stamp this CLI would not write, an engine or backend nobody measured —
- * resolves to `'configured'`. That asymmetry is deliberate: a false `'enforced'`
+ * resolves to `'configured'`. That asymmetry is deliberate: a false `'verified'`
  * sizes the runtime into memory the host needs, while a false `'configured'`
  * only costs a more conservative number.
  */
@@ -136,7 +136,7 @@ export function resolveHostReclaim(
     return 'configured';
   }
   if (verdict.mode !== mode) return 'configured';
-  return verdict.result === 'yes' ? 'enforced' : 'inert';
+  return verdict.result === 'yes' ? 'verified' : 'inert';
 }
 
 /** Ceiling on the `wsl --version` probe, which `doctor` runs on every invocation. */
@@ -188,7 +188,7 @@ export function probeHostReclaim(
   if (provider !== undefined && provider !== 'wsl' && provider !== 'unknown') return 'n/a';
   // Docker on the WSL2 backend is governed by the same file, so it is included
   // deliberately — it can be 'off', 'unsupported' or 'configured'. It is never
-  // 'enforced': this CLI cannot measure Docker's VM, so no verdict describes it.
+  // 'verified': this CLI cannot measure Docker's VM, so no verdict describes it.
   if (engineName !== 'podman' && engineName !== 'docker') return 'n/a';
 
   return resolveHostReclaim(

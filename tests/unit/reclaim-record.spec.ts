@@ -213,7 +213,7 @@ describe('storedSizeAboveNoReclaimCeiling', () => {
   });
 
   test('is quiet when reclaim is verified', () => {
-    assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status: 'enforced' }), null);
+    assert.equal(storedSizeAboveNoReclaimCeiling({ ...base, status: 'verified' }), null);
   });
 
   test('is quiet at or below the ceiling', () => {

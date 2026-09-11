@@ -44,7 +44,7 @@ describe('resolveHostReclaim', () => {
 
   // A verdict was measured against a WSL VM. A backend nobody could identify
   // may not be that VM at all, so the measurement cannot be carried over to it.
-  test('an unknown provider is never enforced, and never inert, whatever was recorded', () => {
+  test('an unknown provider is never verified, and never inert, whatever was recorded', () => {
     for (const provider of ['unknown', undefined] as (MachineProvider | undefined)[]) {
       assert.equal(
         resolveHostReclaim('win32', 'podman', provider, RECLAIM_ON, WSL_2, verdict()),
@@ -61,7 +61,7 @@ describe('resolveHostReclaim', () => {
 
   // Docker's VM cannot be measured from this CLI, so no verdict describes it.
   // It can be configured; it can never earn the smaller reserve.
-  test('Docker on WSL reads the file but is never enforced', () => {
+  test('Docker on WSL reads the file but is never verified', () => {
     assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', null, WSL_2, null), 'off');
     assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', RECLAIM_ON, WSL_2, null), 'configured');
     assert.equal(resolveHostReclaim('win32', 'docker', 'wsl', RECLAIM_ON, WSL_2, verdict()), 'configured');
@@ -86,11 +86,11 @@ describe('resolveHostReclaim', () => {
 
   test('is case-insensitive about the value', () => {
     const text = '[experimental]\nautoMemoryReclaim=Gradual\n';
-    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, verdict()), 'enforced');
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, verdict()), 'verified');
   });
 
-  test('a yes verdict measured against this WSL and this mode is enforced', () => {
-    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_2, verdict()), 'enforced');
+  test('a yes verdict measured against this WSL and this mode is verified', () => {
+    assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_2, verdict()), 'verified');
   });
 
   // Whether the trigger fires is a property of the build, not of the host, so a
@@ -124,7 +124,7 @@ describe('resolveHostReclaim', () => {
     );
   });
 
-  test('a verdict recorded without its mode is not enforced', () => {
+  test('a verdict recorded without its mode is not verified', () => {
     assert.equal(
       resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_2, verdict({ mode: null })),
       'configured',
@@ -154,7 +154,7 @@ describe('resolveHostReclaim', () => {
     );
   });
 
-  test('an explicitly disabled value is off, not enforced', () => {
+  test('an explicitly disabled value is off, not verified', () => {
     const text = '[experimental]\nautoMemoryReclaim=disabled\n';
     assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', text, WSL_2, null), 'off');
   });
@@ -189,7 +189,7 @@ describe('resolveHostReclaim', () => {
     assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, WSL_1, null), 'unsupported');
   });
 
-  test('an unreadable version is treated as unsupported, not as enforced', () => {
+  test('an unreadable version is treated as unsupported, not as verified', () => {
     assert.equal(resolveHostReclaim('win32', 'podman', 'wsl', RECLAIM_ON, null, verdict()), 'unsupported');
   });
 });

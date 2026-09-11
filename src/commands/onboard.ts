@@ -728,7 +728,7 @@ async function offerRuntimeMemory(
   // Sizing depends on whether the VM ever gives memory back, because the host
   // reserve is only real if something enforces it — and *writing* the setting
   // is not enforcing it. It has been measured accepted and inert, so only a
-  // recorded measurement ('enforced') buys the smaller reserve. Eligibility
+  // recorded measurement ('verified') buys the smaller reserve. Eligibility
   // still decides whether the entry gets written; it no longer decides sizing,
   // which is what let a machine be sized on a promise it had never kept.
   const reclaimStatus = probeHostReclaim(engineName, platform, provider);
@@ -737,7 +737,7 @@ async function offerRuntimeMemory(
     provider === 'wsl' &&
     engineName === 'podman' &&
     reclaimStatus !== 'unsupported';
-  const reclaim: HostReclaim = reclaimStatus === 'enforced' ? 'enforced' : 'none';
+  const reclaim: HostReclaim = reclaimStatus === 'verified' ? 'verified' : 'none';
 
   const dedicatedRecommendation = recommendForUse(hostBytes, platform, 'dedicated', reclaim);
   const sharedRecommendation = recommendForUse(hostBytes, platform, 'shared', reclaim);
@@ -795,7 +795,7 @@ async function offerRuntimeMemory(
     // pick one.
     const ceilingNote =
       platform === 'win32'
-        ? reclaimStatus === 'enforced'
+        ? reclaimStatus === 'verified'
           ? 'This is a ceiling, not a reservation — memory is used while DevBoxes run and returned to Windows gradually while the runtime is idle.'
           : reclaimStatus === 'configured'
             ? 'Memory reclaim is configured but has not been verified on this machine — this number is sized as if it does not work; run `clustercode onboard --verify-reclaim` to check.'
@@ -1071,20 +1071,20 @@ async function offerReclaimVerification(ctx: {
 
   // Verified: this host has earned the smaller reserve, so the number it was
   // sized with a moment ago is now needlessly conservative.
-  const enforced = recommendForUse(ctx.hostBytes, ctx.platform, 'dedicated', 'enforced');
-  if (enforced <= 0 || (ctx.currentMib !== null && enforced <= ctx.currentMib)) return;
+  const verified = recommendForUse(ctx.hostBytes, ctx.platform, 'dedicated', 'verified');
+  if (verified <= 0 || (ctx.currentMib !== null && verified <= ctx.currentMib)) return;
   const raise = await clack.confirm({
-    message: `Reclaim verified — raise the runtime to ${(enforced / 1024).toFixed(0)} GiB?`,
+    message: `Reclaim verified — raise the runtime to ${(verified / 1024).toFixed(0)} GiB?`,
   });
   if (clack.isCancel(raise) || !raise) return;
   await applyMemoryTarget({
     provider: ctx.provider,
     platform: ctx.platform,
     engineName: ctx.engineName,
-    target: enforced,
+    target: verified,
     reclaimEligible: true,
     hasExplicitFlag: ctx.flagMemory !== undefined,
-    nonInteractiveHint: `Re-run with ${pc.bold(`--memory ${enforced}`)} to apply it non-interactively.`,
+    nonInteractiveHint: `Re-run with ${pc.bold(`--memory ${verified}`)} to apply it non-interactively.`,
   });
 }
 
@@ -1216,7 +1216,7 @@ export function storedSizeAboveNoReclaimCeiling(ctx: {
   status: HostReclaimStatus;
   targetMib: number;
 }): number | null {
-  if (ctx.platform !== 'win32' || ctx.status === 'enforced' || ctx.status === 'n/a') return null;
+  if (ctx.platform !== 'win32' || ctx.status === 'verified' || ctx.status === 'n/a') return null;
   const ceiling = recommendForUse(ctx.hostBytes, ctx.platform, 'dedicated', 'none');
   return ceiling > 0 && ctx.targetMib > ceiling ? ceiling : null;
 }

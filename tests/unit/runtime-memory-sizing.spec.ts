@@ -86,21 +86,21 @@ describe('estimateDevboxes', () => {
 describe('hostReserveMib', () => {
   const HOST_32_MIB = 32768;
 
-  test('win32 dedicated reserves 6144 MiB when reclaim is enforced', () => {
-    assert.equal(hostReserveMib('win32', 'dedicated', 'enforced', HOST_32_MIB), 6144);
+  test('win32 dedicated reserves 6144 MiB when reclaim is verified', () => {
+    assert.equal(hostReserveMib('win32', 'dedicated', 'verified', HOST_32_MIB), 6144);
   });
 
   test('win32 shared reserves 12288 MiB — double the dedicated reserve', () => {
-    assert.equal(hostReserveMib('win32', 'shared', 'enforced', HOST_32_MIB), 12288);
+    assert.equal(hostReserveMib('win32', 'shared', 'verified', HOST_32_MIB), 12288);
   });
 
   test('darwin matches win32', () => {
-    assert.equal(hostReserveMib('darwin', 'dedicated', 'enforced', HOST_32_MIB), 6144);
-    assert.equal(hostReserveMib('darwin', 'shared', 'enforced', HOST_32_MIB), 12288);
+    assert.equal(hostReserveMib('darwin', 'dedicated', 'verified', HOST_32_MIB), 6144);
+    assert.equal(hostReserveMib('darwin', 'shared', 'verified', HOST_32_MIB), 12288);
   });
 
   test('linux reserves nothing — there is no VM to protect a host around', () => {
-    for (const reclaim of ['enforced', 'none'] as const) {
+    for (const reclaim of ['verified', 'none'] as const) {
       assert.equal(hostReserveMib('linux', 'dedicated', reclaim, HOST_32_MIB), 0);
       assert.equal(hostReserveMib('linux', 'shared', reclaim, HOST_32_MIB), 0);
     }
@@ -124,13 +124,13 @@ describe('hostReserveMib', () => {
     assert.equal(hostReserveMib('win32', 'shared', 'none', 131072), 12288);
   });
 
-  test('the no-reclaim reserve is never smaller than the reclaim-enforced one', () => {
+  test('the no-reclaim reserve is never smaller than the reclaim-verified one', () => {
     for (let gb = 8; gb <= 128; gb++) {
       for (const platform of ['win32', 'darwin'] as const) {
         const hostMib = gb * 1024;
         assert.ok(
           hostReserveMib(platform, 'dedicated', 'none', hostMib) >=
-            hostReserveMib(platform, 'dedicated', 'enforced', hostMib),
+            hostReserveMib(platform, 'dedicated', 'verified', hostMib),
           `${gb}GiB ${platform}`,
         );
       }
@@ -146,43 +146,43 @@ describe('recommendForUse', () => {
     // 32392 - 6144 = 26248; floor(26248 / 1024) * 1024 = 25600. Rounding to
     // 26624 (as an earlier, wrong implementation did) would leave the host
     // only 5768 MiB — less than the 6144 MiB reserve this function promises.
-    assert.equal(recommendForUse(HOST_31_6_GIB, 'win32', 'dedicated', 'enforced'), 25600);
+    assert.equal(recommendForUse(HOST_31_6_GIB, 'win32', 'dedicated', 'verified'), 25600);
   });
 
   test('shared on the worked win32 host is 15360 MiB (15 GiB) — floored, never rounded', () => {
     // min(floor(32392 * 0.5), 32392 - 12288) = min(16196, 20104) = 16196;
     // floor(16196 / 1024) * 1024 = 15360.
-    assert.equal(recommendForUse(HOST_31_6_GIB, 'win32', 'shared', 'enforced'), 15360);
+    assert.equal(recommendForUse(HOST_31_6_GIB, 'win32', 'shared', 'verified'), 15360);
   });
 
   test('dedicated on a round 16 GiB darwin host reserves 6 GiB', () => {
     // 16384 - 6144 = 10240, already a whole GiB.
-    assert.equal(recommendForUse(16384 * MIB, 'darwin', 'dedicated', 'enforced'), 10240);
+    assert.equal(recommendForUse(16384 * MIB, 'darwin', 'dedicated', 'verified'), 10240);
   });
 
   test('shared caps at half the host even when the reserve would allow more', () => {
     // 16384 MiB darwin: half is 8192, but host-minus-reserve is 4096 — the
     // smaller of the two (the reserve) wins here.
-    assert.equal(recommendForUse(16384 * MIB, 'darwin', 'shared', 'enforced'), 4096);
+    assert.equal(recommendForUse(16384 * MIB, 'darwin', 'shared', 'verified'), 4096);
   });
 
   test('linux dedicated hands over the whole host, floored to a GiB', () => {
     // 20000 MiB, no reserve: floor(20000 / 1024) * 1024 = 19 * 1024 = 19456.
-    assert.equal(recommendForUse(20000 * MIB, 'linux', 'dedicated', 'enforced'), 19456);
+    assert.equal(recommendForUse(20000 * MIB, 'linux', 'dedicated', 'verified'), 19456);
   });
 
   test('linux shared is half the host, floored to a GiB', () => {
     // half of 20000 is 10000; floor(10000 / 1024) * 1024 = 9 * 1024 = 9216.
-    assert.equal(recommendForUse(20000 * MIB, 'linux', 'shared', 'enforced'), 9216);
+    assert.equal(recommendForUse(20000 * MIB, 'linux', 'shared', 'verified'), 9216);
   });
 
   test('returns 0 rather than a negative or sub-floor number on a small host', () => {
-    assert.equal(recommendForUse(6000 * MIB, 'win32', 'dedicated', 'enforced'), 0);
-    assert.equal(recommendForUse(6000 * MIB, 'win32', 'shared', 'enforced'), 0);
+    assert.equal(recommendForUse(6000 * MIB, 'win32', 'dedicated', 'verified'), 0);
+    assert.equal(recommendForUse(6000 * MIB, 'win32', 'shared', 'verified'), 0);
   });
 
   test('handles a zero or nonsense host reading without throwing', () => {
-    assert.equal(recommendForUse(0, 'win32', 'dedicated', 'enforced'), 0);
+    assert.equal(recommendForUse(0, 'win32', 'dedicated', 'verified'), 0);
     assert.equal(recommendForUse(-1, 'win32', 'shared', 'none'), 0);
   });
 
@@ -208,23 +208,23 @@ describe('recommendForUse', () => {
     test('shared is unchanged — its reserve already assumes the machine is in use', () => {
       assert.equal(
         recommendForUse(HOST_31_6_GIB, 'win32', 'shared', 'none'),
-        recommendForUse(HOST_31_6_GIB, 'win32', 'shared', 'enforced'),
+        recommendForUse(HOST_31_6_GIB, 'win32', 'shared', 'verified'),
       );
     });
 
     test('linux is unchanged at 0 reserve — there is no VM to reclaim from', () => {
       assert.equal(
         recommendForUse(20000 * MIB, 'linux', 'dedicated', 'none'),
-        recommendForUse(20000 * MIB, 'linux', 'dedicated', 'enforced'),
+        recommendForUse(20000 * MIB, 'linux', 'dedicated', 'verified'),
       );
     });
 
-    test('never recommends more than the reclaim-enforced sizing would', () => {
+    test('never recommends more than the reclaim-verified sizing would', () => {
       for (let gb = 8; gb <= 128; gb++) {
         for (const platform of ['win32', 'darwin'] as const) {
           assert.ok(
             recommendForUse(gb * 1024 * MIB, platform, 'dedicated', 'none') <=
-              recommendForUse(gb * 1024 * MIB, platform, 'dedicated', 'enforced'),
+              recommendForUse(gb * 1024 * MIB, platform, 'dedicated', 'verified'),
             `${gb}GiB ${platform}`,
           );
         }
@@ -233,7 +233,7 @@ describe('recommendForUse', () => {
   });
 
   for (const platform of ['win32', 'darwin'] as const) {
-    for (const reclaim of ['enforced', 'none'] as const) {
+    for (const reclaim of ['verified', 'none'] as const) {
       test(`never recommends more than the host reserve allows (${platform}, reclaim ${reclaim})`, () => {
         for (let gb = 8; gb <= 128; gb++) {
           const hostMib = gb * 1024;

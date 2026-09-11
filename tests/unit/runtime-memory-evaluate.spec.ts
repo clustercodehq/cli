@@ -380,14 +380,14 @@ describe('memory reclaim', () => {
   // Verified is the only status that buys the smaller host reserve, so it is
   // the only one that can offer a bigger runtime.
   test('reclaim verified passes and offers the room it just earned', () => {
-    const r = wsl({ reclaim: 'enforced' });
+    const r = wsl({ reclaim: 'verified' });
     assert.equal(r.status, 'pass');
     assert.match(r.detail, /memory reclaim verified/);
     assert.match(r.detail, /up to 26\.0 GiB/);
   });
 
   test('...and says nothing once the runtime is already that big', () => {
-    const r = wsl({ reclaim: 'enforced', engine: { memTotalBytes: 26624 * MIB, cpus: 8 } });
+    const r = wsl({ reclaim: 'verified', engine: { memTotalBytes: 26624 * MIB, cpus: 8 } });
     assert.equal(r.status, 'pass');
     assert.doesNotMatch(r.detail, /reclaim/);
   });
@@ -461,7 +461,7 @@ describe('memory reclaim', () => {
     assert.match(r.detail, /\[wsl2\] memory= to 24576MB/);
   });
 
-  for (const reclaim of ['configured', 'inert', 'enforced'] as const) {
+  for (const reclaim of ['configured', 'inert', 'verified'] as const) {
     test(`${reclaim} keeps the single-line and name/status/detail-only contracts`, () => {
       const r = wsl({ reclaim, engine: { memTotalBytes: 25600 * MIB, cpus: 8 } });
       assert.doesNotMatch(r.detail, /\n/);
@@ -511,7 +511,7 @@ describe('memory reclaim', () => {
   // An unprobed reading is graded as pessimistically as an off one: a
   // recommendation built on an assumption of reclaim that turns out to be wrong
   // is the exact failure this field was added for.
-  test('an absent status sizes like no reclaim, not like enforced', () => {
+  test('an absent status sizes like no reclaim, not like verified', () => {
     const r = evaluateRuntimeMemory({
       engine: { memTotalBytes: 8192 * MIB, cpus: 8 },
       hostBytes: HOST_32GB, engineName: 'podman', platform: 'win32',

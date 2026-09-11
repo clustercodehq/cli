@@ -184,7 +184,7 @@ function lowerAction(r: HostMemoryReading, ceilingMib: number): string {
  */
 function reclaimPhrase(reclaim: HostReclaimStatus): string | null {
   switch (reclaim) {
-    case 'enforced':
+    case 'verified':
       return 'is on but not keeping up';
     case 'configured':
       return 'is configured but unverified';

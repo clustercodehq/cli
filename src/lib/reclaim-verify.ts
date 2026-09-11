@@ -290,7 +290,7 @@ export function reclaimVerificationRefusal(ctx: {
   switch (ctx.status) {
     case 'configured':
     case 'inert':
-    case 'enforced':
+    case 'verified':
       return null;
     case 'off':
       return 'Memory reclaim is off, so there is nothing to measure. Run `clustercode onboard` to turn it on first.';

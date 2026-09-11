@@ -305,8 +305,8 @@ describe('guest probes', () => {
 describe('reclaimVerificationRefusal', () => {
   const ok = { engineName: 'podman', provider: 'wsl' as const, status: 'configured' as const };
 
-  test('Podman on WSL with reclaim configured, inert or enforced may be measured', () => {
-    for (const status of ['configured', 'inert', 'enforced'] as const) {
+  test('Podman on WSL with reclaim configured, inert or verified may be measured', () => {
+    for (const status of ['configured', 'inert', 'verified'] as const) {
       assert.equal(reclaimVerificationRefusal({ ...ok, status }), null, status);
     }
   });

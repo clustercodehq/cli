@@ -79,9 +79,9 @@ describe('evaluateHostMemory', () => {
     assert.match(r.detail, /clustercode onboard --memory 24576/);
   });
 
-  test('says reclaim is on but not keeping up when it is enforced and the host is still short', () => {
+  test('says reclaim is on but not keeping up when it is verified and the host is still short', () => {
     const r = evaluateHostMemory(
-      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'enforced' }),
+      reading({ availableBytes: 2 * 1024 * MIB, engineMib: 8192, reclaim: 'verified' }),
     );
     assert.match(r.detail, /reclaim is on but not keeping up/);
   });

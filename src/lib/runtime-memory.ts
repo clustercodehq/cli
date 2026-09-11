@@ -116,7 +116,7 @@ export type MachineUse = 'dedicated' | 'shared';
  * has ever touched (the guest's page cache above all) remains charged to the
  * host until the VM is shut down.
  */
-export type HostReclaim = 'enforced' | 'none';
+export type HostReclaim = 'verified' | 'none';
 
 /** Floor on the no-reclaim reserve — the same figure `LEAVE_HOST_MIB` uses. */
 const NO_RECLAIM_RESERVE_MIN_MIB = LEAVE_HOST_MIB;
@@ -147,7 +147,7 @@ export function hostReserveMib(
 ): number {
   if (platform === 'linux') return 0;
   if (use === 'shared') return 12288;
-  if (reclaim === 'enforced') return 6144;
+  if (reclaim === 'verified') return 6144;
   return Math.max(
     NO_RECLAIM_RESERVE_MIN_MIB,
     Math.floor(Math.max(0, hostMib) * NO_RECLAIM_RESERVE_SHARE),
@@ -298,7 +298,7 @@ export interface RuntimeMemoryReading {
    */
   provider?: MachineProvider;
   /**
-   * Whether the VM returns memory to the host while it runs. Only `'enforced'`
+   * Whether the VM returns memory to the host while it runs. Only `'verified'`
    * — configured *and* measured to work on this host — is sized optimistically;
    * `'configured'`, `'inert'`, `'off'`, `'unsupported'` and an absent value are
    * all graded the same, because a recommendation built on an assumption of
@@ -310,7 +310,7 @@ export interface RuntimeMemoryReading {
 
 /** How a probed reclaim status feeds the sizing math. */
 function reclaimForSizing(status: HostReclaimStatus | undefined): HostReclaim {
-  return status === 'enforced' ? 'enforced' : 'none';
+  return status === 'verified' ? 'verified' : 'none';
 }
 
 /** A reading within this fraction of the configured value counts as "that value". */
@@ -466,12 +466,12 @@ function reclaimAdvice(reading: RuntimeMemoryReading, engineMib: number): { text
   // be news to a runtime that was sized conservatively before anyone knew.
   // Deliberately not routed through `dedicatedNudge`, which stays quiet once a
   // size is stored — the stored size was chosen under the old assumption.
-  if (reclaim === 'enforced') {
-    const enforcedRec = recommendForUse(hostBytes, platform, 'dedicated', 'enforced');
-    if (engineMib < enforcedRec && estimateDevboxes(enforcedRec) > estimateDevboxes(engineMib)) {
+  if (reclaim === 'verified') {
+    const verifiedRec = recommendForUse(hostBytes, platform, 'dedicated', 'verified');
+    if (engineMib < verifiedRec && estimateDevboxes(verifiedRec) > estimateDevboxes(engineMib)) {
       return {
         warn: false,
-        text: ` (memory reclaim verified — up to ${gib(enforcedRec * MIB)} GiB; see \`clustercode onboard\`)`,
+        text: ` (memory reclaim verified — up to ${gib(verifiedRec * MIB)} GiB; see \`clustercode onboard\`)`,
       };
     }
   }
