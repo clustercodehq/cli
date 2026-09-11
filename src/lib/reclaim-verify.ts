@@ -6,10 +6,24 @@
  * cache by hand still hands the memory straight back to Windows. Nothing in the
  * configuration distinguishes that host from one where the feature works, so
  * the CLI measures instead of assuming: fill the guest's page cache, leave the
- * machine completely alone, and watch the VM's working set from the Windows
- * side.
+ * machine completely alone, and watch the VM from the Windows side.
  *
- * Two properties of the procedure matter more than they look:
+ * A 'yes' unlocks a smaller host reserve, and a false 'yes' sizes the runtime
+ * into memory the host needs. So the verdict is built to be hard to earn by
+ * accident, and every doubt resolves to 'inconclusive' (which records nothing)
+ * or 'no' (which sizes conservatively):
+ *
+ * - Only the WSL VM's own process is watched, never every VM on the machine.
+ * - A shrinking working set is not enough on its own. Windows can trim a
+ *   process's working set without getting the memory back, so what Windows has
+ *   available must rise alongside it, for several consecutive samples.
+ * - Windows trims hardest when it is itself short of memory, and that looks
+ *   like reclaim from the outside. A run during which the host went short
+ *   proves nothing, so the fill is also sized to keep the host clear of that.
+ * - Finally the guest is asked: reclaim works by the guest releasing its cache,
+ *   and a trim leaves that cache exactly where it was.
+ *
+ * Two further properties of the procedure matter more than they look:
  *
  * 1. **The fill reads; it never writes.** The guest's disk is a sparse virtual
  *    disk that grows and never shrinks, so writing a few GiB of zeros to fill
@@ -19,27 +33,61 @@
  *    the same cache and costs nothing.
  * 2. **The idle phase never touches the machine.** Reclaim only runs when the
  *    guest is idle, and every `wsl`/`podman` command resets that. Sampling is
- *    therefore Windows-side only (`tasklist` and the host's own free memory).
+ *    therefore Windows-side only (`tasklist` and the host's own free memory);
+ *    the guest is consulted again only once the idle phase is over.
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { hostAvailableBytes } from './host-memory.js';
+import { statSync } from 'node:fs';
+import { hostAvailableBytes as readHostAvailableBytes, hostPressureFloorMib } from './host-memory.js';
+import { wslConfigPath } from './runtime-memory-apply.js';
+import type { MachineProvider } from './runtime-memory.js';
+import type { HostReclaimStatus } from './host-reclaim.js';
 
 export interface ReclaimSample {
+  /** Working set of the WSL VM process. */
   vmMemBytes: number;
+  /** What Windows can still hand out. */
   hostAvailableBytes: number;
+  /** The VM process, so a restart mid-run is caught rather than read as a return. */
+  pid: number;
   at: number;
 }
 
 export type ReclaimVerdictResult = 'yes' | 'no' | 'inconclusive';
 
-/** Fraction of the cache we filled that must come back for a 'yes'. */
+export interface JudgeOutcome {
+  result: ReclaimVerdictResult;
+  /** Why the run proves nothing, when it is 'inconclusive'. */
+  reason?: string;
+}
+
+const MIB = 1024 * 1024;
+
+/** Fraction of the growth we caused that must come back for a 'yes'. */
 const RETURN_FRACTION = 0.5;
 /** ...and the fraction of the fill that must actually land, or the run proves nothing. */
 const LANDED_FRACTION = 0.5;
+/** Growth below this is within what an idle VM and a desktop do on their own. */
+export const MIN_LANDED_MIB = 1024;
+/** Windows must gain at least this fraction of what the VM gave back. */
+const HOST_RISE_FRACTION = 0.5;
+/** Qualifying samples in a row before a return counts. At 30 s apart: 90 s held. */
+export const CONSECUTIVE_SAMPLES = 3;
+/** The guest must have released at least this fraction of the required return. */
+const GUEST_CACHE_FRACTION = 0.5;
+
+/** Below this, Windows trims working sets regardless of reclaim. Same floor `doctor` warns at. */
+function hostFloorBytes(): number {
+  return hostPressureFloorMib('win32') * MIB;
+}
+
+function gib(bytes: number): string {
+  return (bytes / 1024 / 1024 / 1024).toFixed(1);
+}
 
 /**
- * Decide from the three phases of the run.
+ * Decide from the Windows-side samples of the run.
  *
  * `fillBytes` is what we asked the guest to read, not what the VM grew by: a
  * read-fill is bounded by how much data exists to read, so the landing check is
@@ -51,42 +99,104 @@ export function judgeReclaim(
   filled: ReclaimSample,
   idle: ReclaimSample[],
   fillBytes: number,
-): ReclaimVerdictResult {
+): JudgeOutcome {
   const grew = filled.vmMemBytes - baseline.vmMemBytes;
   // Nothing to observe: the cache never loaded, so neither answer is earned.
-  if (fillBytes <= 0 || grew < fillBytes * LANDED_FRACTION) return 'inconclusive';
-  const target = filled.vmMemBytes - grew * RETURN_FRACTION;
-  return idle.some((s) => s.vmMemBytes <= target) ? 'yes' : 'no';
+  if (fillBytes <= 0 || grew < fillBytes * LANDED_FRACTION || grew < MIN_LANDED_MIB * MIB) {
+    return {
+      result: 'inconclusive',
+      reason:
+        `the data read into the VM's cache did not land in its memory ` +
+        `(it grew ${gib(Math.max(0, grew))} GiB for ${gib(fillBytes)} GiB read)`,
+    };
+  }
+  if ([filled, ...idle].some((s) => s.pid !== baseline.pid)) {
+    return { result: 'inconclusive', reason: 'the runtime VM restarted during the measurement' };
+  }
+  const floor = hostFloorBytes();
+  if ([filled, ...idle].some((s) => s.hostAvailableBytes < floor)) {
+    return {
+      result: 'inconclusive',
+      reason:
+        `Windows ran short of memory during the measurement (below ${gib(floor)} GiB available), ` +
+        'and then it shrinks the VM whether or not reclaim works. Close other programs and try again',
+    };
+  }
+
+  const required = grew * RETURN_FRACTION;
+  let run = 0;
+  for (const s of idle) {
+    const vmDrop = filled.vmMemBytes - s.vmMemBytes;
+    const hostRise = s.hostAvailableBytes - filled.hostAvailableBytes;
+    const qualifies = vmDrop >= required && hostRise >= vmDrop * HOST_RISE_FRACTION;
+    run = qualifies ? run + 1 : 0;
+    if (run >= CONSECUTIVE_SAMPLES) return { result: 'yes' };
+  }
+  return { result: 'no' };
 }
 
 /**
- * Working-set bytes of the WSL VM process from `tasklist … /fo csv /nh`.
+ * Whether the guest let go of its cache over the idle phase.
  *
- * The process is `vmmem` on some builds and `vmmemWSL` on others; both are
- * accepted, and several rows are summed rather than picking one. Sizes come
- * through localized and thousands-separated ("9,932 K"), and an absent process
- * prints an INFO line instead of rows — which is `null`, not zero: zero would
- * read as "the VM gave everything back".
+ * Reclaim returns memory by the guest releasing cached pages; Windows trimming
+ * the VM's working set leaves them all in place. `requiredBytes` is the return
+ * the Windows side had to see.
  */
-export function parseTasklistWorkingSet(csv: string | null): number | null {
+export function guestReleasedCache(
+  cachedAfterFillBytes: number | null,
+  cachedAfterIdleBytes: number | null,
+  requiredBytes: number,
+): boolean {
+  if (cachedAfterFillBytes === null || cachedAfterIdleBytes === null) return false;
+  return cachedAfterFillBytes - cachedAfterIdleBytes >= requiredBytes * GUEST_CACHE_FRACTION;
+}
+
+/**
+ * The WSL VM process from `tasklist /fi "imagename eq vmmem*" /fo csv /nh`.
+ *
+ * Builds that give WSL's VM its own image name, `vmmemWSL`, leave plain `vmmem`
+ * to every other VM on the machine — Hyper-V guests, Windows Sandbox — so when
+ * a `vmmemWSL` row exists it is taken alone. Older builds name WSL's VM `vmmem`
+ * like everything else; then a single `vmmem` is used, and several are refused
+ * rather than summed or guessed between, because counting another VM's memory
+ * is how an unrelated VM shutting down would read as reclaim.
+ *
+ * Sizes come through localized and thousands-separated ("9,932 K"), and an
+ * absent process prints an INFO line instead of rows — which is `null`, not
+ * zero: zero would read as "the VM gave everything back".
+ */
+export function parseWslVmProcess(csv: string | null): { pid: number; workingSetBytes: number } | null {
   if (!csv) return null;
-  let total: number | null = null;
+  const wsl: { pid: number; workingSetBytes: number }[] = [];
+  const plain: { pid: number; workingSetBytes: number }[] = [];
   for (const line of csv.split(/\r?\n/)) {
     const fields = line.match(/"([^"]*)"/g)?.map((f) => f.slice(1, -1)) ?? [];
     if (fields.length < 5) continue;
-    if (!/^vmmem(wsl)?$/i.test(fields[0].replace(/\.exe$/i, ''))) continue;
+    const image = fields[0].replace(/\.exe$/i, '').toLowerCase();
+    if (image !== 'vmmem' && image !== 'vmmemwsl') continue;
+    const pid = Number(fields[1]);
     // Last column is the memory usage, e.g. "9,932 K".
     const kb = Number(fields[fields.length - 1].replace(/[^\d]/g, ''));
-    if (!Number.isFinite(kb) || kb <= 0) continue;
-    total = (total ?? 0) + kb * 1024;
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(kb) || kb <= 0) continue;
+    (image === 'vmmemwsl' ? wsl : plain).push({ pid, workingSetBytes: kb * 1024 });
   }
-  return total;
+  if (wsl.length > 0) return wsl.length === 1 ? wsl[0] : null;
+  return plain.length === 1 ? plain[0] : null;
+}
+
+function meminfoField(meminfo: string | null, field: string): number | null {
+  const kb = Number(meminfo?.match(new RegExp(`^${field}:\\s*(\\d+)\\s*kB`, 'm'))?.[1]);
+  return Number.isFinite(kb) && kb > 0 ? kb * 1024 : null;
 }
 
 /** Bytes of `MemAvailable` in a `/proc/meminfo`, or null. */
 export function parseMemAvailable(meminfo: string | null): number | null {
-  const kb = Number(meminfo?.match(/^MemAvailable:\s*(\d+)\s*kB/m)?.[1]);
-  return Number.isFinite(kb) && kb > 0 ? kb * 1024 : null;
+  return meminfoField(meminfo, 'MemAvailable');
+}
+
+/** Bytes of page cache (`Cached`, not `SwapCached`) in a `/proc/meminfo`, or null. */
+export function parseCached(meminfo: string | null): number | null {
+  return meminfoField(meminfo, 'Cached');
 }
 
 /** Bytes reported by `du -sb <path>` (its first field), or null. */
@@ -95,11 +205,15 @@ export function parseDuBytes(out: string | null): number | null {
   return Number.isFinite(bytes) && bytes > 0 ? bytes : null;
 }
 
-const MIB = 1024 * 1024;
+/** One literal word for a POSIX shell, whatever the path contains. */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 /** Most we will ever pull through the cache, however much room there is. */
 export const MAX_FILL_MIB = 4096;
-/** Below this the run cannot move the needle above sampling noise. */
-export const MIN_FILL_MIB = 512;
+/** Below this the run cannot land `MIN_LANDED_MIB` and clear sampling noise. */
+export const MIN_FILL_MIB = 2048;
 
 export interface FillPlan {
   fillBytes: number;
@@ -107,22 +221,39 @@ export interface FillPlan {
 }
 
 /**
- * How much to read, given what the guest can cache and what there is to read.
+ * How much to read, given what the guest can cache, what there is to read, and
+ * what the host can spare.
  *
- * Bounded three ways: the cap above, half of what the guest says it can spare
- * (filling all of it would evict the thing we are measuring), and the size of
- * the data we are reading — a read-fill cannot fill more cache than there are
- * bytes on disk to pull through it.
+ * Bounded four ways: the cap above; half of what the guest says it can spare
+ * (filling all of it would evict the thing we are measuring); the size of the
+ * data we are reading — a read-fill cannot fill more cache than there are bytes
+ * on disk to pull through it; and half of what Windows has above its own floor,
+ * because the fill is charged to Windows and a host pushed into memory pressure
+ * trims the VM, which is the one thing that can fake a 'yes'.
  */
-export function planFill(memAvailableBytes: number | null, readableBytes: number | null): FillPlan {
+export function planFill(
+  memAvailableBytes: number | null,
+  readableBytes: number | null,
+  hostAvailableBytes: number,
+): FillPlan {
   if (memAvailableBytes === null) {
     return { fillBytes: 0, reason: 'could not read the runtime VM’s memory statistics' };
   }
   if (readableBytes === null) {
     return { fillBytes: 0, reason: 'could not measure the runtime’s image store' };
   }
-  const target = Math.min(MAX_FILL_MIB * MIB, Math.floor(memAvailableBytes / 2), readableBytes);
+  const hostRoom = Math.max(0, Math.floor((hostAvailableBytes - hostFloorBytes()) / 2));
+  const guestRoom = Math.min(MAX_FILL_MIB * MIB, Math.floor(memAvailableBytes / 2), readableBytes);
+  const target = Math.min(guestRoom, hostRoom);
   if (target < MIN_FILL_MIB * MIB) {
+    if (hostRoom < guestRoom) {
+      return {
+        fillBytes: 0,
+        reason:
+          `the host has only ${gib(hostAvailableBytes)} GiB available, too little to load the VM's cache ` +
+          'without putting Windows under memory pressure — close other programs and try again',
+      };
+    }
     return {
       fillBytes: 0,
       reason:
@@ -133,59 +264,143 @@ export function planFill(memAvailableBytes: number | null, readableBytes: number
   return { fillBytes: target };
 }
 
-function sshOutput(script: string, timeoutMs: number): string | null {
-  try {
-    return execFileSync('podman', ['machine', 'ssh', script], {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: timeoutMs,
-    });
-  } catch {
-    return null;
-  }
-}
-
-function containersRunning(): boolean {
-  try {
+/**
+ * Who may be measured at all.
+ *
+ * The procedure watches a Podman machine on the WSL backend, so that is the
+ * only runtime it can say anything about. Measuring with reclaim switched off
+ * would record a 'no' that later reads as "inert" the moment someone switches
+ * it on. Returns the refusal, or null when the run may go ahead.
+ */
+export function reclaimVerificationRefusal(ctx: {
+  engineName: string | null;
+  provider: MachineProvider | undefined;
+  status: HostReclaimStatus;
+}): string | null {
+  if (!ctx.engineName) return 'No container runtime was found, so there is nothing to measure.';
+  if (ctx.engineName === 'docker') {
     return (
-      execFileSync('podman', ['ps', '--format', '{{.Names}}'], {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 30_000,
-      }).trim() !== ''
+      'Memory reclaim can only be measured for Podman on the WSL backend. Docker’s VM cannot be ' +
+      'measured from this CLI, so Docker is always sized as if reclaim does not work.'
     );
-  } catch {
-    // Podman not answering is not evidence of a busy machine; the samples that
-    // follow will fail honestly if the runtime really is unreachable.
-    return false;
+  }
+  if (ctx.engineName !== 'podman' || ctx.provider !== 'wsl') {
+    return 'Memory reclaim can only be measured for a Podman machine on the WSL backend.';
+  }
+  switch (ctx.status) {
+    case 'configured':
+    case 'inert':
+    case 'enforced':
+      return null;
+    case 'off':
+      return 'Memory reclaim is off, so there is nothing to measure. Run `clustercode onboard` to turn it on first.';
+    case 'unsupported':
+      return 'This WSL build predates memory reclaim (it needs WSL 2.0 or newer), so there is nothing to measure.';
+    default:
+      return 'Memory reclaim can only be measured for a Podman machine on the WSL backend.';
   }
 }
 
-function windowsSample(): ReclaimSample | null {
-  let csv: string | null = null;
-  try {
-    csv = execSync('tasklist /fi "imagename eq vmmem*" /fo csv /nh', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 10_000,
-    });
-  } catch {
-    csv = null;
-  }
-  const vmMemBytes = parseTasklistWorkingSet(csv);
-  if (vmMemBytes === null) return null;
-  return { vmMemBytes, hostAvailableBytes: hostAvailableBytes(), at: Date.now() };
+/**
+ * Everything the measurement touches outside this module.
+ *
+ * Injected so every branch of `verifyReclaim` can be exercised without a VM,
+ * and so a test can prove that nothing is spawned where nothing should be.
+ */
+export interface ReclaimProbes {
+  platform: NodeJS.Platform;
+  containersRunning(): boolean;
+  /** `tasklist` CSV rows for `vmmem*` images, or null. */
+  vmProcessList(): string | null;
+  hostAvailableBytes(): number;
+  /** When the VM process started, in ms since the epoch, or null when unreadable. */
+  vmStartedAt(pid: number): number | null;
+  /** When `.wslconfig` was last written, in ms since the epoch, or null when absent. */
+  wslConfigWrittenAt(): number | null;
+  /** Run a shell script inside the runtime VM; its stdout, or null on failure. */
+  guest(script: string, timeoutMs: number): string | null;
+  sleep(ms: number): Promise<void>;
+  now(): number;
+}
+
+function defaultProbes(): ReclaimProbes {
+  return {
+    platform: process.platform,
+    containersRunning: () => {
+      try {
+        return (
+          execFileSync('podman', ['ps', '--format', '{{.Names}}'], {
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: 30_000,
+          }).trim() !== ''
+        );
+      } catch {
+        // Podman not answering is not evidence of a busy machine; the samples
+        // that follow will fail honestly if the runtime really is unreachable.
+        return false;
+      }
+    },
+    vmProcessList: () => {
+      try {
+        return execSync('tasklist /fi "imagename eq vmmem*" /fo csv /nh', {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          timeout: 10_000,
+        });
+      } catch {
+        return null;
+      }
+    },
+    hostAvailableBytes: readHostAvailableBytes,
+    vmStartedAt: (pid) => {
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      try {
+        // CIM rather than Get-Process: a VM's process is a minimal process, and
+        // opening it for its start time needs rights an ordinary user lacks.
+        const out = execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; ` +
+              `if ($p -and $p.CreationDate) { $p.CreationDate.ToUniversalTime().ToString('o') }`,
+          ],
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000 },
+        ).trim();
+        const at = Date.parse(out);
+        return Number.isFinite(at) ? at : null;
+      } catch {
+        return null;
+      }
+    },
+    wslConfigWrittenAt: () => {
+      try {
+        return statSync(wslConfigPath()).mtimeMs;
+      } catch {
+        return null;
+      }
+    },
+    guest: (script, timeoutMs) => {
+      try {
+        return execFileSync('podman', ['machine', 'ssh', script], {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          timeout: timeoutMs,
+        });
+      } catch {
+        return null;
+      }
+    },
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    now: () => Date.now(),
+  };
 }
 
 const SAMPLE_INTERVAL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 12 * 60_000;
 const FILL_TIMEOUT_MS = 10 * 60_000;
-
-function gib(bytes: number): string {
-  return (bytes / 1024 / 1024 / 1024).toFixed(1);
-}
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Run the experiment.
@@ -193,108 +408,150 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * Refuses rather than guesses: this is only meaningful for a running Podman
  * machine on the WSL backend, and only while nothing else is using it — a
  * container doing work keeps the guest from ever being idle, which is exactly
- * the condition reclaim needs.
+ * the condition reclaim needs. Callers gate on engine, backend and setting
+ * (`reclaimVerificationRefusal`) before calling this.
  */
 export async function verifyReclaim(opts: {
   fillMib?: number;
   timeoutMs?: number;
-  platform?: NodeJS.Platform;
   log: (line: string) => void;
+  probes?: ReclaimProbes;
 }): Promise<{ result: ReclaimVerdictResult; detail: string }> {
   const { log } = opts;
+  const probes = opts.probes ?? defaultProbes();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const inconclusive = (detail: string) => ({ result: 'inconclusive' as const, detail });
 
-  if ((opts.platform ?? process.platform) !== 'win32') {
-    return {
-      result: 'inconclusive',
-      detail: 'Memory reclaim is a Windows setting; there is nothing to measure here.',
-    };
+  if (probes.platform !== 'win32') {
+    return inconclusive('Memory reclaim is a Windows setting; there is nothing to measure here.');
   }
   // A container doing work keeps the guest from ever being idle, and reclaim
   // only runs when it is idle — the run would report 'no' about the workload,
   // not about the machine.
-  if (containersRunning()) {
-    return {
-      result: 'inconclusive',
-      detail: 'Containers are running, so the runtime never goes idle. Stop them and try again.',
-    };
+  if (probes.containersRunning()) {
+    return inconclusive('Containers are running, so the runtime never goes idle. Stop them and try again.');
   }
 
-  const baseline = windowsSample();
+  const sample = (): ReclaimSample | null => {
+    const vm = parseWslVmProcess(probes.vmProcessList());
+    if (vm === null) return null;
+    return {
+      vmMemBytes: vm.workingSetBytes,
+      hostAvailableBytes: probes.hostAvailableBytes(),
+      pid: vm.pid,
+      at: probes.now(),
+    };
+  };
+
+  const baseline = sample();
   if (baseline === null) {
-    return {
-      result: 'inconclusive',
-      detail: 'The runtime VM is not running, so there is nothing to measure.',
-    };
+    return inconclusive(
+      'Could not find the WSL VM process (or found several and could not tell which is WSL’s), ' +
+        'so there is nothing to measure. Make sure the runtime is running and try again.',
+    );
   }
 
-  const graphRoot = sshOutput("podman info --format '{{.Store.GraphRoot}}'", 60_000)?.trim();
-  if (!graphRoot) {
-    return { result: 'inconclusive', detail: 'Could not reach the runtime VM to load its cache.' };
+  // .wslconfig is read when the VM starts. A VM that started before the file
+  // was last written is running the old settings, and would measure those.
+  const startedAt = probes.vmStartedAt(baseline.pid);
+  const writtenAt = probes.wslConfigWrittenAt();
+  if (startedAt !== null && writtenAt !== null && writtenAt > startedAt) {
+    return inconclusive(
+      '.wslconfig changed after the WSL VM started, so the running VM has not loaded the reclaim setting. ' +
+        'Run `wsl --shutdown`, then `podman machine start`, and try again.',
+    );
   }
 
-  const memAvailable = parseMemAvailable(sshOutput('cat /proc/meminfo', 60_000));
-  const readable = parseDuBytes(sshOutput(`du -sb ${graphRoot} 2>/dev/null`, 300_000));
+  const graphRoot = probes.guest("podman info --format '{{.Store.GraphRoot}}'", 60_000)?.trim();
+  if (!graphRoot) return inconclusive('Could not reach the runtime VM to load its cache.');
+  // Interpolated into guest shell commands below: an absolute, single-line path
+  // or nothing.
+  if (!graphRoot.startsWith('/') || /[\r\n]/.test(graphRoot)) {
+    return inconclusive('The runtime reported an image store location that could not be used.');
+  }
+  const store = shellQuote(graphRoot);
+
+  const memAvailable = parseMemAvailable(probes.guest('cat /proc/meminfo', 60_000));
+  const readable = parseDuBytes(probes.guest(`du -sb ${store} 2>/dev/null`, 300_000));
   const plan = planFill(
     memAvailable,
     opts.fillMib !== undefined ? Math.min(opts.fillMib * MIB, readable ?? 0) : readable,
+    baseline.hostAvailableBytes,
   );
   if (plan.fillBytes === 0) {
-    return { result: 'inconclusive', detail: `Could not load the VM's cache: ${plan.reason}.` };
+    return inconclusive(`Could not load the VM's cache: ${plan.reason}.`);
   }
 
   log(`Loading ${gib(plan.fillBytes)} GiB of the runtime's own data into the VM's cache...`);
   // Reads only. The guest's disk never shrinks, so writing a filler file would
   // permanently consume that much of the host's drive.
-  const filled = sshOutput(
-    `tar cf - ${graphRoot} 2>/dev/null | head -c ${plan.fillBytes} > /dev/null`,
+  const filled = probes.guest(
+    `tar cf - ${store} 2>/dev/null | head -c ${plan.fillBytes} > /dev/null`,
     FILL_TIMEOUT_MS,
   );
   if (filled === null) {
-    return { result: 'inconclusive', detail: "Could not load the VM's cache: the read was interrupted." };
+    return inconclusive("Could not load the VM's cache: the read was interrupted.");
   }
+  // The last guest command before the idle phase; after this only Windows is asked.
+  const cachedAfterFill = parseCached(probes.guest('cat /proc/meminfo', 60_000));
 
-  const afterFill = windowsSample();
-  if (afterFill === null) {
-    return { result: 'inconclusive', detail: 'The runtime VM stopped during the measurement.' };
+  const afterFill = sample();
+  if (afterFill === null) return inconclusive('The runtime VM stopped during the measurement.');
+  const landed = judgeReclaim(baseline, afterFill, [], plan.fillBytes);
+  if (landed.result === 'inconclusive') {
+    return inconclusive(`Reclaim could not be measured: ${landed.reason}.`);
   }
   const grew = afterFill.vmMemBytes - baseline.vmMemBytes;
   log(
     `The VM now holds ${gib(afterFill.vmMemBytes)} GiB of the host's memory ` +
-      `(up ${gib(Math.max(0, grew))} GiB). Leaving it idle — do not use the runtime until this finishes.`,
+      `(up ${gib(grew)} GiB). Leaving it idle — do not use the runtime until this finishes.`,
   );
 
   const idle: ReclaimSample[] = [];
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await sleep(Math.min(SAMPLE_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+  const deadline = probes.now() + timeoutMs;
+  let outcome: JudgeOutcome = { result: 'no' };
+  while (probes.now() < deadline) {
+    await probes.sleep(Math.min(SAMPLE_INTERVAL_MS, Math.max(0, deadline - probes.now())));
     // Windows-side only, deliberately: any command into the guest resets the
     // idleness that reclaim waits for, and would measure our own probing.
-    const sample = windowsSample();
-    if (sample === null) {
-      return { result: 'inconclusive', detail: 'The runtime VM stopped during the measurement.' };
-    }
-    idle.push(sample);
-    const remaining = Math.max(0, Math.round((deadline - Date.now()) / 60_000));
-    log(`  VM working set ${gib(sample.vmMemBytes)} GiB, host free ${gib(sample.hostAvailableBytes)} GiB (~${remaining} min left)`);
-    if (judgeReclaim(baseline, afterFill, idle, plan.fillBytes) === 'yes') break;
+    const s = sample();
+    if (s === null) return inconclusive('The runtime VM stopped during the measurement.');
+    idle.push(s);
+    const remaining = Math.max(0, Math.round((deadline - probes.now()) / 60_000));
+    log(
+      `  VM working set ${gib(s.vmMemBytes)} GiB, host available ${gib(s.hostAvailableBytes)} GiB (~${remaining} min left)`,
+    );
+    outcome = judgeReclaim(baseline, afterFill, idle, plan.fillBytes);
+    if (outcome.result !== 'no') break;
   }
 
-  const result = judgeReclaim(baseline, afterFill, idle, plan.fillBytes);
-  const last = idle[idle.length - 1] ?? afterFill;
-  if (result === 'yes') {
-    return {
-      result,
-      detail: `Memory reclaim works here: the VM gave back ${gib(afterFill.vmMemBytes - last.vmMemBytes)} GiB while idle.`,
-    };
+  if (outcome.result === 'inconclusive') {
+    return inconclusive(`Reclaim could not be measured: ${outcome.reason}.`);
   }
-  if (result === 'no') {
+  const last = idle[idle.length - 1] ?? afterFill;
+  if (outcome.result === 'no') {
     return {
-      result,
+      result: 'no',
       detail:
         `Memory reclaim did not return memory on this machine: the VM still holds ` +
         `${gib(last.vmMemBytes)} GiB after idling. The runtime will be sized as if reclaim does not work.`,
     };
   }
-  return { result, detail: "Could not load the VM's cache, so reclaim could not be measured." };
+
+  // Windows says the memory came back. The idle phase is over, so the guest can
+  // be asked whether it was reclaim that returned it, rather than Windows
+  // trimming a VM that still holds every page.
+  const cachedAfterIdle = parseCached(probes.guest('cat /proc/meminfo', 60_000));
+  if (!guestReleasedCache(cachedAfterFill, cachedAfterIdle, grew * RETURN_FRACTION)) {
+    return inconclusive(
+      'Windows got memory back from the VM, but the guest did not release its cache, so this was not ' +
+        'reclaim at work (or the guest could not be asked). Nothing was recorded.',
+    );
+  }
+  return {
+    result: 'yes',
+    detail:
+      `Memory reclaim works here: the VM gave back ${gib(afterFill.vmMemBytes - last.vmMemBytes)} GiB while idle, ` +
+      `and Windows got ${gib(Math.max(0, last.hostAvailableBytes - afterFill.hostAvailableBytes))} GiB of it back.`,
+  };
 }
