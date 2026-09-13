@@ -177,8 +177,10 @@ rejects anything above that ceiling and names the exact limit for your machine.
 
 The number you pick is a **ceiling, not a reservation**: it caps how much the
 container runtime *can* take, but memory is only actually used while DevBoxes
-are running. On Windows, WSL2 gives most of it back to the host once they
-stop; on macOS the VM may not release it back until the machine restarts.
+are running. On Windows, WSL2 gives memory back to the host only when memory
+reclaim actually works, which the CLI measures rather than assumes: until
+`clustercode onboard --verify-reclaim` has verified it, treat the number as
+fully used. On macOS the VM may not release it back until the machine restarts.
 
 A given ceiling fits a different number of DevBoxes depending on their size,
 so the wizard also prints a fit table before asking you to confirm. For
