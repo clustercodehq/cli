@@ -153,12 +153,16 @@ wizard tells you to log out and back in (or run `newgrp docker`) before
 When there's no `--memory` flag, the wizard asks how the machine is used and
 offers a preset for each:
 
-- **Dedicated worker** — mostly hosts DevBoxes. The host keeps a *preset*
-  reserve of ~6 GiB on Windows/macOS and the rest goes to the container
-  runtime. Linux has no VM in the way, so nothing is reserved.
+- **Dedicated worker** — mostly hosts DevBoxes. On Windows/macOS the host keeps
+  a *preset* reserve of 8 GiB or a quarter of its RAM, whichever is larger, and
+  the rest goes to the container runtime. A VM that is not known to give memory
+  back has to be assumed full. Once memory reclaim is verified on a WSL-backed
+  Podman machine (`clustercode onboard --verify-reclaim` measures it), the
+  reserve drops to ~6 GiB; macOS and Docker always keep the larger one. Linux
+  has no VM in the way, so nothing is reserved.
 - **Shared** — you also work on this machine day to day. The runtime gets at
-  most half the machine, and the host keeps a larger preset reserve of ~12 GiB
-  on Windows/macOS so the desktop stays usable.
+  most half the machine, and the host keeps a preset reserve of ~12 GiB on
+  Windows/macOS so the desktop stays usable.
 
 Once a size is saved, the question still comes up on every run in a terminal,
 with the saved size listed first and selected: press Enter to keep it, or pick
