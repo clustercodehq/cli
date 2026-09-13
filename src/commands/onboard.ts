@@ -645,6 +645,88 @@ export function resolveRequestedMemoryMib(
 }
 
 /**
+ * Whether a target size is what the runtime already has. The guest kernel
+ * reserves some of what it is given, so an engine given 24576 MB reports
+ * meaningfully less: an exact comparison never matches.
+ */
+function aboutSameSize(targetMib: number, currentMib: number): boolean {
+  return Math.abs(targetMib - currentMib) / targetMib < 0.07;
+}
+
+export type RuntimeSizeStep =
+  | { kind: 'use'; mib: number; source: 'flag' | 'saved' }
+  | { kind: 'ask'; savedMib: number | null }
+  | { kind: 'too-small' }
+  | { kind: 'skip' };
+
+/**
+ * Ask the sizing question, or say which size to use without asking.
+ *
+ * In a terminal a saved size is the default answer, not the answer. It used to
+ * end the question for good, so changing the size meant knowing about
+ * `--memory` or editing the config by hand. Without a terminal nothing changes:
+ * a saved size is used, and there is nobody to ask.
+ */
+export function runtimeSizeStep(args: {
+  hasFlag: boolean;
+  /** The validated flag, or the validated saved size when there is no flag. */
+  requested: number | null;
+  interactive: boolean;
+  dedicatedMib: number;
+}): RuntimeSizeStep {
+  const { hasFlag, requested, interactive, dedicatedMib } = args;
+  // An invalid flag is refused before this is asked; null here is unreachable.
+  if (hasFlag) return requested === null ? { kind: 'skip' } : { kind: 'use', mib: requested, source: 'flag' };
+  // 0 means the machine is too small to give anything away, so there is no
+  // recommendation to offer in place of a saved size.
+  if (!interactive || dedicatedMib === 0) {
+    if (requested !== null) return { kind: 'use', mib: requested, source: 'saved' };
+    return interactive ? { kind: 'too-small' } : { kind: 'skip' };
+  }
+  return { kind: 'ask', savedMib: requested };
+}
+
+export type RuntimeSizeChoice = 'saved' | 'dedicated' | 'shared' | 'custom' | 'keep';
+
+/**
+ * The answers to the sizing question, and the one selected to begin with.
+ *
+ * A saved size comes first and selected, so pressing Enter does what the wizard
+ * did before it asked on every run. When the runtime already has that size,
+ * keeping it and keeping the current size are one choice, so only one is shown.
+ */
+export function runtimeSizeOptions(args: {
+  savedMib: number | null;
+  currentMib: number | null;
+  dedicatedMib: number;
+  sharedMib: number;
+}): { options: { value: RuntimeSizeChoice; label: string }[]; initialValue: RuntimeSizeChoice } {
+  const { savedMib, currentMib, dedicatedMib, sharedMib } = args;
+  const savedIsCurrent = savedMib !== null && currentMib !== null && aboutSameSize(savedMib, currentMib);
+  const options: { value: RuntimeSizeChoice; label: string }[] = [];
+  if (savedMib !== null) {
+    const verb = currentMib === null || savedIsCurrent ? 'Keep' : 'Apply';
+    options.push({
+      value: 'saved',
+      label: `${verb} saved size (${Number((savedMib / 1024).toFixed(1))} GiB, ~${estimateDevboxes(savedMib)} default DevBoxes)`,
+    });
+  }
+  options.push({
+    value: 'dedicated',
+    label: `Dedicated worker — mostly hosts DevBoxes (${dedicatedMib / 1024} GiB, ~${estimateDevboxes(dedicatedMib)} default DevBoxes)`,
+  });
+  if (sharedMib > 0) {
+    options.push({
+      value: 'shared',
+      label: `Shared — I also work on this machine (${sharedMib / 1024} GiB, ~${estimateDevboxes(sharedMib)} default DevBoxes)`,
+    });
+  }
+  options.push({ value: 'custom', label: 'Custom amount' });
+  if (!savedIsCurrent) options.push({ value: 'keep', label: 'Keep current' });
+  return { options, initialValue: savedMib !== null ? 'saved' : 'dedicated' };
+}
+
+/**
  * Say what the runtime has and where its size is set, for the engines this CLI
  * cannot resize.
  *
@@ -791,45 +873,48 @@ async function offerRuntimeMemory(
     );
   }
 
-  let target = requested;
-  if (target === null) {
-    if (!process.stdin.isTTY) return true;
-    // 0 means the machine is too small to give anything away without starving
-    // the host, for either use. Say so rather than prompting with an invalid
-    // default.
-    if (dedicatedRecommendation === 0) {
-      clack.log.warn('This machine does not have enough RAM to increase the runtime allocation.');
-      return true;
-    }
+  const step = runtimeSizeStep({
+    hasFlag: flagMemory !== undefined,
+    requested,
+    interactive: process.stdin.isTTY === true,
+    dedicatedMib: dedicatedRecommendation,
+  });
+  if (step.kind === 'skip') return true;
+  // Say so rather than prompting with an invalid default.
+  if (step.kind === 'too-small') {
+    clack.log.warn('This machine does not have enough RAM to increase the runtime allocation.');
+    return true;
+  }
 
+  // A saved size is asked about in a terminal like any other, so whether it was
+  // kept, rather than whether one exists, decides what a warning may ask later.
+  let target: number;
+  let source: 'flag' | 'saved' | 'prompt';
+  if (step.kind === 'use') {
+    target = step.mib;
+    source = step.source;
+  } else {
     // Say what actually happens to the number before asking for one.
     const ceilingNote = runtimeCeilingNote(platform, reclaimStatus);
     if (ceilingNote) clack.log.info(ceilingNote);
 
-    const useOptions: { value: 'dedicated' | 'shared' | 'custom' | 'keep'; label: string }[] = [
-      {
-        value: 'dedicated',
-        label: `Dedicated worker — mostly hosts DevBoxes (${dedicatedRecommendation / 1024} GiB, ~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes)`,
-      },
-    ];
-    if (sharedRecommendation > 0) {
-      useOptions.push({
-        value: 'shared',
-        label: `Shared — I also work on this machine (${sharedRecommendation / 1024} GiB, ~${estimateDevboxes(sharedRecommendation)} default DevBoxes)`,
-      });
-    }
-    useOptions.push({ value: 'custom', label: 'Custom amount' });
-    useOptions.push({ value: 'keep', label: 'Keep current' });
-
+    const { options, initialValue } = runtimeSizeOptions({
+      savedMib: step.savedMib,
+      currentMib,
+      dedicatedMib: dedicatedRecommendation,
+      sharedMib: sharedRecommendation,
+    });
     const choice = await clack.select({
       message: 'How should the container runtime memory be sized?',
-      options: useOptions,
+      options,
+      initialValue,
     });
     if (clack.isCancel(choice) || choice === 'keep') return true;
 
-    if (choice === 'dedicated' || choice === 'shared') {
-      target = (choice === 'dedicated' ? dedicatedRecommendation : sharedRecommendation) as number;
-    } else {
+    if (choice === 'saved' && step.savedMib !== null) {
+      target = step.savedMib;
+      source = 'saved';
+    } else if (choice === 'custom') {
       const answer = await clack.text({
         message: `Memory to give the container runtime, in MB (~${estimateDevboxes(dedicatedRecommendation)} default DevBoxes)?`,
         initialValue: String(dedicatedRecommendation),
@@ -840,6 +925,10 @@ async function offerRuntimeMemory(
       });
       if (clack.isCancel(answer)) return true;
       target = Number(String(answer).trim());
+      source = 'prompt';
+    } else {
+      target = choice === 'shared' ? sharedRecommendation : dedicatedRecommendation;
+      source = 'prompt';
     }
   }
 
@@ -859,7 +948,7 @@ async function offerRuntimeMemory(
       `${target}MB is above the ${noReclaimCeiling}MB ceiling for this machine while memory reclaim is not verified, ` +
         'so the runtime can hold on to memory Windows needs.',
     );
-    const fromStoredConfig = flagMemory === undefined && requested !== null;
+    const fromStoredConfig = source === 'saved';
     if (fromStoredConfig && process.stdin.isTTY && !verifyRequested) {
       const choice = await clack.select({
         message: 'What should happen to the runtime size?',
@@ -892,10 +981,9 @@ async function offerRuntimeMemory(
   // custom amount).
   clack.log.info(formatFitTable(devboxFitTable(target, platform)));
 
-  // Compare with tolerance: the guest kernel reserves some of what we allocate,
-  // so an engine given 24576 MB reports meaningfully less. An exact comparison
-  // never matches and would re-apply (and re-run `wsl --shutdown`) every run.
-  if (currentMib !== null && Math.abs(target - currentMib) / target < 0.07) {
+  // Compare with tolerance, or every run would re-apply (and re-run
+  // `wsl --shutdown`).
+  if (currentMib !== null && aboutSameSize(target, currentMib)) {
     // The size being right is not the same as the host being safe: a VM that
     // never returns what it borrows starves the host at any ceiling. This is
     // the path the machines that hit that already take, so it is the one that
@@ -926,7 +1014,7 @@ async function offerRuntimeMemory(
         return false;
       }
       reportAfterApply();
-      if (requested !== null) rememberRuntimeMemory(target);
+      rememberRuntimeMemory(target);
       // Reclaim is now requested. Whether it *works* is a separate question,
       // and this is the moment the answer is worth the most: the size was
       // chosen as if it does not.
@@ -944,9 +1032,10 @@ async function offerRuntimeMemory(
     }
 
     clack.log.info('Already about that size — nothing to change.');
-    // Still a deliberate choice worth recording: without it, doctor keeps
-    // treating a size the user asked for as an install default and nagging.
-    if (requested !== null) rememberRuntimeMemory(target);
+    // Still a deliberate choice worth recording, whether it came from the flag,
+    // the saved size or an answer: without it, doctor keeps treating a size the
+    // user asked for as an install default and nagging.
+    rememberRuntimeMemory(target);
     return true;
   }
 

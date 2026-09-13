@@ -150,8 +150,8 @@ wizard tells you to log out and back in (or run `newgrp docker`) before
 
 #### Sizing your worker
 
-When there's no `--memory` flag and nothing stored yet, the wizard asks how
-the machine is used and offers a preset for each:
+When there's no `--memory` flag, the wizard asks how the machine is used and
+offers a preset for each:
 
 - **Dedicated worker** — mostly hosts DevBoxes. The host keeps a *preset*
   reserve of ~6 GiB on Windows/macOS and the rest goes to the container
@@ -159,6 +159,12 @@ the machine is used and offers a preset for each:
 - **Shared** — you also work on this machine day to day. The runtime gets at
   most half the machine, and the host keeps a larger preset reserve of ~12 GiB
   on Windows/macOS so the desktop stays usable.
+
+Once a size is saved, the question still comes up on every run in a terminal,
+with the saved size listed first and selected: press Enter to keep it, or pick
+another. When the runtime's current size differs from the saved one, that first
+choice applies the saved size, and **Keep current** leaves the runtime as it is.
+Without a terminal, a saved size is used as is; change it with `--memory`.
 
 Those preset reserves are deliberately conservative and are **not** the hard
 limit. A custom amount may go higher, up to a per-machine ceiling that leaves
@@ -198,7 +204,7 @@ clustercode config list
 | Key | Purpose |
 |---|---|
 | `WORKER_NAME` | Display name for this worker. |
-| `RUNTIME_MEMORY_MB` | Memory, in MiB (1024-based — `8192` is 8 GiB; the `MB` in the name is historical), to give the container runtime. Takes effect when a new container-runtime machine is created and whenever `clustercode onboard` runs. |
+| `RUNTIME_MEMORY_MB` | Memory, in MiB (1024-based — `8192` is 8 GiB; the `MB` in the name is historical), to give the container runtime. Takes effect when a new container-runtime machine is created and when `clustercode onboard` runs — in a terminal as the preselected answer to its sizing question, without one as is. |
 
 ### `clustercode status`
 
