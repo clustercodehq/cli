@@ -28,7 +28,15 @@ npm install -g .
 
 ```bash
 clustercode login     # Authenticate (browser OAuth)
-clustercode worker    # Select a tenant (first run) and start the worker
+clustercode connect   # Select a tenant (first run) and start the worker
+```
+
+`clustercode connect` is an alias of `clustercode worker` — use whichever you
+prefer. Add `--doctor` to run the health checks (and fix what they find) on the
+way in:
+
+```bash
+clustercode connect --doctor
 ```
 
 Or run the guided wizard, which checks everything and offers to fix each issue:
@@ -44,11 +52,36 @@ clustercode onboard
 Authenticate with ClusterCode. Opens a browser for OAuth by default; use
 `--no-browser` to paste a token manually (SSH / headless).
 
-### `clustercode worker`
+### `clustercode worker` (alias: `clustercode connect`)
 
-Start the ClusterCode worker on this machine. On first run, if your account has
-access to multiple tenants you'll be prompted to select one. Choose a container
-engine with `--podman` or `--docker`.
+Start the ClusterCode worker on this machine and connect it to the
+orchestrator. On first run, if your account has access to multiple tenants
+you'll be prompted to select one. `connect` is the same command under another
+name: every option below works with both.
+
+| Option | Description |
+|--------|-------------|
+| `--podman` / `--docker` | Choose the container engine (default: whichever is found) |
+| `--prerelease` | Use the latest prerelease worker-agent |
+| `--agent-version <version>` | Pin an exact worker-agent version |
+| `-v, --verbose` | Verbose worker-agent logging |
+| `--doctor` | Run `clustercode doctor` first, then connect |
+
+With `--doctor`, the full `doctor` flow runs before the worker starts — including
+its offer to run `clustercode onboard` when a check fails. Once doctor is done
+the worker connects:
+
+- Failures that are still unresolved (you declined the fix, the fix didn't
+  resolve them, or there is no terminal to ask) produce a warning and the worker
+  **connects anyway**. Hard prerequisites — being logged in, having a tenant and
+  a container engine — are still enforced by the worker itself, with the same
+  errors as without `--doctor`.
+- Cancelling a doctor prompt (Ctrl+C / Esc) stops without connecting.
+- Invalid flags (e.g. `--podman --docker`) fail immediately, before doctor runs.
+
+```bash
+clustercode connect --doctor
+```
 
 ### `clustercode doctor`
 
