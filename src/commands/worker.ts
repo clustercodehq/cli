@@ -14,6 +14,7 @@ import { ensureWorkerBinary } from '../lib/worker-binary.js';
 import { checkContainerRuntime } from '../lib/checks.js';
 import { restoreRawMode, releaseStdin } from '../lib/tty.js';
 import { formatWorkerLogLine } from '../lib/worker-log.js';
+import { runDoctor } from './doctor.js';
 
 /** Loopback hosts where the auth bypass is permitted. */
 function isLoopbackHost(host: string): boolean {
@@ -264,47 +265,107 @@ async function startWorkerProcess(
   process.on('SIGTERM', shutdown);
 }
 
+export interface WorkerOptions {
+  podman?: boolean;
+  docker?: boolean;
+  prerelease?: boolean;
+  agentVersion?: string;
+  verbose?: boolean;
+  doctor?: boolean;
+}
+
+export type ResolvedWorkerOptions =
+  | { ok: true; runtime: 'podman' | 'docker' | undefined; agent: { channel?: 'next'; version?: string } }
+  | { ok: false; error: string };
+
+/**
+ * The pure part of the worker's option handling: engine choice and worker-agent
+ * version/channel. Kept free of I/O so flags can be validated before anything
+ * slow (like `--doctor`) runs.
+ */
+export function resolveWorkerOptions(opts: WorkerOptions): ResolvedWorkerOptions {
+  if (opts.podman && opts.docker) {
+    return { ok: false, error: 'Pick one engine: --podman or --docker, not both.' };
+  }
+  const runtime: 'podman' | 'docker' | undefined = opts.podman
+    ? 'podman'
+    : opts.docker
+      ? 'docker'
+      : undefined;
+
+  // Validate a pinned --agent-version as semver (tolerating a leading "v") so a
+  // typo can't be interpolated into a bogus release URL and silently 404.
+  let agentVersion: string | undefined;
+  if (opts.agentVersion) {
+    agentVersion = opts.agentVersion.replace(/^v/, '');
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(agentVersion)) {
+      return {
+        ok: false,
+        error: `Invalid --agent-version "${opts.agentVersion}". Use a semver like 1.0.0 or 1.0.0-alpha.4.`,
+      };
+    }
+  }
+
+  // Worker-agent version/channel selection (npm-style): --agent-version pins an
+  // exact version; --prerelease follows the newest prerelease ('next'); default
+  // is the stable 'latest'. --agent-version wins if both are given.
+  const agent: { channel?: 'next'; version?: string } = agentVersion
+    ? { version: agentVersion }
+    : opts.prerelease
+      ? { channel: 'next' }
+      : {};
+
+  return { ok: true, runtime, agent };
+}
+
 export const workerCommand = new Command('worker')
-  .description('Start the ClusterCode worker on this machine')
+  // `connect` is the same command under the name people reach for when they
+  // want this machine online; one Command, so options and behaviour can't drift.
+  .alias('connect')
+  .description('Start the ClusterCode worker on this machine and connect it to the orchestrator')
   .option('--podman', 'Use Podman as the container engine')
   .option('--docker', 'Use Docker as the container engine')
   .option('--prerelease', 'Use the latest prerelease worker-agent (the "next" channel)')
   .option('--agent-version <version>', 'Pin an exact worker-agent version (e.g. 1.0.0-alpha.4)')
   .option('-v, --verbose', 'Verbose worker-agent logging (debug level)')
-  .action(async (opts: { podman?: boolean; docker?: boolean; prerelease?: boolean; agentVersion?: string; verbose?: boolean }) => {
+  .option('--doctor', 'Run health checks first (offering to fix failures), then connect')
+  .action(async (opts: WorkerOptions) => {
+    const resolved = resolveWorkerOptions(opts);
+
+    // --doctor runs before the worker's own frame opens (doctor draws and closes
+    // its own), and only once the flags are known to be valid, so a typo fails
+    // fast instead of after a full round of health checks.
+    let doctorUnresolved = false;
+    if (opts.doctor && resolved.ok) {
+      const outcome = await runDoctor({ keepStdin: true });
+      if (outcome.cancelled) {
+        releaseStdin();
+        clack.log.error('Cancelled — not connecting.');
+        process.exitCode = 1;
+        return;
+      }
+      // Doctor sets a non-zero exit code on failures so it works as a scripted
+      // gate. Here it is not the gate — the worker flow owns the exit code.
+      process.exitCode = undefined;
+      doctorUnresolved = outcome.unresolved;
+    }
+
     clack.intro(pc.bold('ClusterCode Worker'));
 
-    if (opts.podman && opts.docker) {
-      clack.log.error('Pick one engine: --podman or --docker, not both.');
+    if (!resolved.ok) {
+      clack.log.error(resolved.error);
       process.exit(1);
     }
-    const runtime: 'podman' | 'docker' | undefined = opts.podman
-      ? 'podman'
-      : opts.docker
-        ? 'docker'
-        : undefined;
+    const { runtime, agent } = resolved;
 
-    // Validate a pinned --agent-version as semver (tolerating a leading "v") so a
-    // typo can't be interpolated into a bogus release URL and silently 404.
-    if (opts.agentVersion) {
-      const normalized = opts.agentVersion.replace(/^v/, '');
-      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(normalized)) {
-        clack.log.error(
-          `Invalid --agent-version "${opts.agentVersion}". Use a semver like 1.0.0 or 1.0.0-alpha.4.`,
-        );
-        process.exit(1);
-      }
-      opts.agentVersion = normalized;
+    // Unresolved doctor failures warn rather than abort: connecting is what was
+    // asked for, and the hard prerequisites (login, tenant, container engine)
+    // are still enforced below with their own actionable errors.
+    if (doctorUnresolved) {
+      clack.log.warn(
+        `Doctor found issues that are still unresolved — connecting anyway. Run ${pc.bold('clustercode doctor')} to review them.`,
+      );
     }
-
-    // Worker-agent version/channel selection (npm-style): --agent-version pins an
-    // exact version; --prerelease follows the newest prerelease ('next'); default
-    // is the stable 'latest'. --agent-version wins if both are given.
-    const agent: { channel?: 'next'; version?: string } = opts.agentVersion
-      ? { version: opts.agentVersion }
-      : opts.prerelease
-        ? { channel: 'next' }
-        : {};
 
     if (process.env.WS_WORKER_AUTH_BYPASS === 'true' && !isAuthBypassEnabled()) {
       clack.log.warn(
