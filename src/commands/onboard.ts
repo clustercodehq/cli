@@ -75,7 +75,7 @@ import {
   type InstallInstructions,
   type LinuxDistro,
 } from '../lib/engine-install.js';
-import { releaseStdin } from '../lib/tty.js';
+import { releaseStdin, restoreRawMode } from '../lib/tty.js';
 
 /**
  * Every spawn in this file runs from the temp directory: `podman machine ssh`
@@ -1427,7 +1427,10 @@ export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
   try {
     await runOnboardInner(opts);
   } finally {
-    releaseStdin();
+    // A caller that prompts again afterwards (`worker --doctor`) must keep stdin
+    // ref'd; releasing it here would abandon its next prompt (see lib/tty.ts).
+    if (opts.keepStdin) restoreRawMode();
+    else releaseStdin();
   }
 }
 
@@ -1598,6 +1601,8 @@ export interface OnboardOptions {
   verifyReclaim?: boolean;
   /** Which engine to install when none is present. Ignored when one already is. */
   engine?: EngineName;
+  /** Restore raw mode instead of releasing stdin on exit, for callers that prompt next. */
+  keepStdin?: boolean;
 }
 
 export const onboardCommand = new Command('onboard')
