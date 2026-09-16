@@ -12,8 +12,21 @@ describe('worker command', () => {
   });
 
   it('parses --doctor into the action options', () => {
-    const parsed = workerCommand.parseOptions(['--doctor', '--verbose']);
-    assert.deepEqual(parsed.unknown, []);
+    try {
+      const parsed = workerCommand.parseOptions(['--doctor', '--verbose']);
+      assert.deepEqual(parsed.unknown, []);
+      assert.equal(workerCommand.opts().doctor, true);
+      assert.equal(workerCommand.opts().verbose, true);
+    } finally {
+      // parseOptions writes onto the exported singleton. Left set, the values
+      // leak into whatever test is added to this file next.
+      workerCommand.setOptionValue('doctor', undefined);
+      workerCommand.setOptionValue('verbose', undefined);
+    }
+  });
+
+  it('leaves no parsed state behind on the exported command', () => {
+    assert.equal(workerCommand.opts().doctor, undefined);
   });
 });
 

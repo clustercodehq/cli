@@ -64,7 +64,8 @@ describe('worker', () => {
     // No credentials in isolated home — should report not logged in
     const { stdout, exitCode } = runCli(['worker'], { timeout: 15_000 });
     assert.match(stdout, /not logged in|login/i);
-    assert.ok(exitCode === 0 || exitCode === 1);
+    // Refusing to connect is a failure, so a provisioning script can see it.
+    assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
   });
 
   it('refuses to start when no container engine is available', () => {
@@ -179,7 +180,9 @@ describe('worker', () => {
     // Orchestrator at 127.0.0.1:19999 is unreachable — should fail gracefully
     const { stdout, exitCode } = runCli(['worker'], { timeout: 15_000 });
     assert.ok(typeof stdout === 'string');
-    assert.ok(exitCode === 0 || exitCode === 1);
+    // Gracefully, but still a failure: tenant selection cannot reach the
+    // orchestrator, so no worker was started.
+    assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
   });
 });
 
@@ -195,12 +198,12 @@ describe('connect (alias of worker)', () => {
     const { stdout, exitCode } = runCli(['connect'], { timeout: 15_000 });
     assert.match(stdout, /ClusterCode Worker/);
     assert.match(stdout, /not logged in/i);
-    assert.ok(exitCode === 0 || exitCode === 1);
+    assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
   });
 
   for (const name of ['connect', 'worker']) {
     it(`${name} --doctor runs doctor to completion before connecting`, () => {
-      const { stdout } = runCli([name, '--doctor'], { timeout: 60_000 });
+      const { stdout, exitCode } = runCli([name, '--doctor'], { timeout: 60_000 });
       const doctorStart = stdout.indexOf('ClusterCode Doctor');
       const doctorDone = stdout.indexOf('Health checks complete');
       const workerStart = stdout.indexOf('ClusterCode Worker');
@@ -210,7 +213,12 @@ describe('connect (alias of worker)', () => {
       // cannot fix without a TTY: connect warns and carries on to the worker's
       // own login gate rather than stopping at doctor.
       assert.match(stdout, /still unresolved/);
-      assert.match(stdout, /not logged in/i);
+      // Anchored on the worker's gate, not /not logged in/i — doctor's own report
+      // line ("✗ Not logged in") matches that before the worker phase even begins.
+      const gate = stdout.indexOf('Not logged in. Run');
+      assert.ok(gate > workerStart, `worker's own login gate did not run:\n${stdout}`);
+      // Doctor is not the gate, but nothing connected, so this is still a failure.
+      assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
     });
   }
 

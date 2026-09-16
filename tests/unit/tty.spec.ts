@@ -130,4 +130,73 @@ describe('tty repairs', () => {
       );
     });
   });
+
+  /**
+   * The other call site, and the reason `keepStdin` exists: `worker --doctor`
+   * runs the whole doctor flow and then goes on to prompt for tenant selection,
+   * so runDoctor({ keepStdin: true }) must not unref — while plain `clustercode
+   * doctor` still has to, or the command would never exit.
+   *
+   * Nothing else can catch this. Both repairs no-op unless win32 + isTTY, and the
+   * e2e suite runs the CLI with piped stdin, so swapping one helper for the other
+   * is invisible there. --json is used here because it returns before any prompt
+   * while still running the same `finally`.
+   */
+  describe('runDoctor (called by worker --doctor, which prompts afterwards)', () => {
+    let tempHome: string;
+    const savedEnv: Record<string, string | undefined> = {};
+    let savedExitCode: typeof process.exitCode;
+    let savedLog: typeof console.log;
+
+    beforeEach(() => {
+      tempHome = mkdtempSync(join(tmpdir(), 'clustercode-doctor-'));
+      for (const key of ['HOME', 'USERPROFILE', 'ORCHESTRATOR_URL']) savedEnv[key] = process.env[key];
+      process.env.HOME = tempHome;
+      process.env.USERPROFILE = tempHome;
+      // Refused immediately rather than timing out: the connectivity check is
+      // the one part of runAllChecks that would otherwise wait on the network.
+      process.env.ORCHESTRATOR_URL = 'http://127.0.0.1:19999';
+      // --json prints a report and sets a non-zero exit code for failing checks.
+      // Neither belongs in this test run's output or its exit status.
+      savedExitCode = process.exitCode;
+      savedLog = console.log;
+      console.log = () => {};
+      install({ platform: 'win32', isTTY: true });
+    });
+
+    afterEach(() => {
+      console.log = savedLog;
+      process.exitCode = savedExitCode;
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(tempHome, { recursive: true, force: true });
+    });
+
+    it('with keepStdin it restores raw mode but never unrefs', async () => {
+      const { runDoctor } = await import('../../src/commands/doctor.js');
+      await runDoctor({ json: true, keepStdin: true });
+
+      assert.ok(
+        !calls.includes('unref'),
+        `runDoctor({ keepStdin: true }) released stdin; the worker's tenant prompt would ` +
+        `render and be abandoned. Calls: ${calls.join(', ') || '(none)'}`,
+      );
+      assert.ok(
+        calls.includes('setRawMode(false)'),
+        `keepStdin must still repair raw mode so Ctrl+C works. Calls: ${calls.join(', ') || '(none)'}`,
+      );
+    });
+
+    it('without keepStdin it releases stdin so the command can exit', async () => {
+      const { runDoctor } = await import('../../src/commands/doctor.js');
+      await runDoctor({ json: true });
+
+      assert.ok(
+        calls.includes('unref'),
+        `plain doctor must release stdin or the process hangs. Calls: ${calls.join(', ') || '(none)'}`,
+      );
+    });
+  });
 });

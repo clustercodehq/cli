@@ -78,6 +78,10 @@ the worker connects:
   errors as without `--doctor`.
 - Cancelling a doctor prompt (Ctrl+C / Esc) stops without connecting.
 - Invalid flags (e.g. `--podman --docker`) fail immediately, before doctor runs.
+- Doctor's own gate exit code is not passed through — `connect` exits on its own
+  result. It exits non-zero whenever it refuses to connect, so a provisioning
+  script can gate on it; use `clustercode doctor` when you want the health
+  checks themselves to be the gate.
 
 ```bash
 clustercode connect --doctor

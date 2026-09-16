@@ -1423,9 +1423,18 @@ function reportAfterApply(): void {
   clack.log.info('Restart the worker for the new capacity to be advertised.');
 }
 
-export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
+export interface OnboardOutcome {
+  /**
+   * Health checks were still failing when onboarding finished. Deliberately not
+   * the same thing as a non-zero exit code: onboard also exits 1 when it fixed
+   * every check but could not apply a requested runtime memory.
+   */
+  failuresRemain: boolean;
+}
+
+export async function runOnboard(opts: OnboardOptions = {}): Promise<OnboardOutcome> {
   try {
-    await runOnboardInner(opts);
+    return await runOnboardInner(opts);
   } finally {
     // A caller that prompts again afterwards (`worker --doctor`) must keep stdin
     // ref'd; releasing it here would abandon its next prompt (see lib/tty.ts).
@@ -1434,7 +1443,7 @@ export async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
   }
 }
 
-async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
+async function runOnboardInner(opts: OnboardOptions = {}): Promise<OnboardOutcome> {
   clack.intro(pc.bold('ClusterCode Onboarding'));
 
   const spinner = clack.spinner();
@@ -1461,7 +1470,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
         ? pc.green('Everything looks good! No issues to fix.')
         : pc.yellow('Checks passed, but the requested runtime memory was not applied.'),
     );
-    return;
+    return { failuresRemain: false };
   }
 
   // Every fix step below is a prompt. Without a TTY the first one hits EOF and
@@ -1474,7 +1483,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
     reportRemainingFailures(failures, opts.engine);
     process.exitCode = 1;
     clack.outro(pc.yellow('Re-run ' + pc.bold('clustercode onboard') + ' from an interactive terminal.'));
-    return;
+    return { failuresRemain: true };
   }
 
   clack.log.warn(`${failures.length} ${failures.length === 1 ? 'issue' : 'issues'} to fix:\n`);
@@ -1579,7 +1588,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
         ? pc.green('All issues resolved! Run ' + pc.bold('clustercode worker') + ' to start.')
         : pc.yellow('Issues resolved, but the requested runtime memory was not applied.'),
     );
-    return;
+    return { failuresRemain: false };
   }
 
   // Print the actual remediation for each remaining failure. This lands last so
@@ -1590,6 +1599,7 @@ async function runOnboardInner(opts: OnboardOptions = {}): Promise<void> {
   clack.outro(
     pc.yellow(`${remainingFailures.length} ${remainingFailures.length === 1 ? 'issue remains' : 'issues remain'}. Fix the above, then re-run ${pc.bold('clustercode onboard')}.`)
   );
+  return { failuresRemain: true };
 }
 
 export interface OnboardOptions {

@@ -340,7 +340,10 @@ export const workerCommand = new Command('worker')
       const outcome = await runDoctor({ keepStdin: true });
       if (outcome.cancelled) {
         releaseStdin();
-        clack.log.error('Cancelled — not connecting.');
+        // Doctor already closed its frame with clack.cancel(). A clack.log here
+        // would draw an orphaned guide bar and a second cancellation line
+        // outside that closed box, so write the consequence plainly instead.
+        console.error(pc.red('Cancelled — not connecting.'));
         process.exitCode = 1;
         return;
       }
@@ -403,6 +406,10 @@ export const workerCommand = new Command('worker')
       // it), so this command has to release stdin itself or a spinner started
       // during tenant setup would keep the event loop alive and hang the exit.
       releaseStdin();
+      // Nothing connected, so this is a failure. Without it `--doctor` (which
+      // clears doctor's gate code above) would report success to a provisioning
+      // script that had just been told the machine is not logged in.
+      process.exitCode = 1;
       return;
     }
 

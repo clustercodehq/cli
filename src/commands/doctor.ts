@@ -110,9 +110,12 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorOutc
     // render as nested, never-terminated frames.
     clack.outro(`Starting ${pc.bold('clustercode onboard')}...`);
     const { runOnboard } = await import('./onboard.js');
-    await runOnboard({ keepStdin: options.keepStdin });
-    // Onboard reports its own outcome through the exit code (see above).
-    return { cancelled: false, unresolved: Boolean(process.exitCode) };
+    const outcome = await runOnboard({ keepStdin: options.keepStdin });
+    // Ask onboard what happened instead of reading process.exitCode: onboard
+    // also exits 1 when it resolved every failing check but could not apply a
+    // requested runtime memory, which is not an unresolved health check and
+    // must not make `worker --doctor` warn about issues that are already fixed.
+    return { cancelled: false, unresolved: outcome.failuresRemain };
   } finally {
     if (options.keepStdin) restoreRawMode();
     else releaseStdin();
