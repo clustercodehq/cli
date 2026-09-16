@@ -23,6 +23,8 @@ describe('CLI', () => {
     assert.match(output, /clustercode/i);
     assert.match(output, /login/);
     assert.match(output, /worker/);
+    // `connect` is an alias of `worker`, rendered on the same line.
+    assert.match(output, /worker\|connect/);
     assert.match(output, /doctor/);
     assert.match(output, /onboard/);
     assert.match(output, /config/);

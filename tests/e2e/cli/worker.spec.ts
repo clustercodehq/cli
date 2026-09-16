@@ -64,7 +64,8 @@ describe('worker', () => {
     // No credentials in isolated home — should report not logged in
     const { stdout, exitCode } = runCli(['worker'], { timeout: 15_000 });
     assert.match(stdout, /not logged in|login/i);
-    assert.ok(exitCode === 0 || exitCode === 1);
+    // Refusing to connect is a failure, so a provisioning script can see it.
+    assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
   });
 
   it('refuses to start when no container engine is available', () => {
@@ -179,6 +180,52 @@ describe('worker', () => {
     // Orchestrator at 127.0.0.1:19999 is unreachable — should fail gracefully
     const { stdout, exitCode } = runCli(['worker'], { timeout: 15_000 });
     assert.ok(typeof stdout === 'string');
-    assert.ok(exitCode === 0 || exitCode === 1);
+    // Gracefully, but still a failure: tenant selection cannot reach the
+    // orchestrator, so no worker was started.
+    assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
+  });
+});
+
+describe('connect (alias of worker)', () => {
+  it('connect --help shows the worker options and --doctor', () => {
+    const { stdout } = runCli(['connect', '--help'], { isolateHome: false });
+    assert.match(stdout, /worker\|connect/);
+    assert.match(stdout, /--doctor/);
+    assert.match(stdout, /--podman/);
+  });
+
+  it('connect without credentials behaves like worker', () => {
+    const { stdout, exitCode } = runCli(['connect'], { timeout: 15_000 });
+    assert.match(stdout, /ClusterCode Worker/);
+    assert.match(stdout, /not logged in/i);
+    assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
+  });
+
+  for (const name of ['connect', 'worker']) {
+    it(`${name} --doctor runs doctor to completion before connecting`, () => {
+      const { stdout, exitCode } = runCli([name, '--doctor'], { timeout: 60_000 });
+      const doctorStart = stdout.indexOf('ClusterCode Doctor');
+      const doctorDone = stdout.indexOf('Health checks complete');
+      const workerStart = stdout.indexOf('ClusterCode Worker');
+      assert.ok(doctorStart !== -1 && doctorDone > doctorStart, `doctor did not run:\n${stdout}`);
+      assert.ok(workerStart > doctorDone, `worker did not start after doctor:\n${stdout}`);
+      // An isolated home has no credentials, so doctor reports a failure it
+      // cannot fix without a TTY: connect warns and carries on to the worker's
+      // own login gate rather than stopping at doctor.
+      assert.match(stdout, /still unresolved/);
+      // Anchored on the worker's gate, not /not logged in/i — doctor's own report
+      // line ("✗ Not logged in") matches that before the worker phase even begins.
+      const gate = stdout.indexOf('Not logged in. Run');
+      assert.ok(gate > workerStart, `worker's own login gate did not run:\n${stdout}`);
+      // Doctor is not the gate, but nothing connected, so this is still a failure.
+      assert.equal(exitCode, 1, `expected a failing exit code:\n${stdout}`);
+    });
+  }
+
+  it('--doctor with invalid flags fails before running doctor', () => {
+    const { stdout, exitCode } = runCli(['connect', '--doctor', '--podman', '--docker']);
+    assert.equal(exitCode, 1);
+    assert.match(stdout, /Pick one engine/);
+    assert.doesNotMatch(stdout, /Health checks/);
   });
 });
